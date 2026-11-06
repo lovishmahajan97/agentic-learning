@@ -303,20 +303,10 @@ flowchart TD
 ## Examples
 ### Parallel tool calls in an agent step
 The model returned three tool calls in one turn. Run them concurrently under a `TaskGroup`, give each a
-timeout, push the one sync tool to a thread, and send every result back (errors included) in one message.
-The model call is a stub so the example runs offline; swap in your provider's async client.
+timeout, push the one sync tool to a thread, and turn every result (errors included) into a tool message.
 
 ```python
 import asyncio, inspect, json, time
-
-async def call_model(messages):                     # stub: a real agent awaits the provider here
-    await asyncio.sleep(0.3)
-    if messages[-1]["role"] == "tool":
-        return {"content": "Done.", "tool_calls": []}
-    return {"content": None, "tool_calls": [
-        {"id": "a", "name": "search", "args": {"q": "refund policy"}},
-        {"id": "b", "name": "lookup_order", "args": {"order": 42}},
-        {"id": "c", "name": "legacy_crm", "args": {"user": 7}}]}
 
 async def search(q):        await asyncio.sleep(1.0); return f"3 docs for {q}"
 async def lookup_order(order): await asyncio.sleep(0.8); return {"order": order, "status": "shipped"}
@@ -336,20 +326,16 @@ async def run_tool(call, timeout=5.0):
     except Exception as e:                            # report failures to the model, do not crash the run
         return {"role": "tool", "tool_call_id": call["id"], "content": f"error: {e!r}"}
 
-async def agent(task, max_steps=5):
-    messages = [{"role": "user", "content": task}]
-    for _ in range(max_steps):
-        reply = await call_model(messages)
-        if not reply["tool_calls"]:
-            return reply["content"]
-        t0 = time.perf_counter()
-        async with asyncio.TaskGroup() as tg:
-            tasks = [tg.create_task(run_tool(c)) for c in reply["tool_calls"]]
-        messages += [t.result() for t in tasks]
-        print(f"{len(tasks)} tools in {time.perf_counter() - t0:.2f}s")   # ~1.0s, not 2.3s
-    return "step limit reached"
+async def main():
+    calls = [{"id": "a", "name": "search", "args": {"q": "refund policy"}},
+             {"id": "b", "name": "lookup_order", "args": {"order": 42}},
+             {"id": "c", "name": "legacy_crm", "args": {"user": 7}}]
+    t0 = time.perf_counter()
+    async with asyncio.TaskGroup() as tg:
+        tasks = [tg.create_task(run_tool(c)) for c in calls]
+    print(f"{len(tasks)} tools in {time.perf_counter() - t0:.2f}s")   # ~1.0s, not 2.3s
 
-print(asyncio.run(agent("Where is my order and can I get a refund?")))
+asyncio.run(main())
 ```
 
 **The timeline:**
@@ -360,40 +346,10 @@ print(asyncio.run(agent("Where is my order and can I get a refund?")))
    timer or thread future becomes ready.
 4. The step costs about the slowest tool (1.0 s) instead of the sum (2.3 s).
 
-### Fan out twenty chat completions
-Twenty calls share one HTTP connection pool; a blocking tokenizer step moves to a thread so it cannot
-stall the loop. Point `API` at any OpenAI-compatible server (a local vLLM or Ollama instance works). This
-is the shape of an eval harness running twenty agent prompts.
-
-```python
-import asyncio, time
-import httpx
-
-API = "http://localhost:8000/v1/chat/completions"
-HEADERS = {"Authorization": "Bearer local"}
-
-async def ask(client: httpx.AsyncClient, question: str) -> str:
-    body = {"model": "small-chat", "messages": [{"role": "user", "content": question}]}
-    r = await client.post(API, headers=HEADERS, json=body, timeout=60)   # the await is where we yield
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
-
-def count_tokens(text: str) -> int:
-    time.sleep(0.05)                      # pretend this is a slow, blocking tokenizer
-    return len(text.split())
-
-async def main(questions: list[str]) -> None:
-    async with httpx.AsyncClient() as client:          # one connection pool for every call
-        t0 = time.perf_counter()
-        answers = await asyncio.gather(*(ask(client, q) for q in questions))
-        # blocking work goes to a thread so the loop keeps serving other tasks meanwhile
-        counts = await asyncio.gather(*(asyncio.to_thread(count_tokens, a) for a in answers))
-        print(f"{len(questions)} calls in {time.perf_counter() - t0:.2f}s, {sum(counts)} tokens")
-
-asyncio.run(main([f"Summarise item {i} in one line." for i in range(20)]))
-```
-
 ### Worked numbers: what the fan-out buys and what caps it
+Twenty chat completions through one shared `httpx.AsyncClient`, run with `gather` as above, plus a
+blocking tokenizer step on each answer.
+
 | Scenario | Wall time | Why |
 |---|---|---|
 | Sequential, each call 1.5 s | about 20 × 1.5 = 30 s | One call at a time |
@@ -447,6 +403,8 @@ asyncio.run(main())
 - **Keep references to background tasks.** For fire-and-forget work such as writing a trace or memory
   update, follow the docs pattern: add each task to a set and call `task.add_done_callback(tasks.discard)`,
   or run them in a `TaskGroup`. Monitor the set's size for leaks.
+- **Cap the agent loop.** Bound model-and-tools iterations per run (for example `max_steps=5`) and return
+  a "step limit reached" result instead of looping on a model that keeps requesting tools.
 
 ## Trade-offs
 - **Cheap waits vs CPU work.** Thousands of concurrent agent waits cost kilobytes each instead of a thread

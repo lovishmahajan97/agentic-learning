@@ -371,77 +371,57 @@ flowchart TD
 
 ## Examples
 ### An idempotent per-document indexing step
-The store is any vector database with upsert, delete and ids by document; `embed_fn` is the shared
-function the query service also imports. Only changed chunks are embedded, stale ones are removed after
-the new ones are live, and the model version is part of every id.
+A dict stands in for any vector database with upsert, delete and ids by document; `embed_fn` is the
+shared function the query service also imports. Only changed chunks are embedded, stale ones are removed
+after the new ones are live, and the model version is part of every id.
 
 ```python
-import hashlib, random, time
-from itertools import islice
+import hashlib
 
 MODEL = "text-embedding-3-small/v1"           # our own pinned label; part of every chunk's identity
-class RateLimited(Exception): ...             # raised by embed_fn on HTTP 429
 
 def chunk_id(doc_id, idx, text):
     return hashlib.sha256(f"{MODEL}\x00{doc_id}\x00{idx}\x00{text}".encode()).hexdigest()[:32]
 
-def batched(items, n):
-    it = iter(items)
-    while batch := list(islice(it, n)):
-        yield batch
-
-def embed_with_retry(embed_fn, texts, tries=5):
-    for attempt in range(tries):
-        try:
-            return embed_fn(texts)                # returns unit-norm vectors, prefix already applied
-        except RateLimited:
-            time.sleep(min(2 ** attempt, 30) * random.uniform(0.5, 1.0))  # capped backoff + jitter
-    raise RuntimeError("embedding failed after retries")
-
-def index_document(doc_id, chunks, store, embed_fn, batch_size=64):
-    wanted = {chunk_id(doc_id, i, c["text"]): (i, c) for i, c in enumerate(chunks)}
-    existing = set(store.ids_for_doc(doc_id))
-    todo = [(cid, i, c) for cid, (i, c) in wanted.items() if cid not in existing]
-    for batch in batched(todo, batch_size):
-        vecs = embed_with_retry(embed_fn, [c["text"] for _, _, c in batch])
-        store.upsert([{"id": cid, "vector": v, "doc_id": doc_id, "chunk_index": i,
-                       "model": MODEL, "text": c["text"], **c.get("meta", {})}
-                      for (cid, i, c), v in zip(batch, vecs)])
+def index_document(doc_id, chunks, store, embed_fn):
+    wanted = {chunk_id(doc_id, i, t): (i, t) for i, t in enumerate(chunks)}
+    existing = {k for k, r in store.items() if r["doc_id"] == doc_id}
+    todo = [cid for cid in wanted if cid not in existing]
+    vecs = embed_fn([wanted[cid][1] for cid in todo])        # batch and retry 429s in production
+    for cid, v in zip(todo, vecs):
+        i, t = wanted[cid]
+        store[cid] = {"vector": v, "doc_id": doc_id, "chunk_index": i, "model": MODEL, "text": t}
     stale = existing - wanted.keys()
-    if stale:
-        store.delete(list(stale))                 # only after the replacements are live
+    for cid in stale:
+        del store[cid]                                       # only after the replacements are live
     return {"embedded": len(todo), "deleted": len(stale), "unchanged": len(existing & wanted.keys())}
 
-class DictStore:                                  # in-memory stand-in to run the step end to end
-    def __init__(self): self.rows = {}
-    def ids_for_doc(self, d): return [k for k, r in self.rows.items() if r["doc_id"] == d]
-    def upsert(self, rows): self.rows.update({r["id"]: r for r in rows})
-    def delete(self, ids): [self.rows.pop(i) for i in ids]
-    def exists(self, i): return i in self.rows
-
-fake_embed = lambda texts: [[1.0, 0.0] for _ in texts]   # swap for the real shared embed function
-store, doc = DictStore(), [{"text": "Refunds take 5-7 days."}, {"text": "Cancel under Billing."}]
-print(index_document("faq", doc, store, fake_embed))      # {'embedded': 2, 'deleted': 0, 'unchanged': 0}
-print(index_document("faq", doc, store, fake_embed))      # {'embedded': 0, 'deleted': 0, 'unchanged': 2}
-doc[1] = {"text": "Cancel under Settings > Billing."}
-print(index_document("faq", doc, store, fake_embed))      # {'embedded': 1, 'deleted': 1, 'unchanged': 1}
+fake_embed = lambda texts: [[1.0, 0.0] for _ in texts]      # swap for the real shared embed function
+store, doc = {}, ["Refunds take 5-7 days.", "Cancel under Billing."]   # a dict stands in for the store
+print(index_document("faq", doc, store, fake_embed))         # {'embedded': 2, 'deleted': 0, 'unchanged': 0}
+print(index_document("faq", doc, store, fake_embed))         # {'embedded': 0, 'deleted': 0, 'unchanged': 2}
+doc[1] = "Cancel under Settings > Billing."
+print(index_document("faq", doc, store, fake_embed))         # {'embedded': 1, 'deleted': 1, 'unchanged': 1}
 ```
 
 ### Agent scenario: an idempotent memory tool
 The agent's `save_memory` tool reuses the same id scheme and embed function, so repeated saves of one
-fact are no-ops and memories are scoped to a user.
+fact are no-ops and memories are scoped to a user. It continues the block above.
 
 ```python
-def save_memory(user_id: str, fact: str, store, embed_fn) -> str:
+def save_memory(user_id: str, fact: str, store: dict, embed_fn) -> str:
     """Tool exposed to the agent: remember a durable fact about this user."""
     text = " ".join(fact.split())                     # deterministic cleanup before hashing
     mid = hashlib.sha256(f"{MODEL}\x00{user_id}\x00{text.lower()}".encode()).hexdigest()[:32]
-    if store.exists(mid):
+    if mid in store:
         return "Already remembered."                  # agent re-saving the same fact costs nothing
-    vec = embed_with_retry(embed_fn, [text])[0]       # same shared function as the search tool
-    store.upsert([{"id": mid, "vector": vec, "user_id": user_id, "model": MODEL,
-                   "text": text, "kind": "memory", "saved_at": time.time()}])
+    vec = embed_fn([text])[0]                         # same shared function as the search tool
+    store[mid] = {"vector": vec, "user_id": user_id, "model": MODEL, "text": text, "kind": "memory"}
     return "Saved."
+
+memories = {}
+print(save_memory("u1", "Prefers  invoices in EUR", memories, fake_embed))   # Saved.
+print(save_memory("u1", "prefers invoices in EUR", memories, fake_embed))    # Already remembered.
 ```
 
 - **Why `user_id` in the id and payload:** recall filters by user, and two users' identical facts do not
@@ -508,6 +488,9 @@ decides.
   depth so one poison pill cannot stall the run.
 - **Golden-vector check on a schedule** — run the test above in CI and hourly against production
   credentials. Page when it fails, because a hosted model change silently splits index and query spaces.
+- **Batch and retry inside the embed call** — embed in batches (for example 64 texts), and retry 429s
+  with capped exponential backoff plus jitter (for example 5 tries, sleeps capped at 30 s) before failing
+  the batch.
 
 ## Trade-offs
 - **Free re-runs vs surprise re-embeds.** Content-hashed ids make re-runs free and safe, but any change

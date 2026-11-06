@@ -179,19 +179,16 @@ the slow tool too, while a tool that already finished keeps its result.
 ```python
 import asyncio
 
-log = []
-
 async def tool(name, secs):
     try:
         await asyncio.sleep(secs)                    # stand-in for an HTTP tool call
-        log.append(f"{name}: done")
-    finally:
-        if asyncio.current_task().cancelling():
-            log.append(f"{name}: cancelled, connection closed")
+        print(f"{name}: done")
+    except asyncio.CancelledError:
+        print(f"{name}: cancelled, connection closed")
+        raise                                        # never swallow the cancel
 
 async def agent_run(steps=5):
     for step in range(steps):
-        log.append(f"step {step}: model call")
         await asyncio.sleep(0.1)                     # stand-in for a streamed model call
         async with asyncio.TaskGroup() as tg:        # parallel tool calls share the run's fate
             tg.create_task(tool(f"search-{step}", 0.3))
@@ -202,14 +199,9 @@ async def main():
     await asyncio.sleep(0.6)                         # user presses stop during step 0's tools
     run.cancel()
     await asyncio.wait([run])
-    print(*log, sep="\n")
     print("run cancelled:", run.cancelled())
 
-asyncio.run(main())
-# step 0: model call
-# search-0: done
-# fetch-0: cancelled, connection closed
-# run cancelled: True
+asyncio.run(main())  # search-0: done, fetch-0: cancelled, connection closed, run cancelled: True
 ```
 
 ### Supersede pattern for a chat session
@@ -222,89 +214,24 @@ import asyncio
 from openai import AsyncOpenAI
 
 client = AsyncOpenAI()
-MODEL = "my-model"
+current: asyncio.Task | None = None
 
-class ChatSession:
-    def __init__(self):
-        self.current: asyncio.Task | None = None
-        self.received: list[str] = []            # a cancelled stream sends no usage event; tokenize
-                                                 # this later for a lower-bound estimate of billed output
-
-    async def _generate(self, messages, on_delta):
-        stream = await client.chat.completions.create(model=MODEL, messages=messages, stream=True)
-        try:
-            async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    self.received.append(chunk.choices[0].delta.content)
-                    on_delta(chunk.choices[0].delta.content)
-        finally:
-            await stream.close()                 # runs on CancelledError too: closing the HTTP response
-                                                 # is the provider's only signal to abort the sequence
-
-    async def submit(self, messages, on_delta) -> asyncio.Task:
-        prev = self.current
-        if prev and not prev.done():
-            prev.cancel()                        # supersede: new message or stop button
-            await asyncio.wait([prev])           # wait for its cleanup without swallowing our own cancel
-        self.current = asyncio.create_task(self._generate(messages, on_delta))
-        return self.current
-
-async def demo():
-    s = ChatSession()
-    show = lambda t: print(t, end="", flush=True)
-    first = await s.submit([{"role": "user", "content": "Write a long essay about rivers."}], show)
-    await asyncio.sleep(1.0)                     # user changes their mind one second in
-    second = await s.submit([{"role": "user", "content": "Actually, one sentence on rivers."}], show)
-    await second
-    print("\nfirst cancelled:", first.cancelled(), "| chars received:", sum(map(len, s.received)))
-
-asyncio.run(demo())
-```
-
-### Racing a non-streaming generation against a disconnect watcher
-Runnable with no server: a fake upstream decodes a token every 10 ms, and the "client" leaves after
-0.5 s. The watcher wins the race, the generation task is cancelled, and its `finally` closes the
-upstream, so decoding stops near 50 tokens instead of running to 1,000.
-
-```python
-import asyncio
-
-class FakeUpstream:                                 # stands in for a provider or engine stream
-    def __init__(self):
-        self.closed, self.tokens = False, 0
-    async def stream(self):
-        while not self.closed:
-            await asyncio.sleep(0.01)
-            self.tokens += 1
-            yield "tok "
-    async def close(self):
-        self.closed = True                          # real code: close the HTTP response
-
-async def generate(up, out, max_tokens=1000):
+async def generate(messages):
+    stream = await client.chat.completions.create(model="my-model", messages=messages, stream=True)
     try:
-        async for t in up.stream():
-            out.append(t)
-            if len(out) == max_tokens:
-                break
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                print(chunk.choices[0].delta.content, end="", flush=True)
     finally:
-        await up.close()                            # runs on CancelledError too
+        await stream.close()              # runs on CancelledError too: the provider's only stop signal
 
-async def handle(disconnect_after):
-    up, out = FakeUpstream(), []
-    gen = asyncio.create_task(generate(up, out))
-    watch = asyncio.create_task(asyncio.sleep(disconnect_after))  # real code: poll is_disconnected()
-    done, _ = await asyncio.wait({gen, watch}, return_when=asyncio.FIRST_COMPLETED)
-    if watch in done:
-        gen.cancel()
-        await asyncio.wait([gen])                   # let cleanup finish
-        status = "cancelled"
-    else:
-        watch.cancel()
-        status = "completed"
-    print(f"{status}: upstream closed={up.closed}, tokens decoded={up.tokens}")
-
-asyncio.run(handle(0.5))
-# cancelled: upstream closed=True, tokens decoded=45   (roughly 45-50, timing dependent)
+async def submit(messages) -> asyncio.Task:
+    global current
+    if current and not current.done():
+        current.cancel()                  # supersede: new message or stop button
+        await asyncio.wait([current])     # wait for its cleanup without swallowing our own cancel
+    current = asyncio.create_task(generate(messages))
+    return current
 ```
 
 ### Worked scenario: what abandonment costs without cancellation
@@ -343,6 +270,8 @@ users make the problem grow.
 - **Measure disconnect-to-abort time.** Track time from client disconnect to engine abort, tokens
   generated after disconnect, and the engine's aborted-request count. If provider usage does not fall
   when abandonment rises, the abort is not reaching them.
+- **Race non-streaming calls against a disconnect watcher.** Poll `request.is_disconnected()` in a
+  watcher task, `asyncio.wait({gen, watch}, return_when=FIRST_COMPLETED)`, and cancel the loser.
 
 ## Trade-offs
 - **Freed capacity vs lost partial work.** Cancelling on disconnect frees capacity and money immediately

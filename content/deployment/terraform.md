@@ -357,9 +357,9 @@ flowchart TD
 
 ## Examples
 ### Module for private model access
-- **What it contains.** A locked remote state, a security group that only admits the app subnet, an
-  interface endpoint for the model runtime with private DNS, and a document bucket protected from
-  accidental destruction. This is the base layer a RAG agent needs.
+- **What it contains.** A pinned provider, an interface endpoint for the model runtime with private
+  DNS, and a document bucket protected from accidental destruction. This is the base layer a RAG agent
+  needs.
 - **Check the names.** Argument names follow the AWS provider; check them against the provider version
   you pin.
 
@@ -368,36 +368,16 @@ terraform {
   required_providers {
     aws = { source = "hashicorp/aws", version = "~> 5.0" }
   }
-  backend "s3" {
-    bucket         = "acme-tfstate"
-    key            = "ai-platform/prod.tfstate"
-    region         = "eu-west-1"
-    use_lockfile   = true         # S3-native lock file (added in 1.10, GA in 1.11); supersedes dynamodb_table
-    encrypt        = true
-  }
 }
 
 variable "vpc_id"             { type = string }
 variable "private_subnet_ids" { type = list(string) }
-variable "app_cidr"           { type = string }
-
-resource "aws_security_group" "model_ep" {
-  name   = "model-runtime-endpoint"
-  vpc_id = var.vpc_id
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = [var.app_cidr]
-  }
-}
 
 resource "aws_vpc_endpoint" "model_runtime" {
   vpc_id              = var.vpc_id
   service_name        = "com.amazonaws.eu-west-1.bedrock-runtime"
   vpc_endpoint_type   = "Interface"
   subnet_ids          = var.private_subnet_ids     # one subnet per availability zone
-  security_group_ids  = [aws_security_group.model_ep.id]
   private_dns_enabled = true
 }
 
@@ -407,7 +387,7 @@ resource "aws_s3_bucket" "documents" {
 }
 ```
 
-- **Fresh account:** `terraform plan` shows three resources to add.
+- **Fresh account:** `terraform plan` shows two resources to add.
 - **Changing `bucket` later** would show a replace, and `prevent_destroy` turns that into an error
   rather than a deleted archive.
 - **Limit of the guard.** It lives in the resource block, so it does not protect against someone
@@ -464,24 +444,16 @@ import json, sys
 
 PROTECTED = {"aws_s3_bucket", "aws_db_instance", "aws_opensearch_domain", "aws_kms_key"}
 
-def risky_changes(plan):
-    for rc in plan.get("resource_changes", []):
-        actions = rc["change"]["actions"]          # e.g. ["update"], ["delete", "create"]
-        if "delete" in actions:
-            kind = "REPLACE" if "create" in actions else "DESTROY"
-            yield kind, rc["address"], rc["type"]
-
-def main(path):
-    plan = json.load(open(path))
-    blocked = 0
-    for kind, address, rtype in risky_changes(plan):
-        flag = "BLOCK" if rtype in PROTECTED else "review"
+plan = json.load(open(sys.argv[1]))
+blocked = 0
+for rc in plan.get("resource_changes", []):
+    actions = rc["change"]["actions"]          # e.g. ["update"], ["delete", "create"]
+    if "delete" in actions:
+        kind = "REPLACE" if "create" in actions else "DESTROY"
+        flag = "BLOCK" if rc["type"] in PROTECTED else "review"
         blocked += flag == "BLOCK"
-        print(f"{flag:6} {kind:7} {address}")
-    sys.exit(1 if blocked else 0)
-
-if __name__ == "__main__":
-    main(sys.argv[1])
+        print(f"{flag:6} {kind:7} {rc['address']}")
+sys.exit(1 if blocked else 0)
 # BLOCK  REPLACE module.rag.aws_s3_bucket.documents
 # review REPLACE aws_launch_template.gpu
 ```
@@ -522,6 +494,10 @@ environment that already exists. A rename in the not-yet-applied staging root al
   plan duration per state. Protect the
   vector store and memory tables with `prevent_destroy`, cloud-side deletion protection, and the
   plan-guard script in CI.
+- **Locked remote state.** Use an S3 backend with `use_lockfile = true` (S3-native lock file, added in
+  1.10, GA in 1.11, supersedes `dynamodb_table`) and `encrypt = true`.
+- **Private endpoint security group.** Attach a security group to the model-runtime endpoint that admits
+  only the app subnet CIDR on TCP 443.
 
 ## Trade-offs
 - **Reviewable plans vs critical state.** Declarative plans make every change reviewable before it

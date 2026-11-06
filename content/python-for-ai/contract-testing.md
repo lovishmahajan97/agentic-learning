@@ -334,18 +334,14 @@ class SearchDocs(BaseModel):
     query: str = Field(description="What to search for, in the user's words")
     k: int = Field(3, ge=1, le=10, description="How many passages to return")
 
-TOOLS = {"search_docs": SearchDocs}
 SNAPSHOT = Path(__file__).with_name("tool_schemas.json")
 
-def current_schemas() -> dict:
-    return {name: model.model_json_schema() for name, model in TOOLS.items()}
-
 def test_tool_schemas_match_snapshot():
+    current = {"search_docs": SearchDocs.model_json_schema()}
     if not SNAPSHOT.exists():                      # first run: write it, commit it
-        SNAPSHOT.write_text(json.dumps(current_schemas(), indent=2, sort_keys=True))
+        SNAPSHOT.write_text(json.dumps(current, indent=2, sort_keys=True))
         pytest.skip("snapshot created; commit tool_schemas.json")
-    assert current_schemas() == json.loads(SNAPSHOT.read_text()), (
-        "tool schema changed: review what the model will now see, then regenerate the snapshot")
+    assert current == json.loads(SNAPSHOT.read_text()), "tool schema changed: review, then regenerate"
 
 def test_model_tool_call_honours_schema():
     raw = '{"query": "refund policy", "k": 3}'      # a recorded real tool call
@@ -357,71 +353,19 @@ def test_model_tool_call_honours_schema():
 - **Recorded tool calls as fixtures** check the other direction: what the model actually sends still
   validates against the schema you now publish.
 
-### Hand-rolled contract: consumer model, provider verification
-An agent service consumes a retrieval service. The consumer models only the fields it reads and
-publishes one interaction; the provider's test replays it against the real app in a seeded state. This
-hand-rolled version shows the mechanism that Pact automates with matchers and a broker.
-
-```python
-from pydantic import BaseModel, ConfigDict
-
-class Hit(BaseModel):                      # consumer side: only fields the agent reads
-    model_config = ConfigDict(extra="ignore", strict=True)   # strict: "0.9" is not a float
-    doc_id: str
-    score: float
-    text: str
-
-class SearchResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore", strict=True)
-    hits: list[Hit]
-
-CONTRACT = {                               # published by the consumer's CI
-    "consumer": "agent-service", "provider": "retrieval-service",
-    "interactions": [{
-        "description": "search returns scored hits",
-        "provider_state": "index contains doc d1 about refunds",
-        "request": {"method": "POST", "path": "/search", "json": {"query": "refund policy", "k": 3}},
-        "response": {"status": 200, "schema": SearchResponse},  # shipped as model_json_schema()
-    }],
-}
-
-# provider side, in the retrieval service's own test suite
-from fastapi.testclient import TestClient
-from retrieval.app import app, seed_state  # the provider's real code
-
-def test_retrieval_honours_agent_contract():
-    client = TestClient(app)
-    for it in CONTRACT["interactions"]:
-        seed_state(it["provider_state"])
-        req = it["request"]
-        r = client.request(req["method"], req["path"], json=req["json"])
-        assert r.status_code == it["response"]["status"]
-        body = it["response"]["schema"].model_validate_json(r.content)  # missing/retyped field raises
-        assert body.hits, "provider state promised at least one hit"
-```
-
-- **What fails and what passes.** If the retrieval team renames `text` to `content`, the provider test
-  fails in their pull request; adding a new `chunk_id` field passes because the consumer ignores extras.
-- **Why `strict=True` matters.** Pydantic's default lax mode would coerce a `score` that became the
-  string `"0.9"` back into a float. The retype would pass verification while breaking any consumer that
-  does not coerce.
-- **In a real setup** the consumer publishes the JSON Schema (or Pact matchers) rather than a Python
-  class.
-
 ### Consumer side: the real adapter against a stub built from the interaction
-The matching consumer test runs the agent's real retrieval adapter against a stub server that returns a
-response built from the same interaction. The contract then cannot list a field the adapter does not
-parse, or omit one it does; that pairing is what Pact's mock provider automates. Runnable with
-`pip install httpx pydantic pytest`.
+An agent service consumes a retrieval service. Its consumer test runs the agent's real retrieval adapter
+against a stub that answers from one recorded interaction, so the contract cannot list a field the
+adapter does not parse, or omit one it does. That pairing is what Pact's mock provider automates.
+Runnable with `pip install httpx pydantic pytest`.
 
 ```python
 import json
 import httpx
 from pydantic import BaseModel, ConfigDict
 
-class Hit(BaseModel):
-    model_config = ConfigDict(extra="ignore", strict=True)
-    doc_id: str
+class Hit(BaseModel):                      # only the fields the agent reads
+    model_config = ConfigDict(extra="ignore", strict=True)   # strict: "0.9" is not a float
     score: float
     text: str
 
@@ -430,32 +374,33 @@ class SearchResponse(BaseModel):
     hits: list[Hit]
 
 def retrieve_context(http: httpx.Client, query: str, k: int = 3) -> list[str]:
-    """The agent's real adapter: the passages it will put in the prompt."""
-    r = http.post("/search", json={"query": query, "k": k})
+    r = http.post("/search", json={"query": query, "k": k})   # the agent's real adapter
     r.raise_for_status()
     return [h.text for h in SearchResponse.model_validate_json(r.content).hits]
 
-INTERACTION = {
-    "request": {"method": "POST", "path": "/search", "json": {"query": "refund policy", "k": 3}},
-    "response": {"status": 200,
-                 "json": {"hits": [{"doc_id": "d1", "score": 0.9, "text": "Refunds take 5 days."}]}},
-}
+INTERACTION = {"request": {"path": "/search", "json": {"query": "refund policy", "k": 3}},
+               "response": {"hits": [{"doc_id": "d1", "score": 0.9, "text": "Refunds take 5 days."}]}}
 
-def stub_provider(it: dict) -> httpx.MockTransport:
-    def handler(request: httpx.Request) -> httpx.Response:
-        exp = it["request"]
-        assert (request.method, request.url.path) == (exp["method"], exp["path"])
-        assert json.loads(request.content) == exp["json"]     # adapter sends what the contract says
-        return httpx.Response(it["response"]["status"], json=it["response"]["json"])
-    return httpx.MockTransport(handler)
+def handler(request: httpx.Request) -> httpx.Response:        # stub provider built from the contract
+    assert request.url.path == INTERACTION["request"]["path"]
+    assert json.loads(request.content) == INTERACTION["request"]["json"]
+    return httpx.Response(200, json=INTERACTION["response"])
 
 def test_adapter_matches_contract():
-    with httpx.Client(transport=stub_provider(INTERACTION), base_url="http://retrieval.test") as http:
+    with httpx.Client(transport=httpx.MockTransport(handler), base_url="http://retrieval.test") as http:
         assert retrieve_context(http, "refund policy") == ["Refunds take 5 days."]
 ```
 
-If the adapter starts sending `"top_k"` instead of `"k"`, the request assertion fails here, before the
-provider ever sees the change.
+- **If the adapter starts sending `"top_k"` instead of `"k"`,** the request assertion fails here, before
+  the provider ever sees the change.
+- **The provider half** replays the same interaction against its real app (for example FastAPI's
+  `TestClient`) in a seeded provider state and validates the body with `SearchResponse`. If the retrieval
+  team renames `text` to `content`, that test fails in their pull request; a new `chunk_id` field passes
+  because the consumer ignores extras. In a real setup the contract ships as JSON Schema or Pact matchers,
+  not a Python class.
+- **Why `strict=True` matters.** Pydantic's default lax mode would coerce a `score` that became the
+  string `"0.9"` back into a float. The retype would pass verification while breaking any consumer that
+  does not coerce.
 
 ### Worked scenario: removing `text` across independent deploys
 Illustrative version numbers; the point is which check blocks which step.

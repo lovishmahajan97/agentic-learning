@@ -244,8 +244,8 @@ flowchart TD
 
 ## Examples
 ### Document ingestion as events
-`publish` and `consume` stand in for any broker client; what matters is the envelope, the partition key
-and the idempotent consumer.
+The envelope, the partition key and an idempotent consumer. A dict stands in for the vector store and a
+direct call stands in for the broker's (re)delivery.
 
 ```python
 import uuid, json, datetime as dt
@@ -259,92 +259,69 @@ def make_event(type_, aggregate_id, payload, trace_id, version=1):
         "trace_id": trace_id, "payload": payload,
     }
 
-# producer: the upload service knows nothing about who listens
-def on_upload(doc_id, storage_uri, tenant_id, trace_id, publish):
-    ev = make_event("DocumentUploaded", doc_id,
-                    {"uri": storage_uri, "tenant_id": tenant_id}, trace_id)
-    publish(topic="documents", key=doc_id, value=json.dumps(ev))
+index = {}                                  # stands in for the vector store
 
-# consumer: embedder reacts, and tolerates redelivery. The vector store is not in the same
-# transaction as any dedupe table, so idempotence comes from the effect itself: chunk ids are
-# deterministic (doc_id:chunk_no), and re-indexing the same document upserts the same rows.
-def on_document_uploaded(raw, chunk_and_embed, vector_upsert, publish):
+def on_document_uploaded(raw):
     ev = json.loads(raw)
     doc_id = ev["aggregate_id"]
-    chunks = chunk_and_embed(ev["payload"]["uri"])          # list of (text, vector)
-    vector_upsert([{"id": f"{doc_id}:{i}", "vector": v, "text": t,
-                    "tenant_id": ev["payload"]["tenant_id"]} for i, (t, v) in enumerate(chunks)])
-    chunk_count = len(chunks)
-    # crash here => redelivery re-embeds and overwrites identical ids (wasted work, no duplicates)
-    publish(topic="documents", key=doc_id, value=json.dumps(
-        make_event("DocumentIndexed", ev["aggregate_id"],
-                   {"chunks": chunk_count}, ev["trace_id"])))
+    chunks = ["intro", "body", "summary"]   # stands in for chunk_and_embed(uri)
+    for i, text in enumerate(chunks):
+        index[f"{doc_id}:{i}"] = text       # deterministic id: redelivery overwrites, never duplicates
+
+raw = json.dumps(make_event("DocumentUploaded", "doc42", {"uri": "s3://docs/42.pdf"}, "t-1"))
+on_document_uploaded(raw); on_document_uploaded(raw)   # broker redelivers after a crash
+print(len(index))                           # 3, not 6
 ```
 
 What this design buys and where it is thin:
-- **New consumers are free.** A billing meter is one more consumer of `DocumentIndexed`; the upload service
+- **New consumers are free.** A billing meter is one more consumer of the same topic; the upload service
   and embedder do not change.
 - **Outages become lag.** If the embedder is down for an hour, events wait on the topic and are processed
   in per-document order when it returns.
 - **Deterministic ids carry idempotence.** A random chunk id would add a second copy of the document on
   every redelivery; the deterministic id turns redelivery into an overwrite.
-- **The downstream publish can be lost or duplicated.** That is acceptable only because the next consumer
-  is idempotent too; otherwise the embedder would need its own outbox.
 - **Gap:** if a re-upload produces *fewer* chunks, old high-numbered chunks survive. A real indexer deletes
   `doc_id:*` ids beyond the new count or versions chunks by document revision.
 
 ### Runnable: redelivery with and without an idempotent consumer
-Simulates a broker that redelivers after a crash, and shows why the dedupe key matters.
+A broker redelivers `e1` after a crash; only the inbox check on `event_id` bills it once.
 
 ```python
 deliveries = [("e1", "doc42", 5), ("e2", "doc43", 3), ("e1", "doc42", 5)]  # e1 redelivered
 
-def naive(events):
-    billed = 0
-    for _eid, _doc, chunks in events:
-        billed += chunks                  # counts the redelivery twice
-    return billed
+naive = sum(chunks for _eid, _doc, chunks in deliveries)   # counts the redelivery twice
 
-def idempotent(events):
-    seen, billed = set(), 0
-    for eid, _doc, chunks in events:
-        if eid in seen:                   # inbox check on event_id
-            continue
-        seen.add(eid)
-        billed += chunks
-    return billed
-
-print(naive(deliveries), idempotent(deliveries))   # 13 8
+seen, billed = set(), 0
+for eid, _doc, chunks in deliveries:
+    if eid not in seen:                   # inbox check on event_id
+        seen.add(eid); billed += chunks
+print(naive, billed)                      # 13 8
 ```
 
 ### Agent scenario: a ticket-triage agent triggered by events
 A support system publishes `TicketCreated`. The triage agent must start once per ticket, even when the
-broker redelivers, and its refund tool must not run twice. `run_agent` stands in for any agent loop
-(a LangGraph graph, an SDK tool-calling loop).
+broker redelivers, and its refund tool must not run twice. `db`, `refund_api` and `run_agent` stand in for
+your database, payment client and agent loop (a LangGraph graph, an SDK tool-calling loop).
 
 ```python
 import json
 
-def on_ticket_created(raw, db, run_agent, refund_api, publish):
+def on_ticket_created(raw, db, run_agent, refund_api):
     ev = json.loads(raw)
-    # 1. inbox: one run per event, recorded in the same DB as the run row
-    with db.transaction() as tx:
+    with db.transaction() as tx:                      # inbox: one run per event, same DB as the run row
         if tx.exists("inbox", event_id=ev["event_id"]):
             return                                    # redelivery: skip, no second paid run
         tx.insert("inbox", event_id=ev["event_id"])
         run_id = tx.insert("agent_runs", ticket_id=ev["aggregate_id"], status="running")
 
     def refund_tool(order_id, amount_cents):
-        # 2. key from the event and the target, not a random uuid or a model-chosen step number,
-        #    so a restarted run that reaches the refund at a different step reuses the same key
+        # key from the event and the target, not a random uuid or a model-chosen step number,
+        # so a restarted run that reaches the refund at a different step reuses the same key
         key = f'{ev["event_id"]}:refund:{order_id}'
         return refund_api.create(order_id=order_id, amount=amount_cents, idempotency_key=key)
 
-    result = run_agent(ticket=ev["payload"], tools={"refund": refund_tool})
-    db.update("agent_runs", run_id, status="done", tokens=result.tokens)
-    # 3. telemetry is a fact; billing, eval sampling and audit subscribe on their own
-    publish(topic="agent-runs", key=ev["aggregate_id"], value=json.dumps(
-        {"type": "RunCompleted", "run_id": run_id, "tokens": result.tokens}))
+    run_agent(ticket=ev["payload"], tools={"refund": refund_tool})
+    db.update("agent_runs", run_id, status="done")
 ```
 
 - **Caveat.** If the process dies mid-run, the inbox row already exists, so the redelivery is skipped
@@ -396,6 +373,10 @@ only the six downstream services; counting the producer too gives the 99.3% here
   run id, tokens and cost, and let billing, eval sampling and audit subscribe. Keep detailed traces in
   your tracing tool (LangSmith, an OpenTelemetry backend) joined by `trace_id`, rather than pushing whole
   transcripts through the broker.
+- **Chained consumers must each be idempotent.** A consumer that publishes a follow-on event (an embedder
+  emitting `DocumentIndexed` after upserting chunks) can lose or duplicate that publish on a crash; this is
+  acceptable only if the next consumer is idempotent too, otherwise the publishing consumer needs its own
+  outbox.
 
 ## Trade-offs
 - **Producer independence vs the synchronous answer.** The uploader cannot tell the user "indexed, ask

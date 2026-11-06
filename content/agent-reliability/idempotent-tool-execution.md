@@ -358,19 +358,15 @@ flowchart TD
   dedupes on the same key. Without that, mark the row "unknown" and reconcile before retrying.
 
 ```python
-import hashlib, time
+import time
 
-class DedupStore:   # key -> {status, result}; in prod a durable table that also stores an
-                    # args hash and rejects a key reused with different arguments
-    def __init__(self):
-        self.rows = {}
-    def begin(self, key):         # existing row, or None if we now own the key; in prod an
-        row = self.rows.get(key)  # atomic INSERT ... ON CONFLICT DO NOTHING, not get-then-set
-        if row is None:
-            self.rows[key] = {"status": "in_flight", "started": time.time()}
+class DedupStore:   # in prod: a durable table with an args hash, claimed by INSERT ... ON CONFLICT DO NOTHING
+    def __init__(self): self.rows = {}
+    def begin(self, key):           # existing row, or None after claiming the key
+        row = self.rows.get(key)
+        self.rows.setdefault(key, {"status": "in_flight"})
         return row
-    def finish(self, key, result):
-        self.rows[key] = {"status": "done", "result": result}
+    def finish(self, key, result): self.rows[key] = {"status": "done", "result": result}
 
 def idempotent(store: DedupStore, wait_s: float = 10):
     def wrap(tool):
@@ -392,16 +388,6 @@ def idempotent(store: DedupStore, wait_s: float = 10):
             return result
         return run
     return wrap
-
-def key_for(ids, call_index: int) -> str:
-    return hashlib.sha256(f"{ids.run_id}:{ids.step}:{call_index}".encode()).hexdigest()
-
-@idempotent(DedupStore())
-def create_ticket(title, body, idempotency_key):
-    return api.post("/tickets", json={"title": title, "body": body},
-                    headers={"Idempotency-Key": idempotency_key}).json()
-
-# in the agent loop:  create_ticket({"title": t, "body": b}, key=key_for(ids, i))
 ```
 
 ### Worked trace: the paths through the wrapper
@@ -416,29 +402,26 @@ def create_ticket(title, body, idempotency_key):
 - **Why the release-on-exception rule needs downstream support:** without it, the last row happens.
 
 ### Runnable: lost response, with and without downstream dedup
-Paste below the `DedupStore` and `idempotent` definitions above (the `create_ticket` example is not
-needed). A fake API creates the ticket and then loses the response once.
+Paste below the `DedupStore` and `idempotent` definitions above. A fake API creates the ticket and then loses the response once.
 
 ```python
-class FakeTicketAPI:                     # stands in for a ticketing API
-    def __init__(self, honours_key=True, fail_once=False):
-        self.created, self.by_key = [], {}
-        self.honours_key, self.fail_once = honours_key, fail_once
+class FakeTicketAPI:                     # creates the ticket, then loses the first response
+    def __init__(self, honours_key):
+        self.created, self.by_key, self.honours_key, self.fail_once = [], {}, honours_key, True
     def create(self, title, idempotency_key):
         if self.honours_key and idempotency_key in self.by_key:
             return self.by_key[idempotency_key]
         ticket = {"id": f"T-{901 + len(self.created)}"}
         self.created.append(ticket)
         self.by_key[idempotency_key] = ticket
-        if self.fail_once:               # ticket created, but the response is lost
+        if self.fail_once:
             self.fail_once = False
             raise TimeoutError("response lost")
         return ticket
 
 for honours in (True, False):
-    api = FakeTicketAPI(honours_key=honours, fail_once=True)
-    tool = idempotent(DedupStore())(lambda title, idempotency_key:
-                                    api.create(title, idempotency_key))
+    api = FakeTicketAPI(honours_key=honours)
+    tool = idempotent(DedupStore())(lambda title, idempotency_key: api.create(title, idempotency_key))
     try:
         tool({"title": "Fix login"}, key="k1")
     except TimeoutError:

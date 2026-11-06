@@ -261,47 +261,35 @@ flowchart TD
 Runnable with only `langgraph` installed; replace `draft_action` with a model call once the flow works.
 
 ```python
+# pip install langgraph   (checked with langgraph 1.2.16)
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import interrupt, Command
 
-class State(TypedDict):
-    request: str
-    draft: str
-    decision: str
-    result: str
+State = TypedDict("State", {"request": str, "draft": str, "decision": str, "result": str}, total=False)
 
-def draft_action(state: State) -> dict:
-    # In the real project an LLM proposes this; a fixed draft keeps the starter runnable.
+def draft_action(state: State) -> dict:          # an LLM proposes this in the real project
     return {"draft": f"send_email(to='team', subject='{state['request']}')"}
 
-def human_approval(state: State) -> dict:
-    answer = interrupt({"question": "Approve this action?", "draft": state["draft"]})
-    return {"decision": answer}
+def human_approval(state: State) -> dict:        # pauses here until a human resumes the thread
+    return {"decision": interrupt({"question": "Approve this action?", "draft": state["draft"]})}
 
 def route(state: State) -> str:
     return "execute" if state["decision"] == "approve" else END
 
-def execute(state: State) -> dict:
-    return {"result": f"executed: {state['draft']}"}   # the side effect runs only after approval
+def execute(state: State) -> dict:               # the side effect runs only after approval
+    return {"result": f"executed: {state['draft']}"}
 
-builder = StateGraph(State)
-builder.add_node("draft_action", draft_action)
-builder.add_node("human_approval", human_approval)
-builder.add_node("execute", execute)
+builder = StateGraph(State).add_sequence([draft_action, human_approval]).add_node(execute)
 builder.add_edge(START, "draft_action")
-builder.add_edge("draft_action", "human_approval")
 builder.add_conditional_edges("human_approval", route, ["execute", END])
-builder.add_edge("execute", END)
 graph = builder.compile(checkpointer=InMemorySaver())
 
 config = {"configurable": {"thread_id": "ticket-42"}}
-first = graph.invoke({"request": "weekly report"}, config)
-print(first["__interrupt__"][0].value)            # paused: the draft waits for a human
-print(graph.get_state(config).next)               # ('human_approval',)
-final = graph.invoke(Command(resume="approve"), config)
-print(final["result"])
+graph.invoke({"request": "weekly report"}, config)
+print(graph.get_state(config).next)              # ('human_approval',): the draft waits for a human
+print(graph.invoke(Command(resume="approve"), config)["result"])   # executed: send_email(...)
 ```
 
 For milestone 4, install `langgraph-checkpoint-sqlite` and compile inside

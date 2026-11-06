@@ -252,22 +252,14 @@ import json, pathlib, re, numpy as np
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 
-def slug(text):                        # heading-based id part, stable when other sections move
-    first = text.strip().splitlines()[0]
-    head = first.lstrip("#").strip().lower() if first.startswith("#") else ""
-    return re.sub(r"[^a-z0-9]+", "-", head).strip("-") or "top"
-
-def chunk_notes(root):
-    chunks, seen = [], {}
+def chunk_notes(root):                 # one chunk per heading; id = path#heading, stable across edits
+    chunks = []
     for p in sorted(pathlib.Path(root).rglob("*.md")):
         src = str(p.relative_to(root))
-        for text in re.split(r"\n(?=#{1,3} )", p.read_text()):
-            if text.strip():
-                cid = f"{src}#{slug(text)}"
-                seen[cid] = seen.get(cid, 0) + 1       # repeated heading in one note
-                if seen[cid] > 1:
-                    cid += f"-{seen[cid]}"
-                chunks.append({"id": cid, "src": src, "text": text})
+        for text in filter(str.strip, re.split(r"\n(?=#{1,3} )", p.read_text())):
+            head = text.strip().splitlines()[0]          # notes start with a heading; prose before it is "top"
+            slug = re.sub(r"[^a-z0-9]+", "-", head.lstrip("#").lower()).strip("-") if head[0] == "#" else "top"
+            chunks.append({"id": f"{src}#{slug}", "src": src, "text": text})
     return chunks
 
 chunks = chunk_notes("notes")
@@ -275,19 +267,17 @@ model = SentenceTransformer("all-MiniLM-L6-v2")
 emb = model.encode([c["text"] for c in chunks], normalize_embeddings=True)
 bm25 = BM25Okapi([c["text"].lower().split() for c in chunks])
 
-def search(q, k=5, rrf_k=60):
+def search(q, k=5, rrf_k=60):          # reciprocal rank fusion of dense and BM25 rankings
     dense = np.argsort(-(emb @ model.encode(q, normalize_embeddings=True)))[:50]
     sparse = np.argsort(-bm25.get_scores(q.lower().split()))[:50]
     score = {}
-    for ranking in (dense, sparse):
-        for rank, i in enumerate(ranking):
-            score[i] = score.get(i, 0) + 1 / (rrf_k + rank + 1)
+    for rank, i in [*enumerate(dense), *enumerate(sparse)]:
+        score[i] = score.get(i, 0) + 1 / (rrf_k + rank + 1)
     return [chunks[i] for i in sorted(score, key=score.get, reverse=True)[:k]]
 
-gold = [json.loads(l) for l in open("golden.jsonl")]
-answerable = [g for g in gold if g["expected_sources"]]
+answerable = [g for g in map(json.loads, open("golden.jsonl")) if g["expected_sources"]]
 hits = sum(any(c["src"] in g["expected_sources"] for c in search(g["question"])) for g in answerable)
-print(f"recall@5 = {hits}/{len(answerable)} = {hits/len(answerable):.2f}")
+print(f"recall@5 = {hits/len(answerable):.2f}")   # e.g. recall@5 = 0.83
 ```
 
 ### Citation prompt and validator
@@ -325,6 +315,8 @@ def citations_valid(answer, n_hits):   # score refusals ("Not in my notes.") sep
   wrong, the trace shows at once whether retrieval or generation failed.
 - **Run the eval in CI.** A GitHub Action that fails when recall@5 drops more than a few points keeps chunking
   experiments honest and makes a strong README badge.
+- **Keep chunk ids unique.** Two sections with the same heading in one note collide on `path#heading`;
+  append a counter (`-2`, `-3`) so citations and golden-set labels stay unambiguous.
 
 ## Trade-offs
 - **Small chunks vs large chunks.** Small chunks give precise citations but lose context across headings; large

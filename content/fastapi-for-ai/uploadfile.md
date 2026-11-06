@@ -314,43 +314,6 @@ sequenceDiagram
 ```
 
 ## Examples
-### Audio upload plus metadata, copied in chunks, handed to a job
-Copies the file to storage without loading it whole, and hands a key to a transcription job.
-
-```python
-import hashlib, uuid
-from pydantic import BaseModel
-from fastapi import FastAPI, Form, HTTPException, UploadFile
-
-app = FastAPI()
-CHUNK = 1 << 20                       # 1 MiB
-MAX = 200 * (1 << 20)                 # downstream cap; edge/middleware caps the upload itself
-
-class Meta(BaseModel):
-    language: str = "en"
-    diarize: bool = False
-
-@app.post("/v1/transcriptions", status_code=202)
-async def transcribe(audio: UploadFile, meta: str = Form("{}")):
-    m = Meta.model_validate_json(meta)
-    if not (audio.content_type or "").startswith("audio/"):
-        raise HTTPException(415, "audio file required")     # also sniff magic bytes in practice
-    key = f"uploads/{uuid.uuid4()}"                          # never reuse audio.filename as a path
-    digest, total = hashlib.sha256(), 0
-    with open(f"/data/{key.split('/')[1]}", "wb") as out:    # stand-in for object storage
-        while chunk := await audio.read(CHUNK):
-            total += len(chunk)
-            if total > MAX:
-                raise HTTPException(413, "audio too large")
-            digest.update(chunk)
-            out.write(chunk)
-    # enqueue(transcribe_job, key=key, lang=m.language)       # pass the key, not the UploadFile
-    return {"job_id": key, "bytes": total, "sha256": digest.hexdigest(),
-            "original_name": audio.filename}
-```
-
-A client sends it with `curl -F "audio=@call.m4a;type=audio/mp4" -F 'meta={"language":"de"}'`.
-
 ### Chat message with attachments that starts an agent run
 Files are persisted in the handler; the run receives keys. `store_upload` and `start_agent_run` are
 your own functions (object storage put, and enqueueing the run).
@@ -360,18 +323,17 @@ import hashlib, uuid
 from fastapi import FastAPI, Form, HTTPException, UploadFile
 
 app = FastAPI()
-CHUNK, MAX_FILE = 1 << 20, 50 * (1 << 20)
+CHUNK, MAX_FILE = 1 << 20, 50 * (1 << 20)   # 1 MiB reads; downstream cap (the edge caps the upload)
 
 async def persist(f: UploadFile) -> dict:
-    key, digest, size, chunks = f"att/{uuid.uuid4()}", hashlib.sha256(), 0, []
+    key, digest, size, chunks = f"att/{uuid.uuid4()}", hashlib.sha256(), 0, []  # never f.filename
     while chunk := await f.read(CHUNK):
         size += len(chunk)
         if size > MAX_FILE:
             raise HTTPException(413, f"{f.filename} too large")
         digest.update(chunk); chunks.append(chunk)       # real code streams to a multipart upload
     await store_upload(key, b"".join(chunks))
-    return {"key": key, "name": f.filename, "type": f.content_type,
-            "bytes": size, "sha256": digest.hexdigest()}
+    return {"key": key, "name": f.filename, "bytes": size, "sha256": digest.hexdigest()}
 
 @app.post("/v1/chat", status_code=202)
 async def chat(message: str = Form(), files: list[UploadFile] | None = None):
@@ -387,21 +349,8 @@ async def chat(message: str = Form(), files: list[UploadFile] | None = None):
 
 Illustrative numbers; prefix caching on the provider side can reduce the inline cost but not remove it.
 
-### Worked trace: the bytes of a 150 MiB recording
-| Stage | Where the bytes are | Peak memory for the part |
-|---|---|---|
-| request still arriving | Starlette's parser writes the part into a `SpooledTemporaryFile`; after the first 1 MiB it rolls over to the temp directory | around a megabyte, while 150 MiB lands on temp disk |
-| handler starts (only now) | copies the file in 150 one-MiB reads to the destination | around a megabyte |
-| after the copy | written to disk twice (temp file and destination) | — |
-| same request with `bytes = File()` | all 150 MiB in a single `bytes` object for the life of the handler | 150 MiB |
-
-- **The double write** is the cost a presigned direct upload avoids.
-- **The SHA-256** lets you deduplicate repeat uploads.
-- **The real file write uses a sync `open`**, which in production should be async object-storage I/O or
-  run in a thread.
-
 ### Several files in a plain `def` handler (runnable with TestClient)
-Requires `fastapi`, `httpx` and `python-multipart`. Shows `list[UploadFile]`, `Form` fields, the sync
+Requires `fastapi`, `httpx` and `python-multipart`. Shows `list[UploadFile]`, a `Form` field, the sync
 copy, and that the client's filename arrives untouched.
 
 ```python
@@ -413,26 +362,33 @@ app = FastAPI()
 STORE = tempfile.mkdtemp()                     # stand-in for durable object storage
 
 @app.post("/v1/batch", status_code=202)
-def batch(files: list[UploadFile], language: str = Form("en"),
-          diarize: bool = Form(False)):        # plain def: FastAPI runs it in a thread pool
+def batch(files: list[UploadFile], language: str = Form("en")):  # plain def: runs in a thread pool
     out = []
     for f in files:
         key = uuid.uuid4().hex                 # generated name; f.filename is only metadata
         with open(os.path.join(STORE, key), "wb") as dest:
             shutil.copyfileobj(f.file, dest)   # sync copy in bounded chunks, no await needed
-        out.append({"key": key[:8], "name": f.filename, "size": f.size, "type": f.content_type})
-    return {"language": language, "diarize": diarize, "files": out}
+        out.append([f.filename, f.size])
+    return {"language": language, "files": out}
 
-c = TestClient(app)
-r = c.post("/v1/batch",
-           files=[("files", ("a.wav", b"\0" * (3 << 20), "audio/wav")),   # 3 MiB: spooled to disk
-                  ("files", ("../b.wav", b"RIFF", "audio/wav"))],          # hostile name, kept as text
-           data={"language": "de", "diarize": "true"})
-print(r.status_code, r.json()["diarize"], [(f["name"], f["size"]) for f in r.json()["files"]])
-# 202 True [('a.wav', 3145728), ('../b.wav', 4)]
-print(c.post("/v1/batch", json={"language": "de"}).status_code)   # 422: JSON is not multipart
+r = TestClient(app).post("/v1/batch", data={"language": "de"},
+    files=[("files", ("a.wav", b"\0" * (3 << 20), "audio/wav")),   # 3 MiB: spooled to disk
+           ("files", ("../b.wav", b"RIFF", "audio/wav"))])          # hostile name, kept as text
+print(r.status_code, r.json())
+# 202 {'language': 'de', 'files': [['a.wav', 3145728], ['../b.wav', 4]]}
 shutil.rmtree(STORE)
 ```
+
+### Worked trace: the bytes of a 150 MiB recording
+| Stage | Where the bytes are | Peak memory for the part |
+|---|---|---|
+| request still arriving | Starlette's parser writes the part into a `SpooledTemporaryFile`; after the first 1 MiB it rolls over to the temp directory | around a megabyte, while 150 MiB lands on temp disk |
+| handler starts (only now) | copies the file in 150 one-MiB reads to the destination | around a megabyte |
+| after the copy | written to disk twice (temp file and destination) | — |
+| same request with `bytes = File()` | all 150 MiB in a single `bytes` object for the life of the handler | 150 MiB |
+
+- **The double write** is the cost a presigned direct upload avoids.
+- **The SHA-256** lets you deduplicate repeat uploads.
 
 ## Production patterns
 - **Temp space on a sized volume** — whenever uploads exceed a few megabytes. Point `TMPDIR` (which
@@ -454,6 +410,9 @@ shutil.rmtree(STORE)
 - **Upload concurrency budget** — when `def` handlers do the copying. Size the thread pool and worker
   memory for peak concurrent uploads, and cap concurrent uploads per tenant. Monitor thread-pool
   saturation, upload latency and worker memory.
+- **Treat `content_type` as a claim** — for every typed upload route. It is client-declared: reject a
+  mismatch with 415, and sniff the file's magic bytes before parsing. Send metadata alongside as one
+  JSON-string form field validated with `model_validate_json`.
 
 ## Trade-offs
 - **`UploadFile` vs `bytes = File()`.** `UploadFile` bounds memory by spooling to disk but costs a

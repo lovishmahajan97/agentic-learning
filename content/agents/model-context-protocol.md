@@ -386,9 +386,13 @@ A Python host connects to a local reference filesystem server over stdio, conver
 format with a namespace prefix, and runs the standard agent loop, routing each `tool_use` back to
 `session.call_tool`. The `mcp` package is the official Python SDK.
 
-For brevity it keeps only text content blocks; a production host would also forward images and
-`structuredContent`. Both examples were run against `mcp` 1.30.0 (pin `mcp<2`). In 2.x, `FastMCP` became
-`MCPServer`, fields are snake_case (`input_schema`, `is_error`), and only `ToolError` messages reach the model.
+For brevity it keeps only text content blocks and lets `call_tool` exceptions raise; a production host
+would also forward images and `structuredContent`, turn exceptions into `is_error` results and cap result
+size (see Production patterns).
+
+Both examples were run against `mcp` 1.30.0 (pin `mcp<2`). In 2.x,
+`FastMCP` became `MCPServer`, fields are snake_case (`input_schema`, `is_error`), and only `ToolError`
+messages reach the model.
 
 ```python
 import asyncio, anthropic
@@ -399,37 +403,25 @@ SERVER = StdioServerParameters(command="npx", args=["-y", "@modelcontextprotocol
                                                     "/data/reports"])          # sandboxed root
 
 async def main(question: str):
-    async with stdio_client(SERVER) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()                                   # version + capability handshake
-            listed = await session.list_tools()
-            tools = [{"name": f"fs__{t.name}", "description": t.description or "",
-                      "input_schema": t.inputSchema} for t in listed.tools]   # 1:1 mapping, namespaced
-            client = anthropic.AsyncAnthropic()                          # do not block the event loop
-            messages = [{"role": "user", "content": question}]
-            for _ in range(12):                                          # step budget
-                resp = await client.messages.create(model="claude-opus-5-5", max_tokens=8192,
-                                                    tools=tools, messages=messages)
-                messages.append({"role": "assistant", "content": resp.content})
-                if resp.stop_reason != "tool_use":
-                    return "".join(b.text for b in resp.content if b.type == "text")
-                results = []
-                for b in resp.content:
-                    if b.type != "tool_use":
-                        continue
-                    try:                                                 # protocol errors raise
-                        r = await session.call_tool(b.name.removeprefix("fs__"), arguments=b.input)
-                    except Exception as e:                               # map channel 2 to an error result
-                        results.append({"type": "tool_result", "tool_use_id": b.id,
-                                        "content": f"server error: {e}", "is_error": True})
-                        continue
-                    text = "\n".join(c.text for c in r.content if getattr(c, "type", "") == "text")
-                    if len(text) > 8000:                                 # cap, and say so
-                        text = text[:8000] + "\n[truncated: narrow the request]"
-                    results.append({"type": "tool_result", "tool_use_id": b.id,
-                                    "content": text, "is_error": bool(r.isError)})
-                messages.append({"role": "user", "content": results})
-            raise RuntimeError("step budget exhausted")
+    async with stdio_client(SERVER) as (read, write), ClientSession(read, write) as session:
+        await session.initialize()                                   # version + capability handshake
+        tools = [{"name": f"fs__{t.name}", "description": t.description or "",
+                  "input_schema": t.inputSchema} for t in (await session.list_tools()).tools]
+        client, messages = anthropic.AsyncAnthropic(), [{"role": "user", "content": question}]
+        for _ in range(12):                                          # step budget
+            resp = await client.messages.create(model="claude-opus-5-5", max_tokens=8192,
+                                                tools=tools, messages=messages)
+            messages.append({"role": "assistant", "content": resp.content})
+            if resp.stop_reason != "tool_use":
+                return "".join(b.text for b in resp.content if b.type == "text")
+            results = []
+            for b in (b for b in resp.content if b.type == "tool_use"):
+                r = await session.call_tool(b.name.removeprefix("fs__"), arguments=b.input)
+                text = "\n".join(c.text for c in r.content if c.type == "text")
+                results.append({"type": "tool_result", "tool_use_id": b.id,
+                                "content": text, "is_error": bool(r.isError)})
+            messages.append({"role": "user", "content": results})
+        raise RuntimeError("step budget exhausted")
 
 print(asyncio.run(main("Which reports under /data/reports mention Q3 churn, and what do they say?")))
 ```
@@ -489,6 +481,9 @@ definition.
   cache-read share per session.
 - **Gate actions after untrusted results.** For servers that return third-party content; route consequential
   tool calls after such reads through approval. Monitor gated actions per run.
+- **Cap each tool result and say so.** In every host; truncate large results (for example at 8,000
+  characters) and append a note such as `[truncated: narrow the request]` so the model asks for less.
+  Monitor truncation rate per tool.
 
 ## Trade-offs
 - **Write-once integration vs an extra hop.** A large ecosystem comes with an extra process or network hop

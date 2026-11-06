@@ -245,36 +245,31 @@ embedding, stacking and the tied LM head. `nn.RMSNorm` needs PyTorch 2.4+; swap 
 
 ```python
 import torch, torch.nn as nn, torch.nn.functional as F
-
 class Block(nn.Module):
     def __init__(self, d=512, n_heads=8, d_ff=2048):
         super().__init__()
-        self.h, self.dk = n_heads, d // n_heads
-        self.n1, self.n2 = nn.RMSNorm(d), nn.RMSNorm(d)
+        self.h, self.n1 = n_heads, nn.RMSNorm(d)
         self.qkv, self.o = nn.Linear(d, 3 * d, bias=False), nn.Linear(d, d, bias=False)
-        self.up, self.down = nn.Linear(d, d_ff, bias=False), nn.Linear(d_ff, d, bias=False)
-
+        self.mlp = nn.Sequential(nn.RMSNorm(d), nn.Linear(d, d_ff, bias=False), nn.GELU(),
+                                 nn.Linear(d_ff, d, bias=False))
     def forward(self, x):                                   # x: [B, n, d]
         B, n, d = x.shape
         q, k, v = self.qkv(self.n1(x)).split(d, dim=-1)
-        q, k, v = (t.view(B, n, self.h, self.dk).transpose(1, 2) for t in (q, k, v))  # [B, h, n, dk]
+        q, k, v = (t.view(B, n, self.h, -1).transpose(1, 2) for t in (q, k, v))  # [B, h, n, dk]
         a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         x = x + self.o(a.transpose(1, 2).reshape(B, n, d))  # residual 1: tokens have now mixed
-        return x + self.down(F.gelu(self.up(self.n2(x))))   # residual 2: per-position transform
+        return x + self.mlp(x)                              # residual 2: per-position transform
 
 class TinyLM(nn.Module):
     def __init__(self, vocab=32000, d=512, L=6, max_len=1024):
         super().__init__()
         self.emb, self.pos = nn.Embedding(vocab, d), nn.Embedding(max_len, d)
-        self.blocks = nn.ModuleList(Block(d) for _ in range(L))
+        self.blocks = nn.Sequential(*(Block(d) for _ in range(L)))
         self.norm, self.head = nn.RMSNorm(d), nn.Linear(d, vocab, bias=False)
         self.head.weight = self.emb.weight                  # weight tying: one matrix, two jobs
-
     def forward(self, ids):                                 # ids: [B, n] -> logits [B, n, vocab]
         x = self.emb(ids) + self.pos(torch.arange(ids.shape[1], device=ids.device))
-        for b in self.blocks:
-            x = b(x)
-        return self.head(self.norm(x))
+        return self.head(self.norm(self.blocks(x)))
 
 m = TinyLM(); ids = torch.randint(0, 32000, (2, 128))
 print(m(ids).shape, f"{sum(p.numel() for p in m.parameters())/1e6:.1f}M params")

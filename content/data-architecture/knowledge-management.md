@@ -235,7 +235,6 @@ flowchart TD
 Raw similarity would put the deprecated 14-day page first. The gates leave only the canonical answer.
 
 ```python
-import hashlib
 from datetime import date
 
 chunks = [
@@ -247,8 +246,6 @@ chunks = [
      "verified": date(2024, 6, 1), "acl": {"all"}, "sim": 0.81},
     {"text": "Refunds over $500 need HR sign-off.", "source": "hr", "authority": 1, "state": "published",
      "verified": date(2025, 2, 1), "acl": {"hr"}, "sim": 0.70},
-    {"text": "DRAFT: refund window may move to 60 days.", "source": "confluence", "authority": 2,
-     "state": "draft", "verified": None, "acl": {"all"}, "sim": 0.84},
 ]
 
 def candidates(chunks, user_groups, today=date(2025, 3, 1)):
@@ -256,10 +253,9 @@ def candidates(chunks, user_groups, today=date(2025, 3, 1)):
     for c in chunks:
         if c["state"] != "published" or not (c["acl"] & user_groups):
             continue                                   # lifecycle gate and ACL filter
-        h = hashlib.sha256(c["text"].encode()).hexdigest()
-        if h in seen:
+        if c["text"] in seen:
             continue                                   # exact duplicate: first (canonical) copy wins
-        seen.add(h)
+        seen.add(c["text"])
         age_days = (today - c["verified"]).days        # verification, not modification
         score = c["sim"] - 0.05 * (c["authority"] - 1) - 0.0001 * age_days
         out.append((round(score, 3), c["source"], c["text"]))

@@ -244,80 +244,61 @@ derived from, so a forward traversal from a deleted document reaches the memory.
 ```python
 import uuid
 
-trace_spans = []   # stand-in for your tracing backend
-memories = {}      # memory_id -> row
+trace_spans, memories = [], {}   # stand-ins for your tracing backend and memory store
 
 def search_docs(query: str, trace_id: str, hits: list[dict]) -> list[dict]:
-    trace_spans.append({"trace_id": trace_id, "tool": "search_docs", "query": query,
-                        "chunk_ids": [h["chunk_id"] for h in hits],
-                        "source_versions": [h["source_version"] for h in hits]})
+    trace_spans.append({"trace_id": trace_id, "query": query, "chunk_ids": [h["chunk_id"] for h in hits]})
     return hits
 
 def write_memory(summary: str, trace_id: str, conversation_id: str, model: str) -> str:
     used = [c for s in trace_spans if s["trace_id"] == trace_id for c in s["chunk_ids"]]
-    mid = str(uuid.uuid4())[:8]
+    mid = uuid.uuid4().hex[:8]
     memories[mid] = {"text": summary, "conversation_id": conversation_id,
                      "derived_from_chunks": used, "model": model}
     return mid
 
 def memories_derived_from(doc_id: str) -> list[str]:
-    """Forward traversal for the request path: which memories quote this document?"""
     return [m for m, row in memories.items()
             if any(c.startswith(f"chunk:{doc_id}:") for c in row["derived_from_chunks"])]
 
-hits = [{"chunk_id": "chunk:kb/42:h1:0", "source_version": "h1", "text": "Refunds take 5 days."}]
-search_docs("refund time", "t-1", hits)
-write_memory("User was told refunds take 5 days.", "t-1", "conv-9", "model-2025-01")
-print(memories_derived_from("kb/42"))   # the memory to purge or refresh when kb/42 changes
+search_docs("refund time", "t-1", [{"chunk_id": "chunk:kb/42:h1:0"}])
+mid = write_memory("User was told refunds take 5 days.", "t-1", "conv-9", "model-2025-01")
+print(memories_derived_from("kb/42") == [mid])   # True: the memory to purge when kb/42 changes
 ```
 
 ### A minimal lineage recorder with forward and backward traversal
-It writes versioned dataset nodes and run edges to an in-memory store, then answers the two traversals
-that matter: forward impact from a document and backward root cause from a chunk.
+It writes versioned dataset nodes and run edges, then answers the two traversals that matter: forward
+impact from a document and backward root cause from a chunk.
 
 ```python
-import hashlib, uuid, time
+import hashlib
 
 edges = []          # (run_id, direction, dataset_id)
-runs = {}           # run_id -> facets
 chunk_lineage = {}  # chunk_id -> facets
 
-def version_of(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()[:12]
-
-def ingest(doc_id: str, text: str, commit: str, chunker="recursive-v3", emb="emb-v7"):
-    run_id = str(uuid.uuid4())[:8]
-    doc_ver = version_of(text.encode())
-    runs[run_id] = {"job": "ingest", "commit": commit, "chunker": chunker,
-                    "embedding_version": emb, "started": time.time()}
-    edges.append((run_id, "reads", f"doc:{doc_id}@{doc_ver}"))
+def ingest(doc_id: str, text: str, run_id: str, commit: str, chunker="recursive-v3") -> str:
+    ver = hashlib.sha256(text.encode()).hexdigest()[:6]
+    edges.append((run_id, "reads", f"doc:{doc_id}@{ver}"))
     for i, piece in enumerate(text.split(". ")):            # stand-in chunker
-        chunk_id = f"chunk:{doc_id}:{doc_ver}:{i}"
-        chunk_lineage[chunk_id] = {"source": f"doc:{doc_id}@{doc_ver}", "run": run_id,
-                                   "chunker": chunker, "embedding_version": emb}
+        chunk_id = f"chunk:{doc_id}:{ver}:{i}"
+        chunk_lineage[chunk_id] = {"source": f"doc:{doc_id}@{ver}", "run": run_id,
+                                   "commit": commit, "chunker": chunker}
         edges.append((run_id, "writes", chunk_id))
-    return run_id
+    return f"doc:{doc_id}@{ver}"
 
-def forward(dataset_id: str):
-    """Everything derived from a dataset version (deletion propagation / impact)."""
-    out, frontier = set(), {dataset_id}
-    while frontier:
-        d = frontier.pop()
-        for run_id in {r for r, dir_, ds in edges if dir_ == "reads" and ds == d}:
-            for r, dir_, ds in edges:
-                if r == run_id and dir_ == "writes" and ds not in out:
-                    out.add(ds); frontier.add(ds)
-    return out
+def forward(dataset_id: str) -> set[str]:
+    """Everything derived from a dataset version (deletion propagation / impact). Assumes a DAG."""
+    readers = {r for r, d, ds in edges if d == "reads" and ds == dataset_id}
+    out = {ds for r, d, ds in edges if d == "writes" and r in readers}
+    return out.union(*(forward(ds) for ds in out))
 
-def backward(chunk_id: str):
+def backward(chunk_id: str) -> dict:
     """Why does this chunk look the way it does?"""
-    lin = chunk_lineage[chunk_id]
-    return {**lin, "run_facets": runs[lin["run"]]}
+    return chunk_lineage[chunk_id]
 
-r1 = ingest("kb/42", "Refunds take 5 days. Chat support is 24/7.", commit="a1b2c3")
-doc_node = next(ds for r, d, ds in edges if r == r1 and d == "reads")
-print(sorted(forward(doc_node)))      # the chunks to delete if kb/42 must be erased
-print(backward("chunk:kb/42:%s:0" % doc_node.split("@")[1]))
+doc = ingest("kb/42", "Refunds take 5 days. Chat support is 24/7.", "run-1", commit="a1b2c3")
+chunks = sorted(forward(doc))
+print(len(chunks), backward(chunks[0])["commit"])   # 2 a1b2c3: both chunks to erase, and which code made them
 ```
 
 In a real system the same records would be OpenLineage events to a catalog, and the agent trace would

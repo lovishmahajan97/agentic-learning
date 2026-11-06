@@ -222,27 +222,27 @@ compares them. URLs and model names are placeholders.
 import json
 from openai import OpenAI
 
-BACKENDS = {
-    "proprietary": OpenAI(),                                              # key from the environment
-    "open_weight": OpenAI(base_url="http://vllm.internal:8000/v1", api_key="unused"),
+BACKENDS = {   # backend -> (client, model); same client code for both
+    "proprietary": (OpenAI(), "<pinned dated model id>"),             # key from the environment
+    "open_weight": (OpenAI(base_url="http://vllm.internal:8000/v1", api_key="unused"),
+                    "<served model name>"),
 }
-MODELS = {"proprietary": "<pinned dated model id>", "open_weight": "<served model name>"}
 TOOLS = [{"type": "function", "function": {
     "name": "lookup_order", "description": "Fetch an order by id",
     "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
                    "required": ["order_id"]}}}]
 
 def tool_call_ok(backend, prompt, expected_tool):
-    resp = BACKENDS[backend].chat.completions.create(
-        model=MODELS[backend], messages=[{"role": "user", "content": prompt}], tools=TOOLS)
+    client, model = BACKENDS[backend]
+    resp = client.chat.completions.create(
+        model=model, messages=[{"role": "user", "content": prompt}], tools=TOOLS)
     calls = resp.choices[0].message.tool_calls or []
     if not calls or calls[0].function.name != expected_tool:
         return False
     try:
-        args = json.loads(calls[0].function.arguments)   # malformed JSON counts as a failure
-    except json.JSONDecodeError:
+        return "order_id" in json.loads(calls[0].function.arguments)
+    except json.JSONDecodeError:                      # malformed JSON counts as a failure
         return False
-    return "order_id" in args
 
 # for b in BACKENDS: print(b, sum(tool_call_ok(b, c["prompt"], c["tool"]) for c in cases) / len(cases))
 ```
@@ -292,32 +292,6 @@ print(f"mass on allowed labels: {mass:.3f}")   # low mass: the model wanted to s
 Through a proprietary API the same classification needs a generated answer parsed from text, and any
 confidence must be inferred from limited top-k log probabilities, if the provider exposes them at all.
 
-### Supply-chain gate for open weights
-Download only safetensors and config files at a pinned revision, then compare file hashes with a
-manifest committed when the artefact was first reviewed. Run it in CI and at deploy time.
-
-```python
-import hashlib, json, pathlib
-from huggingface_hub import snapshot_download
-
-REPO, REV = "Qwen/Qwen2.5-0.5B-Instruct", "<commit hash from the model page>"
-path = pathlib.Path(snapshot_download(
-    REPO, revision=REV,
-    allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model"],   # no pickle (.bin/.pt) files
-))
-
-def sha256(p, chunk=1 << 20):
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        for block in iter(lambda: f.read(chunk), b""):
-            h.update(block)
-    return h.hexdigest()
-
-actual = {p.name: sha256(p) for p in sorted(path.glob("*.safetensors"))}
-pinned = json.loads(pathlib.Path("model-manifest.json").read_text())   # reviewed, committed
-assert actual == pinned, "weights differ from the reviewed artefact"
-```
-
 ### Worked decision: one company, three task families
 Illustrative; each row applies "How the decision runs" in order.
 
@@ -351,6 +325,9 @@ All three sit behind one gateway and one eval harness, so a row can change when 
 - **Deprecation calendar for proprietary models.** For every pinned API version. Track announced
   retirement dates, and open the migration eval the day a notice arrives. Monitor days of runway left
   versus the time your last migration took.
+- **Download only reviewed file types.** Fetch weights with `huggingface_hub.snapshot_download` at the
+  pinned revision and `allow_patterns` limited to `*.safetensors`, `*.json`, `*.txt` and `*.model`, so no
+  pickle (`.bin`/`.pt`) file is ever pulled; hash each safetensors file and compare with the manifest.
 
 ## Trade-offs
 - **Open weights: control vs operations.** Lifecycle control and physical data isolation, but you take on

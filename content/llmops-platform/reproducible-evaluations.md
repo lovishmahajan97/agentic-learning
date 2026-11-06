@@ -208,43 +208,31 @@ flowchart TD
 ```
 
 ## Examples
-### Manifest, noise floor and comparability check
-A manifest builder, a noise-floor measurement, and a comparability check. The run id is derived from the
-manifest, so re-running with the same pins produces the same id; a changed pin produces a new one. The
-noise floor is measured on the champion before any candidate is judged against it.
+### Manifest and noise floor
+A manifest builder and a noise-floor measurement. The run id is derived from the manifest, so re-running
+with the same pins produces the same id; a changed pin produces a new one. The noise floor is measured on
+the champion before any candidate is judged against it.
 
 ```python
-import hashlib, json, statistics, subprocess, pathlib
+import hashlib, json, random, statistics
 
-def sha(path: str) -> str:
-    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()[:12]
-
-def build_manifest(bundle: dict, dataset_version: str, scorers: dict, image_digest: str) -> tuple[str, dict]:
-    git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
-    m = {"dataset": dataset_version,                       # content hash of the items, never a file name
-         "bundle": bundle,                                  # {"model": "vendor-model-2025-04-14", "prompt": "support@v12",
-                                                            #  "params": {"temperature": 0.7, "max_tokens": 400}, "index": "idx-2025-06-01"}
-         "scorers": scorers,                                # {"judge_model": "judge-2025-01-15", "rubric": "helpfulness@v3"}
-         "env": {"git": git_sha, "lock": sha("uv.lock"), "image": image_digest},
+def build_manifest(bundle, dataset_hash, scorers, env):
+    m = {"dataset": dataset_hash,                  # content hash of the items, never a file name
+         "bundle": bundle, "scorers": scorers, "env": env,   # env: git sha, lockfile hash, image digest
          "policy": {"concurrency": 8, "timeout_s": 60, "retries": 2, "cache": "read-write"}}
-    run_id = hashlib.sha256(json.dumps(m, sort_keys=True).encode()).hexdigest()[:12]
-    return run_id, m
+    return hashlib.sha256(json.dumps(m, sort_keys=True).encode()).hexdigest()[:12], m
 
-def noise_floor(run_once, k: int = 3) -> tuple[float, float]:
-    """run_once() executes the SAME manifest with cache disabled and returns per-item scores.
-    The spread between repeats is the smallest delta anyone is allowed to believe."""
+def noise_floor(run_once, k=3):                    # run_once: the SAME manifest, cache off
     means = [statistics.mean(run_once()) for _ in range(k)]
-    return statistics.mean(means), max(means) - min(means)
+    return statistics.mean(means), max(means) - min(means)   # smallest delta anyone may believe
 
-def comparable(a: dict, b: dict) -> tuple[bool, dict]:
-    checks = {k: a[k] == b[k] for k in ("dataset", "scorers")}
-    checks["same_model"] = a["bundle"]["model"] == b["bundle"]["model"]   # false is fine for a model-upgrade eval, but say so
-    return all(checks[k] for k in ("dataset", "scorers")), checks
-
-# champion_mean, floor = noise_floor(lambda: run_eval(champion_manifest, cache=False))
-# delta = candidate_mean - champion_mean
-# if abs(delta) <= floor: print("within noise: not a result")  # generation noise only; the paired interval
-#                                                               # over items (gate lesson) must also exclude it
+bundle = {"model": "vendor-model-2025-04-14", "prompt": "support@v12", "params": {"temperature": 0.7}}
+pins = (bundle, "golden-v8@5c2e91", {"judge_model": "judge-2025-01-15", "rubric": "helpfulness@v3"},
+        {"git": "a1b2c3d", "lock": "9f8e7d", "image": "sha256:4c1d"})
+print(build_manifest(*pins)[0] == build_manifest(*pins)[0])   # True: same pins, same run id
+rng = random.Random(0)
+mean, floor = noise_floor(lambda: [float(rng.random() < 0.7) for _ in range(200)])
+print(f"champion {mean:.3f}, floor {floor:.3f}")   # champion 0.693, floor 0.015: smaller deltas are noise
 ```
 
 ### Freezing an agent's world: replayed tools, fixed clock, fresh memory
@@ -255,32 +243,25 @@ the manifest's runtime inputs.
 ```python
 import hashlib, json, datetime
 
+key = lambda tool, args: hashlib.sha256(json.dumps([tool, args], sort_keys=True).encode()).hexdigest()[:16]
+
 class FrozenWorld:
-    def __init__(self, recording: dict, now: str):
-        self.recording = recording                       # {request_hash: tool_result}
+    def __init__(self, recording, now):
+        self.recording, self.misses = recording, []      # recording: {request_hash: tool_result}
         self.now = datetime.datetime.fromisoformat(now)  # injected clock: no "today" leaking in
-        self.misses = []
-
-    @staticmethod
-    def key(tool, args):
-        return hashlib.sha256(json.dumps([tool, args], sort_keys=True).encode()).hexdigest()[:16]
-
     def call_tool(self, tool, args):
-        k = self.key(tool, args)
-        if k not in self.recording:                      # a new path: record it, never call live in an eval
+        if key(tool, args) not in self.recording:        # a new path: log it, never call live in an eval
             self.misses.append((tool, args))
             return {"error": "not in recording"}
-        return self.recording[k]
-
+        return self.recording[key(tool, args)]
     def new_memory(self):
         return {}                                        # fresh per task, so task order cannot leak state
 
-rec = {FrozenWorld.key("search_orders", {"customer": "c42"}): [{"id": "1182", "status": "delivered"}]}
+rec = {key("search_orders", {"customer": "c42"}): [{"id": "1182", "status": "delivered"}]}
 world = FrozenWorld(rec, now="2025-06-01T09:00:00")
-print(world.call_tool("search_orders", {"customer": "c42"}))   # replayed
-print(world.call_tool("search_orders", {"customer": "c43"}))   # miss, logged
-recording_hash = hashlib.sha256(json.dumps(rec, sort_keys=True).encode()).hexdigest()[:12]
-runtime_inputs = {"clock": "2025-06-01T09:00:00", "tools": recording_hash, "memory": "fresh-per-task"}
+print(world.call_tool("search_orders", {"customer": "c42"}))   # replayed: [{'id': '1182', ...}]
+print(world.call_tool("search_orders", {"customer": "c43"}))   # miss, logged: {'error': 'not in recording'}
+recording_hash = hashlib.sha256(json.dumps(rec, sort_keys=True).encode()).hexdigest()[:12]   # into the manifest
 ```
 
 ### Repeats per item, then a paired interval over items
@@ -292,21 +273,18 @@ still includes zero: only more items can resolve a gain this small.
 import random, statistics
 
 def paired_interval(champ, cand, n_boot=2000, seed=0):
-    """champ, cand: {item_id: [score per repeat]} on IDENTICAL items.
-    Average repeats per item first (shrinks generation noise), then bootstrap over items
-    (quantifies item-sampling noise, which repeats cannot touch)."""
-    ids = sorted(champ)
-    diffs = [statistics.mean(cand[i]) - statistics.mean(champ[i]) for i in ids]
+    """champ, cand: {item_id: [score per repeat]} on IDENTICAL items. Average repeats per item
+    (shrinks generation noise), then bootstrap over items (item-sampling noise)."""
+    diffs = [statistics.mean(cand[i]) - statistics.mean(champ[i]) for i in sorted(champ)]
     rng = random.Random(seed)
     boots = sorted(statistics.mean(rng.choices(diffs, k=len(diffs))) for _ in range(n_boot))
     return statistics.mean(diffs), boots[int(0.025 * n_boot)], boots[int(0.975 * n_boot)]
 
-rng = random.Random(42)                       # synthetic pass/fail scores, 3 repeats per item
-p_champ = {f"i{k}": rng.random() for k in range(100)}           # each item's true pass probability
-p_cand = {k: min(1.0, p + 0.03) for k, p in p_champ.items()}    # candidate truly +3 points per item
-draw = lambda p: [float(rng.random() < p) for _ in range(3)]
+rng = random.Random(42)
+p_champ = {f"i{k}": rng.random() for k in range(100)}            # each item's true pass probability
+draw = lambda p: [float(rng.random() < p) for _ in range(3)]     # 3 repeats per item
 champ = {k: draw(p) for k, p in p_champ.items()}
-cand = {k: draw(p) for k, p in p_cand.items()}
+cand = {k: draw(min(1.0, p + 0.03)) for k, p in p_champ.items()} # candidate truly +3 points
 
 delta, lo, hi = paired_interval(champ, cand)
 print(f"delta={delta:+.3f}  95% CI [{lo:+.3f}, {hi:+.3f}]")   # an interval several points wide around +0.03
@@ -363,6 +341,10 @@ A research agent on 60 tasks with replayed tools, run five times on the same man
 - **Retained evidence with the promoted bundle** — for regulated or customer-facing commitments. Store
   manifest, raw outputs, scores and approvals together and keep them for the retention period your policy
   sets. Monitor that every promoted bundle has a retrievable evidence record.
+- **Comparability check before any comparison.** Two runs are comparable only with the same dataset hash
+  and the same scorers (judge snapshot and rubric); a different model is fine for a model-upgrade eval but
+  the report must say so. A delta inside the noise floor is not a result, and the paired interval over
+  items must also exclude zero.
 
 ## Trade-offs
 - **Stable comparisons vs re-baselining.** Pinning dated snapshots gives stable comparisons, but every

@@ -193,83 +193,54 @@ flowchart TD
 ## Examples
 ### A minimal rail pipeline
 Deterministic checks first, a small label-only classifier second, the main model in the middle, and a
-canary leak check on the way out. Each rail is a pure function you can unit test with a fixture set, and
-each block reason maps to its own honest message.
+canary leak check on the way out. Each block returns its own honest message instead of a crash.
 
 ```python
 import re, anthropic                           # checked against anthropic SDK 2.1.0
-from dataclasses import dataclass
 
 client = anthropic.Anthropic()
 CANARY = "zx-canary-7f3a"                      # planted in the system prompt; must never be echoed
 SYSTEM = f"You are a billing-support assistant for AcmePay. Internal tag: {CANARY}."
 INJECTION = re.compile(r"ignore (all|previous|the above) instructions|you are now", re.I)  # crude by design
 CARD = re.compile(r"\b\d(?:[ -]?\d){12,15}\b")    # 13-16 digits; never eats the trailing space
-MESSAGES = {"too_long": "Please shorten your message to under 8,000 characters.",
-            "injection_pattern": "I can't process that request. Please rephrase your billing question.",
-            "off_topic": "I can only help with AcmePay billing, payments and account access.",
-            "out_of_policy": "I can't give legal, tax or investment advice; a human agent will follow up."}
+TOPIC = "Is the text about billing, payments or account access? Reply ON or OFF only."
 
-@dataclass
-class Verdict:
-    allow: bool
-    reason: str = ""
-
-def classify(policy: str, text: str) -> str:    # checker sees policy + delimited text only; label-only output
-    r = client.messages.create(model="claude-haiku-5-5", max_tokens=1024, system=policy,
-                               messages=[{"role": "user", "content": f"<text>{text}</text>"}])
-    return next(b.text for b in r.content if b.type == "text").strip().upper()
-
-def input_rails(text: str) -> tuple[Verdict, str]:   # returns the verdict and the text to send onward
-    if len(text) > 8000: return Verdict(False, "too_long"), text
-    if INJECTION.search(text): return Verdict(False, "injection_pattern"), text
-    text = CARD.sub("[CARD REMOVED]", text)       # redact rather than block: the user meant no harm
-    label = classify("Is the text about billing, payments or account access? Reply ON or OFF only.", text)
-    return Verdict(label.startswith("ON"), "off_topic"), text
-
-def output_rails(answer: str) -> Verdict:
-    if CANARY in answer: return Verdict(False, "system_prompt_leak")   # near-zero false positives: hard block
-    if CARD.search(answer): return Verdict(False, "card_number_in_output")
-    label = classify("Does the text give legal, tax or investment advice? Reply YES or NO only.", answer)
-    return Verdict(label.startswith("NO"), "out_of_policy")
+def ask(system: str, text: str, model: str = "claude-haiku-5-5") -> str:
+    r = client.messages.create(model=model, max_tokens=1024, system=system,
+                               messages=[{"role": "user", "content": text}])
+    return next(b.text for b in r.content if b.type == "text").strip()
 
 def answer(user_text: str) -> str:
-    v, clean = input_rails(user_text)
-    if not v.allow:
-        print("input_block", v.reason); return MESSAGES[v.reason]       # log line carries the trace id in real code
-    r = client.messages.create(model="claude-opus-5-5", max_tokens=1024, system=SYSTEM,
-                               messages=[{"role": "user", "content": clean}])
-    text = next(b.text for b in r.content if b.type == "text")
-    v = output_rails(text)
-    if not v.allow:
-        print("output_block", v.reason)
-        return MESSAGES.get(v.reason, "I can't share that; a human agent will follow up.")
+    if INJECTION.search(user_text):                                  # 1. deterministic rail, cheapest first
+        return "I can't process that request. Please rephrase your billing question."
+    clean = CARD.sub("[CARD REMOVED]", user_text)                    # 2. redact rather than block
+    if not ask(TOPIC, f"<text>{clean}</text>").upper().startswith("ON"):  # 3. label-only classifier
+        return "I can only help with AcmePay billing, payments and account access."
+    text = ask(SYSTEM, clean, model="claude-opus-5-5")               # the main model
+    if CANARY in text or CARD.search(text):                          # 4. output rail: exact match, hard block
+        return "I can't share that; a human agent will follow up."
     return text
-# answer("My card 4111 1111 1111 1111 was charged twice") -> the model sees "[CARD REMOVED]";
-# answer("Should I move my savings into index funds?") -> off_topic, a specific message, not a crash.
+# answer("My card 4111 1111 1111 1111 was charged twice") -> the model sees "[CARD REMOVED]"
+# answer("Should I move my savings into index funds?") -> the off-topic message, not a crash
 ```
 
 ### Rail-stack calculator: should this rail block or flag?
 Pure Python; plug in your own measured rates from a labelled set.
 
 ```python
-def stack_false_block(fp_rates):
-    """Share of legitimate requests blocked by at least one independent rail."""
-    keep = 1.0
-    for fp in fp_rates:
-        keep *= 1 - fp
-    return 1 - keep
+import math
 
-def block_precision(prevalence, recall, fp_rate):
-    """Share of a rail's blocks that are real attacks."""
-    tp = prevalence * recall
-    fp = (1 - prevalence) * fp_rate
+def stack_false_block(fp_rates):         # share of legitimate requests blocked by at least one rail
+    return 1 - math.prod(1 - fp for fp in fp_rates)
+
+def block_precision(prevalence, recall, fp_rate):   # share of a rail's blocks that are real attacks
+    tp, fp = prevalence * recall, (1 - prevalence) * fp_rate
     return tp / (tp + fp)
 
 print(f"{stack_false_block([0.01] * 5):.1%}")          # 4.9% of good traffic lost to five 1% rails
 p = block_precision(0.001, 0.95, 0.01)
-print(f"{p:.1%}")                                       # ~8.7%: most blocks are wrong
-print("hard-block" if p > 0.9 else "flag for review")  # -> flag for review
+print(f"{p:.1%}")                                       # 8.7%: most blocks are wrong
+print("hard-block" if p > 0.9 else "flag for review")  # flag for review
 ```
 
 ### Worked scenario: one rail, 100,000 requests
@@ -317,6 +288,9 @@ only consequential tool calls and flag the rest (the flags still feed review and
   rail interruptions per task, not only per request, because tasks span many checks.
 - **Weekly block-log triage.** Sample blocked and flagged requests, label them, and track per-rail
   false-positive rate and block precision; re-run the red-team suite after every prompt or model change.
+- **Cap input length and add an output policy classifier.** Reject inputs over a fixed size (for example
+  8,000 characters) before any model call, and run a label-only check such as "legal, tax or investment
+  advice? YES or NO" on outputs, routing hits to a human. Log each block reason with the trace id.
 
 ## Trade-offs
 - **Safety vs latency and cost.** Every rail adds both; a serial LLM checker can double median latency.

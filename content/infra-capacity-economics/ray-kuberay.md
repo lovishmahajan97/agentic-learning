@@ -236,21 +236,17 @@ class Embedder:
         self.model = SentenceTransformer("all-MiniLM-L6-v2", device="cuda")
 
     def __call__(self, batch: dict) -> dict:
-        texts = [str(t)[:2000] for t in batch["text"]]
-        batch["embedding"] = self.model.encode(texts, batch_size=128)  # (n, 384) array
+        batch["embedding"] = self.model.encode(list(batch["text"]), batch_size=128)  # (n, 384)
         return batch
-
-ray.init()  # inside a RayJob this connects to the cluster it created
 
 ds = ray.data.read_parquet("s3://corpus/docs/")                    # streamed, CPU tasks
 ds = ds.filter(lambda row: row["text"] is not None)                # CPU tasks
 ds = ds.map_batches(Embedder, batch_size=512, num_gpus=1, concurrency=4)  # 4 GPU actors
 ds.write_parquet("s3://corpus/embeddings/")                         # triggers execution
-
-# Ray Data executes lazily and streams: reading, filtering and embedding overlap, and
-# back-pressure stops readers from filling the object store when GPUs fall behind.
 ```
 
+- **Lazy and streaming:** reading, filtering and embedding overlap, and back-pressure stops readers from
+  filling the object store when GPUs fall behind.
 - **Rough cost reasoning (illustrative):** if one GPU actor sustains about 1,000 documents per second, four
   actors finish 10 million in roughly 40 minutes plus cluster start-up.
 - **`shutdownAfterJobFinishes`** means you pay for about that long, not for an always-on pool.
@@ -374,6 +370,8 @@ app = Reranker.bind()       # deploy with `serve run module:app`, or from a RayS
 - **Separate worker groups per GPU tier.** Use when jobs need different cards, such as a small embedder
   and a large model. Define one worker group per card type with a node selector, plus custom resources so
   actors target the right group. Monitor pending demand per group to see which tier is the bottleneck.
+- **Truncate long documents before embedding.** Cap input text (for example 2,000 characters) to what the
+  embedder's context holds, so one oversized row cannot slow or fail a GPU batch.
 
 ## Trade-offs
 - **One Python program vs a second scheduler.** It can express a whole CPU-to-GPU pipeline with stateful

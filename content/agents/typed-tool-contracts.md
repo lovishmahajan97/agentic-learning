@@ -160,76 +160,65 @@ flowchart TD
 
 ## Examples
 ### A registry entry derived from types
-The handler receives a validated `SearchOrdersIn`, must return something that validates as
-`SearchOrdersOut`, and any failure becomes a typed error. The `read_only` and `parallel_safe` flags are
-read by the harness, not the model.
+The harness side: the handler receives a validated input model, must return something that validates as the
+output model, and any failure becomes a typed error. The `read_only` and `parallel_safe` flags are read by
+the harness, not the model.
 
 ```python
-# Python 3.10+ (X | None in a field); checked with pydantic 2.14.1. Try SEARCH.run({"customer_id": "C-10492"}).
-import json
+# Python 3.10+ (X | None in a field); checked with pydantic 2.14.1.
 from dataclasses import dataclass
-from enum import Enum
 from typing import Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-class ErrorKind(str, Enum):
-    not_found = "not_found"; invalid_argument = "invalid_argument"; transient = "transient"
-    internal = "internal"
-
-class ToolError(Exception):
-    def __init__(self, kind: ErrorKind, message: str, retryable: bool = False):
-        super().__init__(message)
-        self.body = {"kind": kind.value, "message": message, "retryable": retryable}
-
-class SearchOrdersIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    customer_id: str = Field(description="Customer id, e.g. C-10492")
-    status: Literal["open", "shipped", "delivered"] | None = Field(default=None, description="Filter")
-    limit: int = Field(default=10, ge=1, le=50, description="Max rows, 1-50")
-
-class OrderRow(BaseModel):
-    order_id: str; status: str; total_cents: int; placed_on: str
-
-class SearchOrdersOut(BaseModel):
-    orders: list[OrderRow]; total_matches: int; truncated: bool
+class ToolError(Exception): ...   # arg: {"kind": "not_found" | "transient", "message", "retryable"}
 
 @dataclass
 class Tool:
     name: str; description: str; input_model: type[BaseModel]; output_model: type[BaseModel]
     handler: Callable; read_only: bool = True; parallel_safe: bool = True   # harness-only metadata
 
-    def spec(self) -> dict:                                 # what the model sees, derived from types
+    def spec(self) -> dict:                             # what the model sees, derived from types
         return {"name": self.name, "description": self.description,
                 "input_schema": self.input_model.model_json_schema()}
 
-    def run(self, raw_input: dict) -> tuple[str, bool]:     # (content, is_error)
+    def run(self, raw_input: dict) -> tuple[dict, bool]:  # (content, is_error)
         try:
             args = self.input_model.model_validate(raw_input)
         except ValidationError as e:
-            msg = "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors())
-            return json.dumps({"kind": "invalid_argument", "message": msg, "retryable": False}), True
+            return {"kind": "invalid_argument", "retryable": False,
+                    "message": "; ".join(f"{x['loc'][0]}: {x['msg']}" for x in e.errors())}, True
         try:
-            out = self.output_model.model_validate(self.handler(args))   # output is checked too
-            return out.model_dump_json(), False
+            return self.output_model.model_validate(self.handler(args)).model_dump(), False
         except ToolError as e:
-            return json.dumps(e.body), True
-        except ValidationError:                             # handler broke its own output contract
-            return json.dumps({"kind": "internal", "message": "tool returned malformed data",
-                               "retryable": False}), True  # our bug, not the model's: log and alert
+            return e.args[0], True
+        except ValidationError:                         # handler broke its own output contract
+            return {"kind": "internal", "message": "tool returned malformed data", "retryable": False}, True
+```
 
-CUSTOMERS = {"C-10492"}
-ALL_ORDERS = [{"order_id": "O-1", "customer_id": "C-10492", "status": "shipped",
-               "total_cents": 12_900, "placed_on": "2026-10-02"}]
+One tool on that harness. Run it after the block above; the three calls are the rows of the next table.
 
+```python
+class SearchOrdersIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    customer_id: str = Field(description="Customer id, e.g. C-10492")
+    status: Literal["open", "shipped", "delivered"] | None = None
+    limit: int = Field(default=10, ge=1, le=50, description="Max rows, 1-50")
+
+class SearchOrdersOut(BaseModel):
+    orders: list[dict]; total_matches: int; truncated: bool
+
+ORDERS = [{"order_id": "O-1", "customer_id": "C-10492", "status": "shipped"}]
 def search_orders(args: SearchOrdersIn) -> dict:
-    rows = [r for r in ALL_ORDERS if r["customer_id"] == args.customer_id
-            and (args.status is None or r["status"] == args.status)]
-    if not rows and args.customer_id not in CUSTOMERS:
-        raise ToolError(ErrorKind.not_found, f"customer {args.customer_id} not found")
+    if args.customer_id != "C-10492":
+        raise ToolError({"kind": "not_found", "message": "customer not found", "retryable": False})
+    rows = [r for r in ORDERS if args.status in (None, r["status"])]
     return {"orders": rows[:args.limit], "total_matches": len(rows), "truncated": len(rows) > args.limit}
 
 SEARCH = Tool("search_orders", "Find a customer's orders. Call when the user asks about their "
               "orders without giving an order id.", SearchOrdersIn, SearchOrdersOut, search_orders)
+print(SEARCH.run({"customer_id": "C-10492", "status": "shipped"}))  # ({'orders': [...], ...}, False)
+print(SEARCH.run({"customer_id": "C-10492", "limit": 100}))  # invalid_argument naming limit <= 50
+print(SEARCH.run({"customer_id": "C-99999"}))                # not_found, retryable False
 ```
 
 ### What the outcomes look like to the model

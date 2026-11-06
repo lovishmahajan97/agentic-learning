@@ -250,7 +250,7 @@ any Hugging Face tokenizer with a chat template.
 
 ```python
 import hashlib, json
-IGNORE, SEQ_LEN, SHARD_ROWS = -100, 4096, 2048
+IGNORE, SEQ_LEN = -100, 4096
 
 def render(tok, messages):
     prompt = tok.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
@@ -258,8 +258,7 @@ def render(tok, messages):
     enc = lambda s: tok(s, add_special_tokens=False)["input_ids"]   # template already has BOS
     p_ids, f_ids = enc(prompt), enc(full)
     assert f_ids[:len(p_ids)] == p_ids, "template must be prefix-stable"
-    labels = [IGNORE] * len(p_ids) + f_ids[len(p_ids):]      # loss only on the final assistant turn
-    return f_ids, labels
+    return f_ids, [IGNORE] * len(p_ids) + f_ids[len(p_ids):]       # loss only on the final assistant turn
 
 def pack(examples, tok):
     ids, labels, doc_ids = [], [], []
@@ -273,20 +272,11 @@ def pack(examples, tok):
     if ids:
         yield ids, labels, doc_ids                              # trainer pads this last one
 
-def write_shards(packed, path):
-    manifest, rows = [], []
-    def flush():
-        blob = json.dumps(rows).encode(); name = f"{path}/shard-{len(manifest):05d}.json"
-        with open(name, "wb") as f: f.write(blob)
-        manifest.append({"shard": name, "rows": len(rows), "sha256": hashlib.sha256(blob).hexdigest()})
-    for ids, labels, doc_ids in packed:
-        rows.append({"input_ids": ids, "labels": labels, "doc_ids": doc_ids})  # doc_ids -> attention mask
-        if len(rows) == SHARD_ROWS:
-            flush(); rows = []
-    if rows:
-        flush()                                                 # keep the final partial shard
-    with open(f"{path}/manifest.json", "w") as f:
-        json.dump(manifest, f)                                  # the dataset version is this file's hash
+def write_shard(packed, name):                                  # real pipelines write fixed-size shards
+    blob = json.dumps([{"input_ids": i, "labels": l, "doc_ids": d} for i, l, d in packed]).encode()
+    with open(name, "wb") as f:
+        f.write(blob)
+    return {"shard": name, "sha256": hashlib.sha256(blob).hexdigest()}   # one dataset-manifest entry
 ```
 
 - **`doc_ids`** lets a trainer that supports it block attention across packed documents.
@@ -302,15 +292,11 @@ def p_candidate(s, b, r):
     return 1 - (1 - s**r) ** b
 
 for b, r in [(20, 5), (10, 10), (50, 2)]:                  # each uses k = b*r = 100 hash functions
-    thr = (1 / b) ** (1 / r)
     row = "  ".join(f"s={s}: {p_candidate(s, b, r):.4f}" for s in (0.3, 0.5, 0.8))
-    print(f"b={b:>2} r={r:>2} threshold~{thr:.2f}  {row}")
+    print(f"b={b:>2} r={r:>2} threshold~{(1 / b) ** (1 / r):.2f}  {row}")
 
-def epochs(weight, total_tokens, source_tokens):
-    return weight * total_tokens / source_tokens
-
-print(epochs(0.20, 1e9, 50e6))       # 4.0 passes over a 50M-token source at 20% of a 1B run
-print(1 - 300 / 4096)                # padding fraction of 300-token examples in 4,096 slots, unpacked
+print(0.20 * 1e9 / 50e6)     # 4.0 passes over a 50M-token source at 20% of a 1B-token run
+print(1 - 300 / 4096)        # ~0.927 padding fraction of 300-token examples in 4,096 slots, unpacked
 ```
 
 | Layout | Threshold | P at s = 0.3 | P at s = 0.5 | P at s = 0.8 |
@@ -328,13 +314,11 @@ loss and everything else is ignored. It reuses the prefix-stability idea from `r
 the serving tool schemas through the template's `tools` argument.
 
 ```python
-IGNORE = -100
-
 def render_trajectory(tok, messages, tools):
     """Labels cover every assistant turn (tool calls and final answer); tool results are masked."""
     enc = lambda s: tok(s, add_special_tokens=False)["input_ids"]
     full_ids = enc(tok.apply_chat_template(messages, tools=tools, tokenize=False))
-    labels = [IGNORE] * len(full_ids)
+    labels = [IGNORE] * len(full_ids)                         # IGNORE = -100, as above
     for i, m in enumerate(messages):
         if m["role"] != "assistant":
             continue
@@ -344,10 +328,6 @@ def render_trajectory(tok, messages, tools):
         assert full_ids[:len(upto)] == upto, "template must be prefix-stable"
         labels[start:len(upto)] = upto[start:]
     return full_ids, labels
-
-def keep(traj):
-    """Outcome filter: only successful, bounded runs become training data."""
-    return traj["outcome"] == "success" and not traj["hit_step_budget"] and traj["tool_errors"] == 0
 ```
 
 Decode one rendered trajectory with labels shown before every run; templates differ in how they serialize
@@ -386,6 +366,9 @@ The 400 overlapping runs would have inflated the agent eval score while doing no
   results and outcome, then export only successful, deduplicated trajectories into the pipeline, holding out
   whole tasks for the agent eval. Monitor tool-call validity rate and task success of the tuned model against
   the base model on the held-out tasks.
+- **Fixed-size shards plus an outcome filter.** Write shards of a fixed row count (for example 2,048
+  rows) and keep the final partial shard; admit a trajectory only if its outcome is
+  success, it did not hit the step budget and it had zero tool errors.
 
 ## Trade-offs
 - **Aggressive heuristic filtering vs coverage.** It removes junk cheaply but also legitimate code, tables

@@ -237,51 +237,42 @@ stateDiagram-v2
 ## Examples
 ### Lifecycle state machine and deprecation planner
 A lifecycle state machine with restricted transitions, and a deprecation planner that turns a sunset date
-into dated obligations plus a list of consumers still pinned to the old version. Durations are
-illustrative policy values, not a standard.
+into dated obligations plus the consumers still pinned to the old version. Durations are illustrative
+policy values, not a standard.
 
 ```python
 from datetime import date, timedelta
 
-TRANSITIONS = {                       # what may follow each state
-    "registered": {"evaluated", "retired"},
-    "evaluated":  {"staged", "retired"},
-    "staged":     {"canary", "retired"},
-    "canary":     {"production", "staged"},        # back to staged = candidate withdrawn
-    "production": {"deprecated"},                  # never straight to retired: consumers must move first
-    "deprecated": {"retired", "production"},       # un-deprecate allowed, with a recorded reason
-    "retired":    {"archived"},
+TRANSITIONS = {                                  # what may follow each state
+    "registered": {"evaluated", "retired"}, "evaluated": {"staged", "retired"},
+    "staged": {"canary", "retired"},        "canary": {"production", "staged"},
+    "production": {"deprecated"},           # never straight to retired: consumers must move first
+    "deprecated": {"retired", "production"}, "retired": {"archived"},
 }
 
-def move(version, new_state, actor, reason):
+def move(version, new_state):
     if new_state not in TRANSITIONS[version["state"]]:
-        raise ValueError(f"{version['id']}: {version['state']} -> {new_state} not allowed")
-    version["history"].append((date.today(), version["state"], new_state, actor, reason))
+        raise ValueError(f"{version['state']} -> {new_state} not allowed")
     version["state"] = new_state
 
-POLICY = {"notice_days": 90, "freeze_days": 60, "brownout_days": 14}   # illustrative
+POLICY = {"announce_by": 90, "freeze_new_pins": 60, "brownouts_from": 14}   # days before sunset
 
-def deprecation_plan(version, sunset, consumers):
-    """Sunset date -> dated obligations and the consumers still to chase."""
-    todo = [c["bundle"] for c in consumers
-            if c["pinned_model"] == version["id"] and not c.get("migration_pr")]
-    return {"announce_by": sunset - timedelta(days=POLICY["notice_days"]),
-            "freeze_new_pins": sunset - timedelta(days=POLICY["freeze_days"]),
-            "brownouts_from": sunset - timedelta(days=POLICY["brownout_days"]),
-            "sunset": sunset, "unmigrated": todo}
+def deprecation_plan(sunset, consumers):
+    plan = {step: sunset - timedelta(days=d) for step, d in POLICY.items()}
+    plan["unmigrated"] = [bundle for bundle, pr in consumers.items() if pr is None]
+    return plan
 
-v = {"id": "chat-model@2025-03-01", "state": "production", "history": []}
-move(v, "deprecated", actor="platform-team", reason="provider sunset announced")
-plan = deprecation_plan(v, date(2026, 12, 15), consumers=[
-    {"bundle": "support-assistant@41", "pinned_model": v["id"]},
-    {"bundle": "claims-extractor@7", "pinned_model": v["id"], "migration_pr": 812},
-])
-print(plan)   # announce_by 2026-09-16, freeze 2026-10-16, brownouts 2026-12-01, unmigrated: support-assistant@41
+v = {"id": "chat-model@2025-03-01", "state": "production"}
+move(v, "deprecated")                            # move(v, "retired") would raise
+print(deprecation_plan(date(2026, 12, 15), {"support-assistant@41": None, "claims-extractor@7": 812}))
+# announce_by 2026-09-16, freeze_new_pins 2026-10-16, brownouts_from 2026-12-01, unmigrated ['support-assistant@41']
 ```
 
-- **Where the consumer list comes from:** the bundle registry's pins joined with gateway telemetry.
+- **Where the consumer list comes from:** the bundle registry's pins joined with gateway telemetry; the
+  value is the open migration PR, if any.
 - **What happens to it:** each unmigrated entry becomes a ticket owned by the bundle's team, and the freeze
   date is enforced by a CI check on pinned model ids.
+- **Not shown:** a real transition also records who, when and why, so the lifecycle is an audit trail.
 
 ### The CI check that enforces the freeze
 Pure Python: fail the build if any bundle pins a model past its freeze date. The deprecated list would be
@@ -306,20 +297,6 @@ problems = pin_violations(bundles, today=date(2026, 10, 20))
 print("\n".join(problems) or "ok")
 sys.exit(1 if problems else 0)   # non-zero exit fails the pipeline
 ```
-
-### Worked migration: the successor that passed every eval
-Illustrative numbers for one bundle moving to a successor model.
-
-| Check | Old snapshot | Successor | Verdict |
-|---|---|---|---|
-| Golden-set score | 4.3 | 4.3 | pass |
-| Input tokens per request (same prompts, new tokenizer) | 2,000 | 2,300 | +15% cost before any price change |
-| Effective context for retrieved chunks | 12 chunks | 10 chunks | prompt budget must be re-tuned |
-| Requests per minute quota on the account | 600 | 300 | 429s at peak unless quota is raised |
-| Tool-call format | supported | supported, stricter schema | two tool definitions need fixing |
-
-- **Takeaway:** quality alone would have promoted it; the checklist caught a cost rise, a context squeeze
-  and a quota cut before the canary did.
 
 ### Worked migration: a research agent on a successor model
 Illustrative numbers from running a 200-task agent eval suite on both snapshots.

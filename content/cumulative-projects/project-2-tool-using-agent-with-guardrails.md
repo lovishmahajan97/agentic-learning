@@ -198,64 +198,41 @@ Standard library only. A scripted plan stands in for the model's tool calls so e
 once; replace it with your provider's tool-calling loop.
 
 ```python
-import json, time, uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as Timeout
-
-def log(**e): print(json.dumps({"ts": round(time.time(), 3), **e}))
+import json, uuid
 
 TOOLS = {  # name -> (function, arg schema, risk). Keep the list short: every tool is attack surface.
-    "lookup_order": (lambda order_id: {"order_id": order_id, "status": "shipped"}, {"order_id": str}, "read"),
-    "refund":       (lambda order_id, amount: {"refunded": amount},  {"order_id": str, "amount": float}, "write"),
-    "search_kb":    (lambda query: time.sleep(1) or {"hits": []},       {"query": str}, "read"),  # slow
+    "lookup_order": (lambda order_id: {"status": "shipped"}, {"order_id": str}, "read"),
+    "refund":       (lambda order_id, amount: {"refunded": amount}, {"order_id": str, "amount": float}, "write"),
 }
-ALLOWED = {"support-agent": {"lookup_order", "refund", "search_kb"}}       # role -> tools it may call
-POOL = ThreadPoolExecutor(max_workers=4)
-
-def validate(schema, args):
-    if set(args) != set(schema): raise ValueError(f"expected args {sorted(schema)}, got {sorted(args)}")
-    for k, t in schema.items():
-        if not isinstance(args[k], t): raise ValueError(f"{k} must be {t.__name__}")
-    if "amount" in args and not 0 < args["amount"] <= 500: raise ValueError("amount out of range")
-
-def call_tool(run, role, name, args, approve, timeout_s=0.5, retries=2):
-    if name not in TOOLS or name not in ALLOWED.get(role, set()):
-        log(run=run, event="denied", tool=name); return {"error": "tool not permitted"}
+ALLOWED = {"support-agent": {"lookup_order", "refund"}}       # role -> tools it may call
+def call_tool(role, name, args, approve):                    # returns (event, result for the model)
+    if name not in ALLOWED.get(role, set()):
+        return "denied", {"error": "tool not permitted"}
     fn, schema, risk = TOOLS[name]
-    try: validate(schema, args)
-    except ValueError as e:
-        log(run=run, event="invalid_args", tool=name, why=str(e)); return {"error": str(e)}  # model can fix
+    if set(args) != set(schema) or not all(isinstance(args[k], t) for k, t in schema.items()) \
+            or not 0 < args.get("amount", 1) <= 500:
+        return "invalid_args", {"error": f"expected {sorted(schema)}, amount 0-500"}  # model can fix
     if risk == "write" and not approve(name, args):
-        log(run=run, event="approval_rejected", tool=name); return {"error": "human rejected action"}
-    for attempt in range(retries + 1):              # retry only safe-to-repeat failures; writes need idempotency keys
-        try:
-            out = POOL.submit(fn, **args).result(timeout=timeout_s)
-            log(run=run, event="tool_ok", tool=name, attempt=attempt); return out
-        except Timeout:
-            log(run=run, event="timeout", tool=name, attempt=attempt); time.sleep(0.1 * 2 ** attempt)
-    return {"error": "tool timed out"}
-
-def run_agent(plan, role="support-agent", max_steps=5, approve=lambda n, a: False):
-    run = uuid.uuid4().hex[:8]                       # the scripted plan stands in for model tool calls
+        return "approval_rejected", {"error": "human rejected action"}
+    return "tool_ok", fn(**args)
+def run_agent(plan, role="support-agent", max_steps=4, approve=lambda n, a: False):
+    run = uuid.uuid4().hex[:8]                                # the scripted plan stands in for model tool calls
     for step, (name, args) in enumerate(plan):
         if step >= max_steps:
-            log(run=run, event="budget_exceeded", steps=step); return "stopped: step budget"
-        print("  ->", call_tool(run, role, name, args, approve))
-    return "done"
-
+            print(json.dumps({"run": run, "event": "budget_exceeded"})); return "stopped: step budget"
+        event, result = call_tool(role, name, args, approve)
+        print(json.dumps({"run": run, "step": step, "tool": name, "event": event}), "->", result)
 run_agent([("lookup_order", {"order_id": "A17"}),
            ("refund", {"order_id": "A17", "amount": 9000.0}),     # invalid: over the limit
            ("refund", {"order_id": "A17", "amount": 40.0}),       # risky: needs a human
            ("delete_account", {"user": "u1"}),                    # not in the allowlist
-           ("search_kb", {"query": "refund window"}),             # times out, retried with backoff
-           ("lookup_order", {"order_id": "A18"})])                # step 6: over the budget
+           ("lookup_order", {"order_id": "A18"})])                # step 5: over the budget
 ```
 
-Run on Python 3.9, it logs `tool_ok`, `invalid_args`, `approval_rejected`, `denied`, three `timeout`
-attempts, then `budget_exceeded`, in about 2.5 seconds. Two gaps are left for you:
-- **A timeout does not cancel the thread.** The slow function keeps running in the pool; real tools need
-  a client-side timeout (for example on the HTTP call) so work actually stops.
-- **The retry loop also covers writes.** Before a write may retry, it needs an idempotency key the tool
-  honours (M2).
+Run on Python 3.9, it logs `tool_ok`, `invalid_args`, `approval_rejected`, `denied`, then
+`budget_exceeded`. Each error goes back as a result the model can read. Two gaps are left for you:
+- **No timeouts or retries yet.** Add a per-tool timeout and retries for reads only (M2).
+- **Writes have no idempotency key.** Before a write may retry, it needs a key the tool honours (M2).
 
 ### Evaluation table: one row per guardrail
 Each scenario names the event that must appear in the log; a run without that event fails, whatever
@@ -284,6 +261,9 @@ the final answer says.
   the share of runs that hit each cap; rising values mean the agent is looping.
 - **Return errors as tool results.** Validation and permission errors go back to the model as structured
   results, so it can repair the call instead of the run crashing. Monitor repair success on the next step.
+- **Timeouts that actually stop work.** Use a short per-tool timeout (for example 0.5 s) with 2 retries
+  and exponential backoff for reads only; a thread-pool timeout does not cancel the call, so set the
+  timeout on the client (for example the HTTP call).
 
 ## Trade-offs
 - **Fewer tools vs capability.** A small toolset limits damage and improves tool selection, but some

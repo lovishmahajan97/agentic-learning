@@ -356,10 +356,9 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 WORKDIR /app
 # Dependencies first: this layer is rebuilt only when the lockfile changes.
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project
 COPY src/ ./src/
-RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev
 
 FROM python:3.12-slim AS runtime
 RUN useradd --create-home --uid 10001 app
@@ -368,9 +367,6 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/src /app/src
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
 USER app
-EXPOSE 8000
-HEALTHCHECK --interval=30s --timeout=3s \
-  CMD python -c "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health')" || exit 1
 # Exec form: uvicorn is PID 1 and receives SIGTERM from `docker stop`.
 CMD ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
@@ -380,8 +376,7 @@ and model weights keeps the build context small and the `COPY` cache stable.
 
 ```bash
 docker build -t llm-api:$(git rev-parse --short HEAD) .
-docker run --rm -p 8000:8000 --memory=2g -e LLM_SECRET_ID=prod/llm llm-api:$(git rev-parse --short HEAD)
-docker history llm-api:$(git rev-parse --short HEAD)   # where did the bytes go?
+docker run --rm -p 8000:8000 --memory=2g llm-api:$(git rev-parse --short HEAD)
 ```
 
 ### A PID 1 that drains on SIGTERM
@@ -392,15 +387,11 @@ a handler, finishes in-flight work and exits 0 well inside the 10-second grace p
 import signal, sys, threading, time
 
 stop = threading.Event()
+signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
 
-def on_term(signum, frame):
-    print("SIGTERM received: stop accepting work, finish in-flight", flush=True)
-    stop.set()
-
-signal.signal(signal.SIGTERM, on_term)
 print("serving", flush=True)
-while not stop.is_set():
-    time.sleep(0.2)            # stand-in for serving requests
+stop.wait()                    # stand-in for serving requests until SIGTERM
+print("SIGTERM received: finishing in-flight work", flush=True)
 time.sleep(1)                  # stand-in for draining one in-flight stream
 print("drained, exiting 0", flush=True)
 sys.exit(0)
@@ -428,28 +419,21 @@ The agent's `run_python` tool runs model-written code in a throwaway container. 
   container with the Docker socket mounted (see Pitfalls), because that hands the agent root on the host.
 
 ```python
-import subprocess, uuid
+import subprocess
 
 def run_python(code: str, timeout_s: int = 20) -> dict:
-    name = f"sbx-{uuid.uuid4().hex[:8]}"
-    cmd = ["docker", "run", "--rm", "--name", name, "-i",
+    cmd = ["docker", "run", "--rm", "-i",
            "--network", "none",              # no egress: cannot exfiltrate or reach internal hosts
            "--read-only", "--tmpfs", "/tmp:size=64m",
            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
            "--user", "65534:65534",          # nobody
            "--memory", "512m", "--cpus", "1", "--pids-limit", "64",
            "python:3.12-slim", "python", "-"]   # no -e flags: the environment holds no secrets
-    try:
-        p = subprocess.run(cmd, input=code, capture_output=True, text=True, timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        subprocess.run(["docker", "kill", name], capture_output=True)
-        return {"error": "timeout", "limit_s": timeout_s}
-    if p.returncode == 137:
-        return {"error": "killed (SIGKILL): likely the memory limit", "exit": 137}
+    p = subprocess.run(cmd, input=code, capture_output=True, text=True, timeout=timeout_s)
     return {"exit": p.returncode, "stdout": p.stdout[-4000:], "stderr": p.stderr[-2000:]}
 
-print(run_python("import os; print(sorted(os.environ))"))   # no provider keys visible
-print(run_python("import urllib.request as u; u.urlopen('https://example.com')"))  # fails: no network
+print(run_python("import os; print(sorted(os.environ))"))   # exit 0: no provider keys visible
+print(run_python("import urllib.request as u; u.urlopen('https://example.com')"))  # exit 1: no network
 ```
 
 - **This is defence in depth, not a security boundary** for hostile code: the container shares the host
@@ -487,6 +471,12 @@ Keeping weights and GPU runtimes out of the agent API image is what makes its au
   topology with `docker compose up`. Monitor how long the stack takes to become healthy.
 - **Evaluate the image you ship.** The CI eval job runs against the freshly built image by digest, and the
   deploy step promotes that same digest only if evals pass. Record digest and eval score together.
+- **Cache mounts and a container healthcheck.** Add `RUN --mount=type=cache,target=/root/.cache/uv` to the
+  `uv sync` steps so rebuilds reuse downloaded wheels, and a `HEALTHCHECK --interval=30s --timeout=3s` that
+  calls `/health`. Use `docker history <image>` to see which layer holds the bytes.
+- **Kill sandbox containers on timeout.** Name each sandbox run (`--name sbx-<id>`) and `docker kill` it when
+  the tool times out, because killing the `docker run` client does not reliably stop the container. Map exit
+  137 to "likely hit the memory limit" in the tool result.
 
 ## Trade-offs
 - **Reproducible images vs pull time.** Deploys are reproducible and rollback is a pointer change, but a

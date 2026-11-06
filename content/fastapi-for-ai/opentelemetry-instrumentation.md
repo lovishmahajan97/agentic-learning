@@ -355,42 +355,35 @@ flowchart TD
 
 ## Examples
 ### Agent scenario: one trace per run, spans per model and tool call
-The run span is the parent; each step's model call and tool calls are children with GenAI attributes.
-Attribute names follow the in-development GenAI conventions; pin and check the version you use.
+The run span is the parent; each model call and tool call is a child with GenAI attributes. Attribute
+names follow the in-development GenAI conventions; pin and check the version you use.
 
 ```python
+# pip install opentelemetry-sdk  (checked on 1.45)
 from opentelemetry import trace
-from opentelemetry.trace import Status, StatusCode
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-tracer = trace.get_tracer("agent-api")
+exporter = InMemorySpanExporter()                 # tests only; production uses BatchSpanProcessor + OTLP
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(exporter))
+tracer = provider.get_tracer("agent-api")
 
-async def run_agent(run_id: str, messages: list, llm, tools, max_steps: int = 20):
-    with tracer.start_as_current_span("invoke_agent support-agent") as run_span:
-        run_span.set_attribute("gen_ai.operation.name", "invoke_agent")
-        run_span.set_attribute("app.run_id", run_id)              # your own namespace for custom keys
-        for step in range(1, max_steps + 1):
-            with tracer.start_as_current_span("chat model-a") as span:
-                span.set_attribute("gen_ai.operation.name", "chat")
-                span.set_attribute("gen_ai.request.model", "model-a")
-                span.set_attribute("app.agent.step", step)
-                reply = await llm.complete(messages, tools=tools.schemas())   # httpx span nests here
-                span.set_attribute("gen_ai.usage.input_tokens", reply.usage.prompt_tokens)
-                span.set_attribute("gen_ai.usage.output_tokens", reply.usage.completion_tokens)
-            if not reply.tool_calls:
-                run_span.set_attribute("app.agent.steps", step)
-                return reply.text
-            messages.append(reply.message)
-            for call in reply.tool_calls:
-                with tracer.start_as_current_span(f"execute_tool {call.name}") as tspan:
-                    tspan.set_attribute("gen_ai.operation.name", "execute_tool")
-                    tspan.set_attribute("gen_ai.tool.name", call.name)
-                    result = await tools.call(call.name, call.arguments)    # exceptions mark it red
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": str(result)})
-        run_span.set_status(Status(StatusCode.ERROR, "max_steps reached"))
+with tracer.start_as_current_span("invoke_agent support-agent") as run_span:
+    run_span.set_attribute("app.run_id", "r-123")         # an attribute, never part of the name
+    with tracer.start_as_current_span("chat model-a") as span:
+        span.set_attribute("gen_ai.request.model", "model-a")
+        span.set_attribute("gen_ai.usage.input_tokens", 812)
+    with tracer.start_as_current_span("execute_tool search_orders") as span:
+        span.set_attribute("gen_ai.tool.name", "search_orders")
+
+spans = exporter.get_finished_spans()
+print(sorted(s.name for s in spans if s.parent), len({s.context.trace_id for s in spans}))
+# ['chat model-a', 'execute_tool search_orders'] 1
 ```
 
-- **Span names stay low-cardinality** (operation plus model or tool name); `run_id` is an attribute, never
-  part of the name.
+- **Span names stay low-cardinality** (operation plus model or tool name); `run_id` is an attribute.
 - **No prompt or tool content in attributes by default,** so the collector scrub is a safety net, not the
   only defence.
 
@@ -410,10 +403,9 @@ Illustrative trace for one 14-second run, read from the span tree.
 - **The 2.3 s gap** is work without spans (prompt assembly, retries with backoff, a sync SDK) and is the
   next thing to instrument.
 
-### Per-worker init, auto-instrumentation and a manual LLM span
+### Per-worker init and auto-instrumentation
 ```python
 from contextlib import asynccontextmanager
-import httpx
 from fastapi import FastAPI
 from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
@@ -421,56 +413,31 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI):                 # runs in each worker, after any fork
     provider = TracerProvider(resource=Resource.create({"service.name": "chat-api"}))
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))  # OTEL_EXPORTER_OTLP_ENDPOINT
     trace.set_tracer_provider(provider)
-    HTTPXClientInstrumentor().instrument()
-    app.state.http = httpx.AsyncClient(base_url="https://llm.example.internal", timeout=60)
     yield
-    await app.state.http.aclose()
-    provider.shutdown()                       # flushes queued spans; skipped if the pod is SIGKILLed
+    provider.shutdown()                           # flushes queued spans
 
 app = FastAPI(lifespan=lifespan)
-FastAPIInstrumentor.instrument_app(app)       # wraps the ASGI app; set OTEL_PYTHON_FASTAPI_EXCLUDED_URLS for probes
-tracer = trace.get_tracer("chat-api")
-
-@app.post("/v1/chat")
-async def chat(body: dict):
-    with tracer.start_as_current_span("chat model-a") as span:
-        span.set_attribute("gen_ai.operation.name", "chat")
-        span.set_attribute("gen_ai.request.model", "model-a")
-        r = await app.state.http.post("/v1/chat/completions", json=body)   # child client span
-        usage = r.json().get("usage", {})
-        span.set_attribute("gen_ai.usage.input_tokens", usage.get("prompt_tokens", 0))
-        span.set_attribute("gen_ai.usage.output_tokens", usage.get("completion_tokens", 0))
-        return r.json()
+FastAPIInstrumentor.instrument_app(app, excluded_urls="livez,readyz")  # one server span per request
 ```
 
-- **Resulting trace:** `POST /v1/chat` (server) → `chat model-a` (manual) → `POST` (httpx client), with the
-  provider's latency and token counts on the spans.
-- **Streaming caveat:** start the model span inside the generator; a span ended when the handler returns
-  closes before the first token is streamed.
-
 ### Collector pipeline: scrub prompts, keep errors and slow traces
-A collector config (the `tail_sampling` processor ships in the collector's contrib distribution). Tail
-sampling only sees what the app exported, so the app's own sampler must keep everything (or a high ratio)
-for this to work, and all spans of a trace must reach the same collector instance.
+The `tail_sampling` processor ships in the collector's contrib distribution. It only sees what the app
+exported, so the app's sampler must keep everything (or a high ratio), and all spans of a trace must
+reach the same collector instance.
 
 ```yaml
 receivers:
-  otlp:
-    protocols:
-      grpc: {endpoint: 0.0.0.0:4317}
-      http: {endpoint: 0.0.0.0:4318}
+  otlp: {protocols: {grpc: {endpoint: 0.0.0.0:4317}}}
 processors:
   attributes/scrub:
     actions:
       - {key: gen_ai.prompt, action: delete}
-      - {key: gen_ai.completion, action: delete}
       - {key: enduser.id, action: hash}
   tail_sampling:
     decision_wait: 10s
@@ -480,14 +447,10 @@ processors:
       - {name: baseline, type: probabilistic, probabilistic: {sampling_percentage: 10}}
   batch: {}
 exporters:
-  otlp:
-    endpoint: tracing-backend.internal:4317
+  otlp: {endpoint: tracing-backend.internal:4317}
 service:
   pipelines:
-    traces:
-      receivers: [otlp]
-      processors: [attributes/scrub, tail_sampling, batch]
-      exporters: [otlp]
+    traces: {receivers: [otlp], processors: [attributes/scrub, tail_sampling, batch], exporters: [otlp]}
 ```
 
 - **`decision_wait` must cover a whole run.** At 10s, spans of a 40-second agent run arrive after the
@@ -523,6 +486,12 @@ drifts whenever someone changes the sampling ratio.
   query for spans carrying prompt-like attributes.
 - **Trace id in every log line.** Add the 32-hex trace id to structured logs so on-call can jump from a log
   to its trace. Monitor: the share of request logs that carry a trace id.
+- **Instrument the shared httpx client.** Call `HTTPXClientInstrumentor().instrument()` in lifespan so
+  each provider request becomes a child client span under the model span.
+- **Streaming model spans start inside the generator.** A span ended when the handler returns closes
+  before the first token is streamed.
+- **Shutdown flush is best effort.** `provider.shutdown()` flushes queued spans on a clean exit, but a
+  SIGKILLed pod loses them.
 
 ## Trade-offs
 - **Vendor neutrality vs configuration surface.** You change backends by changing an exporter endpoint,

@@ -219,40 +219,34 @@ A refund agent's run, one event per step, then a human override. In production t
 appended to WORM storage and the head hash anchored elsewhere.
 
 ```python
-import hashlib, json, time
+import hashlib, json
 
 GENESIS = "0" * 64
 
-def canonical(rec: dict) -> bytes:
-    return json.dumps(rec, sort_keys=True, separators=(",", ":")).encode()
+def digest(prev: str, body: dict) -> str:
+    return hashlib.sha256(prev.encode() + json.dumps(body, sort_keys=True).encode()).hexdigest()
 
-def append(log: list, event: dict) -> dict:
-    prev = log[-1]["hash"] if log else GENESIS
-    body = {**event, "ts": time.time(), "prev": prev}
-    body["hash"] = hashlib.sha256(prev.encode() + canonical(body)).hexdigest()
-    log.append(body)
-    return body
+def append(log: list, event: dict) -> None:
+    body = {**event, "prev": log[-1]["hash"] if log else GENESIS}
+    log.append({**body, "hash": digest(body["prev"], body)})
 
 def verify(log: list):                    # index of first broken record, or None
     prev = GENESIS
     for i, rec in enumerate(log):
         body = {k: v for k, v in rec.items() if k != "hash"}
-        if rec["prev"] != prev or hashlib.sha256(prev.encode() + canonical(body)).hexdigest() != rec["hash"]:
-            return i                      # first broken record
+        if rec["prev"] != prev or digest(prev, body) != rec["hash"]:
+            return i
         prev = rec["hash"]
     return None
 
-run = {"actor": "svc:refund-agent", "on_behalf_of": "user:4821", "run_id": "run-93a",
-       "model": "provider-model-2026-05", "prompt_version": "refund-v14"}
+run = {"actor": "svc:refund-agent", "on_behalf_of": "user:4821", "run_id": "run-93a"}
 log = []
 append(log, {**run, "step": 1, "action": "tool.search_policy", "retrieved": ["policy-77#sha256:9f1c..."]})
-append(log, {**run, "step": 2, "action": "refund.decide", "decision": "deny", "approver": None})
-append(log, {"actor": "user:ops-17", "action": "refund.override", "run_id": "run-93a",
-             "decision": "approve", "reason": "policy-77 outdated"})
+append(log, {**run, "step": 2, "action": "refund.decide", "decision": "deny"})
+append(log, {"actor": "user:ops-17", "action": "refund.override", "run_id": "run-93a", "decision": "approve"})
 anchor = (len(log), log[-1]["hash"])      # copied to a store the writer cannot alter
 print(verify(log))                         # None: chain intact
-dropped = log[:2]                          # an insider deletes the override record
-print(verify(dropped), len(dropped) < anchor[0])   # None True: chain still verifies, anchor exposes it
+print(verify(log[:2]), 2 < anchor[0])      # None True: deleting the newest record verifies; anchor exposes it
 log[1]["decision"] = "approve"             # an insider edits history
 print(verify(log))                         # 1: tampering detected at record 1
 ```
@@ -311,6 +305,8 @@ aws s3api put-object-lock-configuration --bucket acme-ai-audit \
 - **Completeness reconciliation.** Nightly, compare counts of business decisions and agent side effects in
   the system of record with audit events of the same action type. Alert on any difference, because a
   missing event looks like concealment.
+- **Timestamp and canonical form inside the hash.** Put each record's timestamp in the hashed body and
+  serialize with sorted keys and fixed separators, so a record always hashes the same way on re-verification.
 
 ## Trade-offs
 - **Full payloads vs references.** Logging full prompts, tool results and outputs makes reconstruction easy

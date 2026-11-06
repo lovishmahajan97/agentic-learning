@@ -399,60 +399,39 @@ flowchart TD
 
 ## Examples
 ### A tool wrapper that writes both
-A tool-execution wrapper that emits a trace span and append-only, hash-chained audit records from the
-same call: one for the decision before anything runs, one for the outcome after.
+A tool-execution wrapper that emits a trace span and two audit records from the same call: one for the
+decision before anything runs, one for the outcome after.
 
-- **Arguments** are hashed into the audit rows and stored by reference for the trace.
-- **In a stream-based runtime** both would be projections of the run's events; the direct writes keep the
-  example short.
+- **Arguments** reach the audit rows only as a keyed hash, never inline.
+- **A plain list stands in for the audit store;** the next example adds the hash chain. In a stream-based
+  runtime both sinks would be projections of the run's events.
 
 ```python
-import hashlib, hmac, json, os, time
-from opentelemetry import trace
+import hashlib, hmac, json, os
+from opentelemetry import trace                       # pip install opentelemetry-api (checked with 1.41)
 
 tracer = trace.get_tracer("agent")
 ARGS_KEY = os.environ["AUDIT_HMAC_KEY"].encode()      # held outside the audit store
 
-def _canon(obj) -> bytes:
-    return json.dumps(obj, sort_keys=True, default=str).encode()
-
-def _h(obj) -> str:                                    # chain hash: plain SHA-256 is fine
-    return hashlib.sha256(_canon(obj)).hexdigest()
-
 def _args_hash(args) -> str:                           # keyed, so low-entropy args cannot be guessed
-    return hmac.new(ARGS_KEY, _canon(args), hashlib.sha256).hexdigest()
+    return hmac.new(ARGS_KEY, json.dumps(args, sort_keys=True).encode(), hashlib.sha256).hexdigest()
 
-class AuditLog:
-    """Append-only, hash-chained, one writer per chain. The role has INSERT only, no UPDATE/DELETE."""
-    def __init__(self, store):
-        self.store, self.prev = store, store.last_hash() or "0" * 64    # resume the chain on restart
-    def write(self, **rec) -> str:
-        rec["prev_hash"] = self.prev
-        rec["hash"] = _h(rec)
-        self.store.insert(rec)
-        self.prev = rec["hash"]
-        return rec["hash"]
-
-def run_tool(name, args, *, ctx, policy, tools, blobs, audit: AuditLog):
+def run_tool(name, args, *, ctx, decision, tools, audit):
     with tracer.start_as_current_span(f"tool.call {name}") as span:
-        decision = policy.check(ctx.run_id, name, args)             # allow | ask | deny
-        args_ref = blobs.put(args, ttl_days=30)                     # payload lives in the blob store
-        span.set_attributes({"agent.tool.name": name, "agent.args_ref": args_ref,
-                             "agent.permission": decision, "agent.policy_version": policy.version})
-        base = dict(run_id=ctx.run_id, step_id=ctx.step_id, actor=ctx.user_id,
-                    principal=ctx.agent_id, action=name, target=args.get("id"),
-                    args_hash=_args_hash(args), args_ref=args_ref, policy_version=policy.version,
-                    decision=decision, credential_id=ctx.credential_id)
-        audit.write(ts=time.time(), phase="authorized", **base)    # before the effect; raises -> no run
-        t0 = time.time()
-        # "ask" would go to an approval flow (omitted); here only "allow" executes
+        span.set_attributes({"agent.run_id": ctx["run_id"], "agent.tool.name": name,
+                             "agent.permission": decision})
+        base = dict(run_id=ctx["run_id"], actor=ctx["user_id"], action=name,
+                    target=args.get("order_id"), args_hash=_args_hash(args), decision=decision)
+        audit.append(dict(base, phase="authorized"))   # before the effect; if it raises, nothing runs
         result = tools[name](**args) if decision == "allow" else {"ok": False, "error": decision}
-        span.set_attributes({"agent.ok": bool(result.get("ok")),
-                             "agent.error": result.get("error", ""),
-                             "agent.latency_ms": int((time.time() - t0) * 1000)})
-        audit.write(ts=time.time(), phase="completed", **base,
-                    outcome="ok" if result.get("ok") else result.get("error", "error"))
+        span.set_attribute("agent.ok", bool(result.get("ok")))
+        audit.append(dict(base, phase="completed", outcome="ok" if result.get("ok") else result["error"]))
         return result
+
+audit = []                                             # stands in for the hash-chained store below
+print(run_tool("refund", {"order_id": "o-77", "amount": 40}, ctx={"run_id": "r9", "user_id": "u-17"},
+               decision="allow", tools={"refund": lambda **a: {"ok": True}}, audit=audit))  # {'ok': True}
+print([r["phase"] for r in audit], "amount" in audit[0])  # ['authorized', 'completed'] False
 ```
 
 ### Verifying the chain and the anchor (runnable, stdlib only)
@@ -463,7 +442,7 @@ externally anchored head, which is why the anchor matters.
 import hashlib, json
 
 def _h(obj) -> str:
-    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
 
 def append(chain: list, **rec) -> None:
     rec["prev_hash"] = chain[-1]["hash"] if chain else "0" * 64
@@ -473,8 +452,7 @@ def append(chain: list, **rec) -> None:
 def verify(chain: list, anchored_head: str) -> str:
     prev = "0" * 64
     for i, rec in enumerate(chain):
-        body = {k: v for k, v in rec.items() if k != "hash"}
-        if rec["prev_hash"] != prev or _h(body) != rec["hash"]:
+        if rec["prev_hash"] != prev or _h({k: v for k, v in rec.items() if k != "hash"}) != rec["hash"]:
             return f"broken at row {i}"
         prev = rec["hash"]
     return "ok" if prev == anchored_head else "head does not match anchor"
@@ -483,13 +461,12 @@ log = []
 append(log, run_id="r9", action="refund", phase="authorized", decision="allow", target="o-77")
 append(log, run_id="r9", action="refund", phase="completed", outcome="ok", target="o-77")
 anchor = log[-1]["hash"]                     # copied to a store the writer cannot touch
-
 print(verify(log, anchor))                   # ok
 log[0]["decision"] = "ask"                   # someone edits a row
 print(verify(log, anchor))                   # broken at row 0
 for i, rec in enumerate(log):                # attacker recomputes the whole chain
-    rec["prev_hash"] = log[i - 1]["hash"] if i else "0" * 64
-    rec["hash"] = _h({k: v for k, v in rec.items() if k != "hash"})
+    rec.pop("hash"); rec["prev_hash"] = log[i - 1]["hash"] if i else "0" * 64
+    rec["hash"] = _h(rec)
 print(verify(log, anchor))                   # head does not match anchor
 ```
 
@@ -526,6 +503,10 @@ Each standard question is answered by a specific field, and the shared `run_id` 
 - **Blob retention from investigation windows.** When: payloads are stored by reference. How: lifecycle
   rules on the blob store set from the longest investigation you must support, with per-record delete for
   data-protection requests. Monitor: references in audit rows that no longer resolve.
+- **Resume the chain on restart.** When: a writer process restarts. How: read the store's last hash and
+  continue from it instead of the genesis value, and advance the in-memory head only after an insert
+  succeeds. Keep one writer per chain, since two writers appending to one chain fork it. Monitor: nightly
+  verification failures that follow a deploy or an outage.
 
 ## Trade-offs
 - **One stream, two sinks vs coverage.** Deriving both artifacts from the event stream guarantees they

@@ -169,37 +169,11 @@ flowchart TD
   scores against a golden set.
 
 ## Examples
-### Golden-set evaluation of stage 1 vs stage 2
-Each question has human-labelled answer-bearing chunk ids; the code computes recall@k and precision@k for
-stage 1 (hybrid retrieval) and stage 2 (reranked).
-
-```python
-from statistics import mean
-
-golden = {  # question -> set of chunk ids that contain the answer (labelled by hand)
-    "What is the SLA credit for 99.5% availability?": {"sla-table", "credit-defs", "credit-exclusions"},
-    "How long are audit logs retained?": {"retention-policy"},
-}
-
-def precision_recall(retrieved, relevant, k):
-    top = retrieved[:k]
-    hit = len(set(top) & relevant)
-    return hit / k, hit / len(relevant)
-
-def evaluate(search, k):
-    p, r = [], []
-    for q, relevant in golden.items():
-        pk, rk = precision_recall(search(q), relevant, k)
-        p.append(pk); r.append(rk)
-    return mean(p), mean(r)
-
-# search_hybrid(q) -> ranked chunk ids; rerank(q, ids) -> ids reordered by a cross-encoder
-stage1 = lambda q: search_hybrid(q)
-stage2 = lambda q: rerank(q, search_hybrid(q)[:50])
-for k in (5, 20, 50):
-    print("stage1", k, evaluate(stage1, k))
-print("stage2", 5, evaluate(stage2, 5))
-```
+### Worked scenario: stage 1 vs stage 2 on a golden set
+Each golden question has human-labelled answer-bearing chunk ids. Question 1, "What is the SLA credit for
+99.5% availability?", needs `sla-table`, `credit-defs` and `credit-exclusions`; question 2, "How long are
+audit logs retained?", needs only `retention-policy`. Stage 1 is hybrid retrieval; stage 2 reranks its top
+50 with a cross-encoder.
 
 Illustrative results for the first question:
 

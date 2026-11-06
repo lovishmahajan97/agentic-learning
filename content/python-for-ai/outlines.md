@@ -289,7 +289,6 @@ A support agent on a self-hosted model served by vLLM. Each step asks for one of
 engine constrains decoding so the reply always parses.
 
 ```python
-import json
 from typing import Literal, Union
 from openai import OpenAI
 from pydantic import BaseModel, Field

@@ -223,33 +223,23 @@ import pymupdf, re            # PyMuPDF 2.x needs Python 3.11+; checked against 
 MIN_CHARS_PER_PAGE, MIN_WORD_RATIO = 200, 0.85
 
 def quality(blocks):                              # English prose heuristic; tables scored separately
-    text = " ".join(b["text"] for b in blocks if b["type"] not in ("header", "footer", "table"))
-    tokens = text.split()
-    if not tokens:
-        return 0.0
-    wordlike = sum(1 for t in tokens if re.search(r"[A-Za-z]{2,}", t))
-    garbage = text.count("\ufffd") + len(re.findall(r"(.)\1{5,}", text))
-    return (wordlike / len(tokens)) * (0.0 if garbage > 20 else 1.0)
+    tokens = " ".join(b["text"] for b in blocks if b["type"] != "table").split()
+    return sum(bool(re.search(r"[A-Za-z]{2,}", t)) for t in tokens) / len(tokens) if tokens else 0.0
 
 def process(path, tiers):
     """tiers: ordered list of (name, extract_page) returning canonical blocks for one page."""
-    pages, errors = [], []
+    pages = []
     for page in pymupdf.open(path):
         native = page.get_text().strip()
-        if not native and not page.get_images():
-            pages.append({"page": page.number, "tier": "blank", "blocks": []}); continue
         start = 0 if len(native) >= MIN_CHARS_PER_PAGE else 1   # no usable text layer: skip native
         for name, extract in tiers[start:]:
-            try:
-                blocks = extract(page)                          # worker timeout in production
-            except Exception as e:                              # a bad page must not kill the batch
-                errors.append((page.number, name, repr(e))); continue
+            blocks = extract(page)                              # sandboxed worker with a timeout in production
             if (q := quality(blocks)) >= MIN_WORD_RATIO:
                 pages.append({"page": page.number, "tier": name, "quality": q, "blocks": blocks})
                 break
         else:
             pages.append({"page": page.number, "tier": "needs_review", "blocks": []})
-    return {"pages": pages, "errors": errors}
+    return {"pages": pages}
 
 # tiers = [("native", native_page), ("ocr", ocr_page), ("layout", layout_page), ("vlm", vlm_page)]
 ```
@@ -261,45 +251,6 @@ def process(path, tiers):
   (consistent column counts per row, numeric cells that parse).
 - **Header and footer removal runs after routing,** across all pages, because it depends on text repeating
   from page to page.
-
-### Filling the layout tier with Docling
-A real tier 3 for the router above. Docling runs layout and table-structure models over a page range and
-returns typed items with page provenance, which map straight onto the canonical blocks.
-
-```python
-# checked against docling 2.147.0, 2026-11; the first run downloads layout and table models
-from docling.document_converter import DocumentConverter
-
-converter = DocumentConverter()                      # build once per worker, not per page
-
-def layout_pages(path, first, last):
-    """Tier 3: Docling layout analysis for pages first..last (1-based), as canonical blocks."""
-    doc = converter.convert(path, page_range=(first, last)).document
-    blocks = []
-    for item, _level in doc.iterate_items():
-        prov = item.prov[0]                              # page number and bounding box
-        text = item.export_to_markdown(doc=doc) if item.label == "table" else getattr(item, "text", "")
-        blocks.append({"type": str(item.label), "text": text, "page": prov.page_no,
-                       "bbox": prov.bbox.as_tuple()})
-    return blocks
-
-def layout_page(page):                                   # router adapter: takes a PyMuPDF page
-    n = page.number + 1                                  # PyMuPDF counts from 0, Docling from 1
-    return layout_pages(page.parent.name, n, n)          # ("layout", layout_page) in the tiers list
-
-for b in layout_pages("statement.pdf", 1, 1):
-    print(b["page"], b["type"], b["text"][:70].replace("\n", " | "))
-# On a one-page statement with a ruled table this printed three blocks:
-# 1 section_header Quarterly statement
-# 1 text This statement summarises the account activity for the quarter. Fees a
-# 1 table | Month     |   Fees |   Interest | | |-----------|--------|------------
-```
-
-- **The table arrives as a table,** serialized to Markdown with its header row, which tier 1 returned as a
-  loose column of numbers.
-- **Run it in a background worker.** Model loading and the first-run download take far longer than one
-  agent tool call can wait, so this tier belongs on the asynchronous path.
-- **Docling's page numbers are 1-based,** while PyMuPDF's `page.number` is 0-based; `layout_page` converts at the boundary.
 
 ### Worked scenario: a contract with a scanned annex
 A 60-page born-digital contract whose last 8 pages are a scanned, signed annex.
@@ -330,18 +281,12 @@ from collections import Counter
 def norm(line):
     return re.sub(r"\d+", "#", line.strip().lower())       # "Page 14 of 62" -> "page # of #"
 
-def strip_repeating(pages, min_share=0.6, edge=1):
-    """pages: list of line lists. Drop lines in the top/bottom `edge` positions whose normalized
-    text repeats on at least min_share of pages: headers, footers, page numbers."""
-    counts = Counter()
-    for lines in pages:
-        counts.update({norm(l) for l in lines[:edge] + lines[-edge:]})
+def strip_repeating(pages, min_share=0.6):
+    """pages: list of line lists. Drop first/last lines that repeat on at least min_share of pages."""
+    counts = Counter(norm(l) for lines in pages for l in {lines[0], lines[-1]})
     repeated = {k for k, c in counts.items() if c >= min_share * len(pages)}
-    cleaned = []
-    for lines in pages:
-        n = len(lines)
-        cleaned.append([l for i, l in enumerate(lines)
-                        if not ((i < edge or i >= n - edge) and norm(l) in repeated)])
+    cleaned = [[l for i, l in enumerate(lines)
+                if not (i in (0, len(lines) - 1) and norm(l) in repeated)] for lines in pages]
     return cleaned, repeated
 
 bodies = ["Scope of services.", "Fees and payment.", "Revenue grew 12% in Q3.", "Termination.", "Signatures."]
@@ -358,19 +303,16 @@ agent gets typed blocks with page numbers, plus an explicit list of pages it mus
 
 ```python
 INLINE_TIERS = ["native", "ocr"]          # fast enough for one tool call
-def read_document(path, tiers, queue, max_pages=100):
-    inline = [(n, f) for n, f in tiers if n in INLINE_TIERS]
-    result = process(path, inline)        # per-page routing, quality gate, errors recorded
+
+def read_document(path, tiers, queue):
+    result = process(path, [(n, f) for n, f in tiers if n in INLINE_TIERS])
     pending = [p["page"] for p in result["pages"] if p["tier"] == "needs_review"]
     if pending:
         queue.put({"path": path, "pages": pending, "tiers": ["layout", "vlm"]})   # background escalation
-    shown = result["pages"][:max_pages]   # cap the tool result size, but never silently
     blocks = [{"page": p["page"] + 1, "type": b["type"], "text": b["text"]}
-              for p in shown for b in p["blocks"]
-              if b["type"] not in ("header", "footer")]
+              for p in result["pages"] for b in p["blocks"] if b["type"] not in ("header", "footer")]
     return {"blocks": blocks,
             "pending_pages": [n + 1 for n in pending],     # tell the agent, and through it the user
-            "not_returned_from_page": len(shown) + 1 if len(result["pages"]) > max_pages else None,
             "note": "Pages in pending_pages are still being processed; do not answer from them."}
 ```
 
@@ -398,6 +340,17 @@ def read_document(path, tiers, queue, max_pages=100):
   document tool's output and instruct the agent to mention them, instead of returning partial text silently.
   Monitor the share of agent answers given while pages were pending and the p95 latency of the inline tiers
   per tool call.
+- **Fuller page routing and quality scoring.** Mark pages with no text and no images as blank instead of
+  escalating them; zero the quality score when the text holds many replacement characters or runs of one
+  repeated character (more than 20 in the reference version); catch each tier's exception per page and
+  record `(page, tier, error)` so one bad page does not kill the batch.
+- **Docling as the layout tier.** Checked against docling 2.147.0 (2026-11): build one `DocumentConverter()`
+  per worker, call `converter.convert(path, page_range=(first, last))`, and export tables with
+  `item.export_to_markdown(doc=doc)` so they arrive as tables with header rows. The first run downloads
+  layout and table models, so run it in a background worker; Docling pages are 1-based, PyMuPDF's
+  `page.number` is 0-based.
+- **Bounded tool results.** Cap the pages a `read_document` result returns (for example 100) and report
+  where truncation started, such as a `not_returned_from_page` field, never truncating silently.
 
 ## Trade-offs
 - **Tiered routing vs extra passes.** Average cost stays near the cheapest extractor, but there is a scoring

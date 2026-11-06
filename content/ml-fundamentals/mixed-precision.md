@@ -197,10 +197,8 @@ an fp16 weight ignore 1,000 updates of 1e-4 that an fp32 master absorbs.
 
 ```python
 import struct
-
 def fp16(x):                      # round a Python float to the nearest fp16 value
     return struct.unpack("e", struct.pack("e", x))[0]
-
 def fp32(x):
     return struct.unpack("f", struct.pack("f", x))[0]
 
@@ -212,11 +210,6 @@ for _ in range(steps):
 print(f"fp16 weights after {steps} steps: {w16}")     # 1.0   (spacing just below 1.0 is 2^-11)
 print(f"fp32 master after {steps} steps:  {w32:.4f}")  # 0.9000
 print(f"forward copy cast from master:   {fp16(w32)}") # 0.89990234375
-
-try:
-    fp16(70_000.0)                        # above fp16 max of 65,504
-except OverflowError as e:
-    print("fp16(70000):", e)              # float too large to pack with e format
 ```
 
 | Weight storage | After 1,000 updates of 1e-4 | What training sees |
@@ -250,15 +243,13 @@ bf16 weights. A handful of tasks pick a different tool on the first step.
 | Fix | run the eval in the serving dtype, report pass rate with run-to-run variance, and treat near-tie flips as noise, not regressions |
 
 ### The failure modes and a correct training step
-The first block shows the three failure modes on a CPU; the second is the training step. Note what is
+The first lines show the three failure modes on a CPU; the function is the training step. Note what is
 absent: no `model.half()`, no casting of the optimizer, no change to the learning rate. The model stays
 fp32 (those are the master weights) and autocast handles the per-op casting.
 
 ```python
 import torch
 from torch.nn.utils import clip_grad_norm_
-
-# 1. What the formats can and cannot hold
 f16, b16 = torch.float16, torch.bfloat16
 print(torch.tensor(70_000., dtype=f16))        # inf      fp16 max is 65,504
 print(torch.tensor(70_000., dtype=b16))        # 70144.   bf16 has fp32's range but ~3 digits
@@ -266,7 +257,6 @@ print(torch.tensor(1e-8, dtype=f16))           # 0.       below fp16's smallest 
 print(torch.tensor(1., dtype=b16) + 0.001)     # 1.       bf16 spacing at 1.0 is 2^-7 ≈ 0.0078
 print(torch.tensor(1., dtype=f16) + 0.001)     # 1.0010   fp16 spacing at 1.0 is 2^-10 ≈ 0.00098
 
-# 2. One training step: fp32 master weights, 16-bit matmuls, a scaler only for fp16
 def train_step(model, opt, x, y, dtype, scaler=None, max_norm=1.0):
     opt.zero_grad(set_to_none=True)
     with torch.autocast("cuda", dtype=dtype):   # matmuls in dtype; softmax, norm, loss stay fp32
@@ -282,9 +272,7 @@ def train_step(model, opt, x, y, dtype, scaler=None, max_norm=1.0):
         scaler.step(opt)                         # skips the step if any grad is inf/nan
         scaler.update()                          # halves S on overflow, doubles after 2,000 clean steps
     return loss.item()
-
-# model = MyModel().cuda()                       # parameters stay fp32: these are the master weights
-# bf16: train_step(model, opt, x, y, torch.bfloat16)
+# model stays fp32 (master weights). bf16: train_step(model, opt, x, y, torch.bfloat16)
 # fp16: scaler = torch.amp.GradScaler("cuda"); train_step(model, opt, x, y, torch.float16, scaler)
 ```
 

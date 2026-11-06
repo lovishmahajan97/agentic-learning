@@ -229,61 +229,46 @@ flowchart TD
 ```
 
 ## Examples
-### A layered resolver with validation and stable rollout buckets
-A minimal layered resolver with validation, versioning and a conservative fallback. The schema is the
-contract; overrides are partial dictionaries.
+### A layered resolver with validation
+A minimal layered resolver with validation and a conservative fallback. The schema is the contract;
+overrides are partial dictionaries.
 
 ```python
 from dataclasses import dataclass, replace, fields
-import hashlib
 
 @dataclass(frozen=True)
 class TenantConfig:
     model: str = "default-large"
     prompt_version: str = "support-v7"
     retrieval_top_k: int = 8
-    pii_redaction: bool = True
     allowed_providers: tuple = ("provider-a", "provider-b")
-    new_reranker_pct: int = 0           # release flag: % of users on the new reranker
-
     def validate(self):   # explicit raises, not assert: asserts vanish under python -O
         if not 1 <= self.retrieval_top_k <= 50: raise ValueError("retrieval_top_k out of range")
-        if not 0 <= self.new_reranker_pct <= 100: raise ValueError("new_reranker_pct out of range")
-        if self.model_provider() not in self.allowed_providers:
-            raise ValueError("model not allowed for tenant")
-
-    def model_provider(self):
-        return "provider-b" if self.model.startswith("b-") else "provider-a"
+        provider = "provider-b" if self.model.startswith("b-") else "provider-a"
+        if provider not in self.allowed_providers: raise ValueError("model not allowed for tenant")
 
 LAYERS = {  # in production: rows in a versioned config store
     "plan:enterprise": {"retrieval_top_k": 12},
     "tenant:acme": {"prompt_version": "support-v7-de", "allowed_providers": ("provider-a",)},
-    "tenant:globex": {"new_reranker_pct": 25},
 }
 
 def resolve(tenant: str, plan: str) -> TenantConfig:
     cfg, known = TenantConfig(), {f.name for f in fields(TenantConfig)}
     for layer in (f"plan:{plan}", f"tenant:{tenant}"):
         override = LAYERS.get(layer, {})
-        unknown = set(override) - known
-        if unknown: raise ValueError(f"{layer}: unknown keys {unknown}")   # typo caught here
+        if set(override) - known: raise ValueError(f"{layer}: unknown keys")   # typo caught here
         cfg = replace(cfg, **override)
     cfg.validate()
     return cfg
 
-def in_rollout(flag: str, user_id: str, pct: int) -> bool:   # stable bucket per user and flag
-    return int(hashlib.sha256(f"{flag}:{user_id}".encode()).hexdigest(), 16) % 100 < pct
-
-cfg = resolve("globex", "enterprise")
-print(cfg.retrieval_top_k, in_rollout("new_reranker", "globex:u-1842", cfg.new_reranker_pct))
+cfg = resolve("acme", "enterprise")
+print(cfg.retrieval_top_k, cfg.prompt_version)   # 12 support-v7-de (plan layer, then tenant layer)
 ```
 
-- **What each tenant gets.** Acme gets a German prompt and a single allowed provider; Globex gets a quarter
-  of users on the new reranker; both inherit the enterprise `top_k`.
-- **Where the rollout belongs.** The percentage sits in the config only to keep the sketch short; in
-  practice it lives in the flag service with an owner and a removal date, the separation argued above.
+- **What the tenant gets.** Acme gets a German prompt and a single allowed provider, and inherits the
+  enterprise `top_k`.
 - **Validation as contract.** Setting `model="b-large"` for Acme would fail validation before any request
-  runs, because the contract forbids that provider for that tenant.
+  runs, because the contract forbids that provider for that tenant; a typoed key fails the same way.
 
 ### Pinning the config for a conversation
 A runnable sketch of why snapshots matter: an admin saves a new prompt version mid-conversation, and only
@@ -292,17 +277,12 @@ the pinned path stays consistent.
 ```python
 store = {"acme": {"version": 41, "prompt_version": "support-v7-de"}}
 
-def live_lookup(tenant):
-    return store[tenant]
-
 def run_conversation(tenant, turns, pin, admin_edit_at):
-    snapshot = dict(live_lookup(tenant)) if pin else None
-    used = []
+    snapshot, used = dict(store[tenant]), []
     for turn in range(turns):
         if turn == admin_edit_at:   # admin saves a change mid-run
             store[tenant] = {"version": 42, "prompt_version": "support-v8-de"}
-        cfg = snapshot if pin else live_lookup(tenant)
-        used.append(cfg["version"])
+        used.append((snapshot if pin else store[tenant])["version"])
     store[tenant] = {"version": 41, "prompt_version": "support-v7-de"}   # reset for the demo
     return used
 
@@ -364,6 +344,9 @@ switch target.
   side-effecting tools. Store which tools a tenant may use in typed config, and give each external tool a
   long-lived kill switch that removes it from the registry. Monitor tool-call error rate per tool and how
   often each switch flips.
+- **Stable rollout buckets live in the flag service.** Bucket a user with `sha256(f"{flag}:{user_id}") % 100 <
+  pct` so the same user stays in or out as the percentage grows; keep the percentage in the flag service with
+  an owner and a removal date, not in tenant config.
 
 ## Trade-offs
 - **No-deploy changes vs config-caused breakage.** Runtime configuration changes tenant behaviour without

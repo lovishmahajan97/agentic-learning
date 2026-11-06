@@ -211,28 +211,24 @@ names, dashboards and thresholds are illustrative stand-ins for the team's own.
 
 ```markdown
 ### RB-07 LLM provider degraded (429s / 5xx / timeouts)
-Trigger: alert `llm_upstream_error_rate > 5% for 5 min` (any tenant)
-Impact: answers fail or slow down for all users. SEV2; SEV1 if > 25% for 15 min.
+Trigger: alert `llm_upstream_error_rate > 5% for 5 min`. Impact: all users; SEV2 (SEV1 if > 25% for 15 min).
 
 Confirm
-1. Dashboard "LLM upstream" -> panel "errors by status code".
-   429 = rate limit, 5xx/timeout = provider outage. Check the provider status page.
+1. Dashboard "LLM upstream" -> "errors by status code": 429 = rate limit, 5xx/timeout = outage.
 2. Panel "requests by tenant": is one tenant > 50% of traffic? If yes, go to step 6.
 
 Mitigate (pre-authorised, no approval needed)
-3. 5xx/timeouts: set flag `llm.route=fallback` (secondary provider/region). Expect
-   slightly lower answer quality; banner `degraded_mode=on` informs users.
+3. 5xx/timeouts: set `llm.route=fallback` (secondary provider/region); banner `degraded_mode=on`.
 4. 429s, no single hot tenant: set `llm.max_concurrency=40` (default 80) to stop retry storms.
 5. Pause batch jobs: set `jobs.summarise_nightly.enabled=false`.
 6. One tenant flooding: set `tenant.<id>.rate_limit_rps=2`; notify their admin (template T-3).
 
 Verify
-7. Upstream error rate < 1% and p95 < 8 s for 15 min. Then revert step 3 first, watch 15 min,
-   then restore concurrency, then re-enable batch jobs last.
+7. Error rate < 1% and p95 < 8 s for 15 min. Revert one change at a time, 15 min apart:
+   fallback first, then concurrency, batch jobs last.
 
 Escalate
-8. Not recovered 30 min after step 3, or fallback also failing: page vendor on-call
-   (rota "assistant-l3"), open a ticket with the provider quoting request IDs from the trace.
+8. Not recovered 30 min after step 3: page vendor on-call (rota "assistant-l3") with trace IDs.
 Afterwards: export the incident timeline and five failing trace IDs to the postmortem doc.
 ```
 
@@ -252,26 +248,19 @@ and thresholds are illustrative stand-ins for the levers your own agent exposes.
 
 ```markdown
 ### RB-12 Agent cost runaway / looping
-Trigger: alert `agent_cost_per_task > 2x 7-day median for 15 min`, or step-budget hits > 2% of tasks
-Impact: spend climbs, tasks time out at the step limit. SEV2; SEV1 if daily budget will be hit today.
+Trigger: `agent_cost_per_task > 2x 7-day median for 15 min`, or step-budget hits > 2% of tasks. SEV2.
 
 Confirm
-1. Dashboard "Agent tasks" -> "steps per task" and "tool calls by tool": did one tool's call count jump?
-2. Open three runs at the step limit (trace search: status=step_limit, last 1 h).
-   Same tool called repeatedly with similar arguments = loop. Go to step 3.
+1. Open three runs at the step limit (trace search: status=step_limit, last 1 h).
+   Same tool called repeatedly with similar arguments = loop.
 
 Mitigate (pre-authorised)
-3. Disable the looping tool: set `tools.<name>.enabled=false`. The agent answers without it or hands off.
-4. If no single tool: lower `agent.max_steps` from 15 to 8 for all tenants.
-5. One tenant driving the spend: set `tenant.<id>.daily_task_cap` to its 7-day average.
+2. Disable the looping tool: `tools.<name>.enabled=false`. The agent answers without it or hands off.
+3. If no single tool: lower `agent.max_steps` from 15 to 8 for all tenants.
 
 Verify
-6. Cost per task back within 1.2x median and step-budget hits < 0.5% for 30 min.
+4. Cost per task within 1.2x median and step-budget hits < 0.5% for 30 min.
    Re-enable the tool on the internal tenant first, watch 30 min, then everyone.
-
-Escalate
-7. Not recovered 30 min after step 3 or 4: page vendor on-call (rota "assistant-l3") with trace IDs.
-Afterwards: attach three looping traces and the tool's recent changes to the postmortem.
 ```
 
 - **The confirm step reads traces, not logs**, because a loop is visible as a repeated tool call in one
@@ -290,8 +279,6 @@ groups:
       - alert: LLMUpstreamErrorRate
         expr: llm_upstream_error_rate > 0.05
         for: 5m
-        labels:
-          severity: sev2
         annotations:
           summary: "LLM upstream errors above 5% for 5 minutes"
           runbook_url: "https://runbooks.example.internal/RB-07"
@@ -304,26 +291,19 @@ from datetime import date
 
 alerts = [  # parsed from the alert rules file
     {"alert": "LLMUpstreamErrorRate", "runbook_url": "https://runbooks.example.internal/RB-07"},
-    {"alert": "GuardrailBlockSurge"},                       # no runbook link
-]
+    {"alert": "GuardrailBlockSurge"}]                       # no runbook link
 runbooks = {"RB-07": {"owner": "cust-ops", "last_tested": date(2026, 3, 2)}}
 
 def lint(alerts, runbooks, today, max_age_days=180):
-    problems = []
     for a in alerts:
-        url = a.get("runbook_url")
-        if not url:
-            problems.append(f"{a['alert']}: no runbook_url")
-            continue
-        rb = runbooks.get(url.rsplit("/", 1)[-1])
+        rb = runbooks.get(a.get("runbook_url", "").rsplit("/", 1)[-1])
         if rb is None:
-            problems.append(f"{a['alert']}: runbook {url} not found")
+            yield f"{a['alert']}: no runbook_url, or runbook not found"
         elif (today - rb["last_tested"]).days > max_age_days:
-            problems.append(f"{a['alert']}: runbook last tested {rb['last_tested']}")
-    return problems
+            yield f"{a['alert']}: runbook last tested {rb['last_tested']}"
 
-print(lint(alerts, runbooks, date(2026, 10, 20)))
-# ['LLMUpstreamErrorRate: runbook last tested 2026-03-02', 'GuardrailBlockSurge: no runbook_url']
+print(list(lint(alerts, runbooks, date(2026, 10, 20))))
+# ['LLMUpstreamErrorRate: runbook last tested 2026-03-02', 'GuardrailBlockSurge: no runbook_url, ...']
 ```
 
 ## Production patterns
@@ -343,6 +323,12 @@ print(lint(alerts, runbooks, date(2026, 10, 20)))
 - **Step-to-script promotion.** When a step is run identically in several incidents, wrap it in a script
   or chat-ops command and reference that command from the runbook. Monitor how often automated
   remediations fail and fall back to manual steps.
+- **Escalation and evidence in every runbook.** End each runbook with an escalation step (time limit,
+  rota to page, trace IDs to quote) and an "afterwards" line: export the timeline and failing trace IDs
+  to the postmortem. Carry severity as an alert label (for example `severity: sev2`) so paging routes
+  match the runbook's SEV level.
+- **Spend runbooks need a tenant lever and a SEV1 rule.** Cap a tenant driving spend at its 7-day
+  average daily task count, and raise to SEV1 when the daily budget will be hit today.
 
 ## Trade-offs
 - **Speed for strangers vs staleness.** Detailed, command-level runbooks make incidents fast for

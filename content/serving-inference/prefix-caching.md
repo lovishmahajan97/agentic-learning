@@ -178,13 +178,14 @@ flowchart TD
 ### Agent scenario: prefill tokens for a 10-step run, simulated
 Pure Python, no GPU. A 6,000-token prefix (system prompt plus tool schemas), 1,500 tokens appended per step
 (tool call plus result). The only difference between runs is one step id placed before the system prompt.
+Each block's key chains the previous key, exactly as described above.
 
 ```python
 import hashlib
 
 BLOCK = 16
 
-def block_hashes(ids):
+def block_hashes(ids):                       # chained: each key covers the whole prefix so far
     out, prev = [], b""
     for i in range(0, len(ids) - len(ids) % BLOCK, BLOCK):
         prev = hashlib.sha256(prev + str(ids[i:i + BLOCK]).encode()).digest()
@@ -192,22 +193,21 @@ def block_hashes(ids):
     return out
 
 def run_agent(header, steps=10, prefix=6000, per_step=1500):
-    """Total prefill tokens for one agent run; header(step) is what precedes the system prompt."""
     cache, transcript, prefilled = set(), [], 0
     for s in range(steps):
         prompt = header(s) + list(range(prefix)) + transcript
         hit = 0
         for h in block_hashes(prompt):
             if h not in cache:
-                break                                   # first miss ends reuse
+                break                        # first miss ends reuse
             hit += BLOCK
         prefilled += len(prompt) - hit
         cache.update(block_hashes(prompt))
         transcript += [100_000 + s * per_step + j for j in range(per_step)]  # tool call + result
     return prefilled
 
-print("stable prefix    :", run_agent(lambda s: []))              # 19548
-print("step id at top   :", run_agent(lambda s: [900_000 + s]))   # 127510
+print("stable prefix :", run_agent(lambda s: []))              # 19548
+print("step id at top:", run_agent(lambda s: [900_000 + s]))   # 127510
 ```
 
 | Run | Prefill tokens over 10 steps | Per step after step 1 |
@@ -216,6 +216,7 @@ print("step id at top   :", run_agent(lambda s: [900_000 + s]))   # 127510
 | Step id before the system prompt | 127,510 | the whole prompt, growing by 1.5k each step |
 
 - **About 6.5x more prefill** from one token, because chained hashes make every later block miss.
+- **Only full blocks are cached,** so the partly filled block at the end of a prompt is always recomputed.
 
 ### Measure prompt layout in vLLM's offline engine
 The two prompt styles contain identical content; only the position of the volatile part changes.
@@ -224,69 +225,23 @@ The two prompt styles contain identical content; only the position of the volati
 import time
 from vllm import LLM, SamplingParams
 
-llm = LLM("meta-llama/Meta-Llama-3-8B-Instruct", enable_prefix_caching=True,
-          max_model_len=8192, gpu_memory_utilization=0.9)
+llm = LLM("meta-llama/Meta-Llama-3-8B-Instruct", enable_prefix_caching=True, max_model_len=8192)
 sp = SamplingParams(temperature=0, max_tokens=32)
+system = "You are a contracts assistant.\n" + "Policy clause.\n" * 400     # >1k stable tokens
+qs = [f"Question {i}: does clause {i} allow early termination?" for i in range(20)]
 
-system = "You are a contracts assistant.\n" + ("Policy clause.\n" * 400)   # ~1.2k+ tokens, stable
-questions = [f"Question {i}: does clause {i} allow early termination?" for i in range(20)]
-
-def run(prompts):
-    llm.generate(prompts[:1], sp)                      # warm: first call pays full prefill
+def ms_per_request(prompts):
+    llm.generate(prompts[:1], sp)                     # warm: first call pays full prefill
     t = time.perf_counter(); llm.generate(prompts[1:], sp)
-    return (time.perf_counter() - t) / (len(prompts) - 1)
+    return round((time.perf_counter() - t) / (len(prompts) - 1) * 1000, 1)
 
-good = [f"{system}\n{q}" for q in questions]                               # stable prefix first
-bad  = [f"Request-id: {i}\n{system}\n{q}" for i, q in enumerate(questions)]  # volatile token first
-
-print(f"stable-first : {run(good)*1000:.0f} ms/request")
-print(f"volatile-first: {run(bad)*1000:.0f} ms/request")
-# Expect the stable-first layout to be markedly faster per request: the >1k-token
-# policy block hits the cache on every call. The volatile-first layout misses on
-# every block because the first few tokens differ, so every request re-prefills the whole block.
-# llm.llm_engine metrics (or the server's /metrics endpoint) expose the prefix hit rate.
+print("stable-first  :", ms_per_request([f"{system}\n{q}" for q in qs]))
+print("volatile-first:", ms_per_request([f"Request-id: {i}\n{system}\n{q}" for i, q in enumerate(qs)]))
+# Expect stable-first to be markedly faster: volatile-first misses on every block.
 ```
 
 - **Confirm with the counters, not only the timer.** On a server, the prefix-cache query and hit counters
   on `/metrics` give the hit rate directly; timings on a small offline run are noisy.
-
-### Why one early token kills every later hit: a block-hash simulator
-Each block's key chains the previous key, exactly as described above.
-
-```python
-import hashlib
-
-BLOCK = 16
-
-def block_hashes(token_ids):
-    """Chained hash per full block: each key covers the whole prefix up to that block."""
-    hashes, prev = [], b""
-    for i in range(0, len(token_ids) - len(token_ids) % BLOCK, BLOCK):
-        h = hashlib.sha256(prev + str(token_ids[i:i + BLOCK]).encode()).digest()
-        hashes.append(h); prev = h
-    return hashes
-
-def cached_tokens(cache, token_ids):
-    hit = 0
-    for h in block_hashes(token_ids):
-        if h not in cache: break          # longest chain of hits from the start
-        hit += BLOCK
-    cache.update(block_hashes(token_ids))
-    return hit
-
-system = list(range(1000, 4000))          # 3,000 stable "system prompt" tokens
-cache = set()
-for turn, q in enumerate([[1, 2, 3] * 10, [4, 5, 6] * 10]):
-    print("stable-first  turn", turn, cached_tokens(cache, system + q))   # 0, then 2992
-cache = set()
-for req_id in (7, 8):
-    print("id-first   request", req_id, cached_tokens(cache, [req_id] + system))  # 0, 0
-```
-
-- **2992, not 3,000:** the block holding the system prompt's last 8 tokens also holds question tokens, so
-  it differs and is recomputed.
-- **The id-first layout never hits,** because the first block differs and every chained key after it does
-  too.
 
 ### Worked scenario: an agent loop on a four-replica fleet
 A 4k-token system prompt plus a growing trajectory, 10 tool steps per task, illustrative.

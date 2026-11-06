@@ -347,146 +347,75 @@ flowchart TD
 ```
 
 ## Examples
-### The server: a knowledge base with a lifespan, errors and annotations
-Tested with the Python SDK 1.x (`pip install "mcp>=1.10,<2"`).
+### The server: typed tools, a recoverable error and annotations
+Tested with the Python SDK 1.x. The dict stands in for a database; a real server opens its pool once in a
+lifespan, as the Lab starter does.
 
 ```python
-# kb_server.py
-import sqlite3, sys
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from pydantic import BaseModel
-from mcp.server.fastmcp import FastMCP, Context
+# kb_server.py  (pip install "mcp>=1.10,<2")
+from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-@dataclass
-class Deps:
-    db: sqlite3.Connection
-
-@asynccontextmanager
-async def lifespan(server: FastMCP):
-    db = sqlite3.connect(":memory:")            # open once, not per tool call
-    db.execute("CREATE TABLE kb (id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
-    db.execute("INSERT INTO kb (title, body) VALUES ('Reset VPN token', 'Open the portal, then ...')")
-    try:
-        yield Deps(db=db)
-    finally:
-        db.close()
-
-mcp = FastMCP("kb", lifespan=lifespan, instructions="Search before drafting. Drafts need review.")
-
-class Hit(BaseModel):
-    id: int
-    title: str
+mcp = FastMCP("kb")
+KB = {1: {"title": "Reset VPN token", "body": "Open the portal, then press Reset."}}  # real: a db in the lifespan
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
-async def kb_search(query: str, ctx: Context, limit: int = 5) -> list[Hit]:
-    """Search knowledge-base titles. Returns ids and titles; call kb_get_article for the text."""
-    db = ctx.request_context.lifespan_context.db
-    await ctx.info(f"kb_search {query!r}")       # MCP log notification to the host
-    rows = db.execute("SELECT id, title FROM kb WHERE title LIKE ? LIMIT ?", (f"%{query}%", limit))
-    return [Hit(id=i, title=t) for i, t in rows]
+def kb_search(query: str) -> list[dict]:
+    """Search article titles. Returns ids; call kb_get_article for the text."""
+    return [{"id": i, "title": a["title"]} for i, a in KB.items() if query.lower() in a["title"].lower()]
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
-async def kb_get_article(article_id: int, ctx: Context) -> str:
+def kb_get_article(article_id: int) -> str:
     """Full text of one article by id (from kb_search)."""
-    row = ctx.request_context.lifespan_context.db.execute(
-        "SELECT body FROM kb WHERE id = ?", (article_id,)).fetchone()
-    if row is None:
+    if article_id not in KB:
         raise ToolError(f"No article {article_id}. Use an id returned by kb_search.")
-    return row[0]
+    return KB[article_id]["body"]
 
-@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False))
-async def kb_create_draft(title: str, body: str, ctx: Context) -> Hit:
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
+def kb_create_draft(title: str, body: str) -> str:
     """Create an unpublished draft article. A human publishes it later."""
-    db = ctx.request_context.lifespan_context.db
-    cur = db.execute("INSERT INTO kb (title, body) VALUES (?, ?)", (f"[draft] {title}", body))
-    return Hit(id=cur.lastrowid, title=f"[draft] {title}")
+    KB[len(KB) + 1] = {"title": f"[draft] {title}", "body": body}
+    return f"Created draft {len(KB)}."
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http" if "--http" in sys.argv else "stdio")
+    mcp.run()                                       # stdio; transport="streamable-http" for remote hosts
 ```
 
 ### The agent: bridging MCP tools into a Claude tool loop
-A step budget, an approval gate for the write tool, and `isError` passed back to the model. Set `MODEL` to
-a current model id from the provider docs.
+A step budget, an approval gate for the write tool, and `isError` passed back to the model.
 
 ```python
-# agent.py  (pip install anthropic "mcp>=1.10,<2")
-import asyncio, os, sys
-import anthropic
+# agent.py  (pip install anthropic "mcp>=1.10,<2"); set MODEL to a current model id
+import asyncio, os, sys, anthropic
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-
 APPROVE = {"kb_create_draft"}                      # write tools need a human yes
-llm = anthropic.AsyncAnthropic()
+SERVER = StdioServerParameters(command=sys.executable, args=["kb_server.py"])
+llm, MODEL = anthropic.AsyncAnthropic(), os.environ["MODEL"]
 
-async def run(task: str, max_steps: int = 6):
-    server = StdioServerParameters(command=sys.executable, args=["kb_server.py"])
-    async with stdio_client(server) as (r, w), ClientSession(r, w) as mcp:
+async def run(task: str, max_steps: int = 6) -> str:
+    async with stdio_client(SERVER) as (r, w), ClientSession(r, w) as mcp:
         await mcp.initialize()
         tools = [{"name": t.name, "description": t.description or "", "input_schema": t.inputSchema}
                  for t in (await mcp.list_tools()).tools]
         messages = [{"role": "user", "content": task}]
         for _ in range(max_steps):                  # step budget: never loop forever
-            resp = await llm.messages.create(model=os.environ["MODEL"], max_tokens=1024,
-                                             tools=tools, messages=messages)
+            resp = await llm.messages.create(model=MODEL, max_tokens=1024, tools=tools, messages=messages)
             messages.append({"role": "assistant", "content": resp.content})
-            calls = [b for b in resp.content if b.type == "tool_use"]
-            if not calls:
+            if resp.stop_reason != "tool_use":
                 return "".join(b.text for b in resp.content if b.type == "text")
             results = []
-            for c in calls:
+            for c in (b for b in resp.content if b.type == "tool_use"):
                 if c.name in APPROVE and input(f"Allow {c.name}({c.input})? [y/N] ") != "y":
-                    out, err = "User denied this action.", True
+                    out, err = "User denied this action.", True    # gate before the call
                 else:
                     res = await mcp.call_tool(c.name, c.input)
-                    out = "\n".join(x.text for x in res.content if x.type == "text")
-                    err = bool(res.isError)         # tool errors go back to the model
+                    out, err = "\n".join(x.text for x in res.content if x.type == "text"), bool(res.isError)
                 results.append({"type": "tool_result", "tool_use_id": c.id, "content": out, "is_error": err})
-            messages.append({"role": "user", "content": results})
+            messages.append({"role": "user", "content": results})  # all results in one user message
         return "Stopped: step budget exhausted."
-
-if __name__ == "__main__":
-    print(asyncio.run(run("How do I reset my VPN token? Draft an article if none exists.")))
-```
-
-### The same server in TypeScript
-Tested with `@modelcontextprotocol/sdk` 1.x and Zod. Note `console.error` for logs: stdout is the wire.
-
-```typescript
-// server.mjs  (npm i @modelcontextprotocol/sdk zod)
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
-
-const kb = new Map([[1, { title: "Reset VPN token", body: "Open the portal, then ..." }]]);
-const server = new McpServer({ name: "kb", version: "1.0.0" });
-
-server.registerTool("kb_search", {
-  description: "Search knowledge-base titles. Returns ids and titles.",
-  inputSchema: { query: z.string(), limit: z.number().int().min(1).max(20).default(5) },
-  outputSchema: { hits: z.array(z.object({ id: z.number(), title: z.string() })) },
-  annotations: { readOnlyHint: true },
-}, async ({ query, limit }) => {
-  const hits = [...kb].filter(([, a]) => a.title.toLowerCase().includes(query.toLowerCase()))
-    .slice(0, limit).map(([id, a]) => ({ id, title: a.title }));
-  return { content: [{ type: "text", text: JSON.stringify({ hits }) }], structuredContent: { hits } };
-});
-
-server.registerTool("kb_get_article", {
-  description: "Full text of one article by id (from kb_search).",
-  inputSchema: { article_id: z.number().int() },
-  annotations: { readOnlyHint: true },
-}, async ({ article_id }) => {
-  const a = kb.get(article_id);
-  if (!a) return { content: [{ type: "text", text: `No article ${article_id}. Use an id from kb_search.` }], isError: true };
-  return { content: [{ type: "text", text: a.body }] };
-});
-
-console.error("kb server ready");
-await server.connect(new StdioServerTransport());
+print(asyncio.run(run("How do I reset my VPN token? Draft an article if none exists.")))
 ```
 
 ### Worked scenario: what a test run catches before any model is involved
@@ -517,6 +446,9 @@ seconds (illustrative), so it belongs in every CI run.
   policy check in the agent for anything destructive, and make writes idempotent so retries are safe.
 - **Version tools like an API.** Add new tools or optional arguments rather than changing meanings; when a
   breaking change is unavoidable, ship a new tool name and remove the old one after hosts migrate.
+- **TypeScript servers follow the same shape.** Register tools with `McpServer.registerTool` and Zod
+  `inputSchema`/`outputSchema`, return `isError: true` for recoverable failures, and log with
+  `console.error`, because stdout is the JSON-RPC wire.
 
 ## Trade-offs
 - **High-level API vs low-level `Server`.** Decorators and `registerTool` give schemas from types and little

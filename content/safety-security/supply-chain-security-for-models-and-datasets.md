@@ -163,32 +163,21 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-REPO = "Qwen/Qwen2.5-0.5B"
-REV = "<commit-sha-reviewed>"                 # never "main": branches move, hashes do not
+REPO, REV = "Qwen/Qwen2.5-0.5B", "<commit-sha-reviewed>"   # never "main": branches move, hashes do not
 EXPECTED = {   # abbreviated: the review step writes one entry per downloaded file (also vocab.json etc.)
     "model.safetensors": "<sha256>", "config.json": "<sha256>",
     "tokenizer.json": "<sha256>", "tokenizer_config.json": "<sha256>",  # chat template lives here
 }
 
-def sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
 # 1. fetch only what a safe load needs; *.bin / *.pt / *.pkl are never downloaded
-local = snapshot_download(REPO, revision=REV,
-                          allow_patterns=["*.safetensors", "*.json", "tokenizer*"])
+local = snapshot_download(REPO, revision=REV, allow_patterns=["*.safetensors", "*.json", "tokenizer*"])
 
-# 2. integrity: exactly the reviewed files, with exactly the reviewed bytes
-got = {str(p.relative_to(local)): sha256(str(p))           # rglob: "*.json" also matches sub/x.json
-       for p in Path(local).rglob("*") if p.is_file()}
-if got.keys() != EXPECTED.keys():
-    sys.exit(f"file set changed: {sorted(got.keys() ^ EXPECTED.keys())}")
-bad = [n for n in EXPECTED if got[n] != EXPECTED[n]]
+# 2. integrity: exactly the reviewed files, with exactly the reviewed bytes (file_digest: Python 3.11+)
+got = {str(p.relative_to(local)): hashlib.file_digest(p.open("rb"), "sha256").hexdigest()
+       for p in Path(local).rglob("*") if p.is_file()}      # rglob: "*.json" also matches sub/x.json
+bad = sorted(k for k in got.keys() | EXPECTED.keys() if got.get(k) != EXPECTED.get(k))
 if bad:
-    sys.exit(f"hash mismatch: {bad}")
+    sys.exit(f"file set or hashes changed: {bad}")
 
 # 3. belt and braces: scan the snapshot for pickle payloads (also run in CI on the mirror)
 subprocess.run(["picklescan", "--path", local], check=True)

@@ -300,57 +300,34 @@ provider's docs. The cache namespace hashes tenant, the model pair, system promp
 so a routing or prompt change starts a fresh namespace.
 
 ```python
-import hashlib, os, time
-import numpy as np
+import hashlib, os
 from litellm import completion
 from sentence_transformers import SentenceTransformer
 
 SMALL, LARGE = os.environ["SMALL_MODEL"], os.environ["LARGE_MODEL"]
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
-class SemanticCache:
-    def __init__(self, threshold=0.92, ttl_s=24 * 3600):
-        self.threshold, self.ttl_s = threshold, ttl_s
-        self.ns, self.vecs, self.answers, self.ts = [], [], [], []
-
-    def get(self, ns, query):
-        if not self.vecs:
-            return None, 0.0
-        q = embedder.encode(query, normalize_embeddings=True)
-        sims = np.array(self.vecs) @ q                      # cosine, since vectors are normalised
-        now = time.time()
-        ok = [i for i in range(len(sims)) if self.ns[i] == ns and now - self.ts[i] < self.ttl_s]
-        if not ok:
-            return None, 0.0
-        best = max(ok, key=lambda i: sims[i])
-        return (self.answers[best], float(sims[best])) if sims[best] >= self.threshold else (None, float(sims[best]))
-
-    def put(self, ns, query, answer):
-        self.ns.append(ns); self.answers.append(answer); self.ts.append(time.time())
-        self.vecs.append(embedder.encode(query, normalize_embeddings=True))
+cache = []                                                   # (namespace, vector, answer)
 
 def namespace(tenant, system, tools_version):
     key = f"{tenant}|{SMALL}|{LARGE}|{system}|{tools_version}"         # anything that changes the answer
     return hashlib.sha256(key.encode()).hexdigest()[:16]
 
-def looks_hard(q):
-    return len(q.split()) > 60 or any(w in q.lower() for w in ("compare", "plan", "why", "debug"))
-
 def ask(model, system, q):
     r = completion(model=model, messages=[{"role": "system", "content": system}, {"role": "user", "content": q}])
     return r.choices[0].message.content
 
-def answer(cache, tenant, system, q, tools_version="v1"):
-    ns = namespace(tenant, system, tools_version)
-    hit, sim = cache.get(ns, q)
-    if hit:
-        return hit, {"route": "cache", "sim": sim}
-    route = LARGE if looks_hard(q) else SMALL
+def answer(tenant, system, q, threshold=0.92, tools_version="v1"):
+    ns, v = namespace(tenant, system, tools_version), embedder.encode(q, normalize_embeddings=True)
+    sim, hit = max(((float(v @ cv), a) for n, cv, a in cache if n == ns), default=(0.0, None))
+    if hit is not None and sim >= threshold:                 # cosine, since vectors are normalised
+        return hit, "cache"
+    hard = len(q.split()) > 60 or any(w in q.lower() for w in ("compare", "plan", "why", "debug"))
+    route = LARGE if hard else SMALL
     text = ask(route, system, q)
     if route == SMALL and (not text or "I'm not sure" in text):
         route, text = LARGE, ask(LARGE, system, q)           # escalate on a failed check
-    cache.put(ns, q, text)
-    return text, {"route": route, "sim": sim}
+    cache.append((ns, v, text))                              # never cache the small model's failure
+    return text, route
 ```
 
 ### Milestones, time estimates and done-when checks
@@ -387,6 +364,9 @@ The router saves more than the cache here, but only the eval tells you whether t
   false hits that the offline threshold sweep missed.
 - **Portfolio polish.** A README with the before/after table, a 2-minute demo of hits and escalations,
   pytest tests for isolation and TTL, and a script that reproduces the eval with one command.
+- **Expire entries.** Store a timestamp with each cached answer and skip entries older than a TTL (24 hours
+  is a sensible start for FAQ answers, shorter for policy text); move to Redis or pgvector once a linear scan
+  over in-memory vectors gets slow.
 
 ## Trade-offs
 - **Higher threshold vs hit rate.** A strict threshold (0.95+) almost never serves a wrong answer but

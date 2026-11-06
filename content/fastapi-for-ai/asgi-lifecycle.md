@@ -327,45 +327,6 @@ sequenceDiagram
 ```
 
 ## Examples
-### Agent run as an SSE stream that stops when the user leaves
-Validate before the stream starts (so bad input is a real 4xx), check for disconnect between agent
-steps, and emit an explicit error event if a step fails after the 200 is out. `run_step` is a stand-in
-for one LLM call plus its tool call.
-
-```python
-import asyncio, json
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
-
-app = FastAPI()
-MAX_STEPS = 8
-
-async def run_step(task: str, i: int) -> dict:
-    await asyncio.sleep(5)                      # stand-in: one LLM call plus one tool call
-    return {"step": i, "tool": "search", "done": i == 3}
-
-@app.post("/agent/run")
-async def agent_run(request: Request, body: dict):
-    task = body.get("task", "").strip()
-    if not task:                                # fail BEFORE http.response.start: a real 422
-        raise HTTPException(422, "task is required")
-
-    async def events():
-        for i in range(MAX_STEPS):
-            if await request.is_disconnected(): # user left: stop spending tokens and tool calls
-                return
-            try:
-                ev = await run_step(task, i)
-            except Exception as e:              # status is already 200: send an error event
-                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
-                return
-            yield f"data: {json.dumps(ev)}\n\n"
-            if ev["done"]:
-                return
-
-    return StreamingResponse(events(), media_type="text/event-stream")
-```
-
 ### Raw ASGI app: lifespan, body, streamed response
 No framework. Run it with `uvicorn asgi_demo:app --lifespan on` and `curl -N -d "the kv cache stores keys"
 localhost:8000` to watch words arrive one at a time. FastAPI's `lifespan=` and `StreamingResponse`
@@ -384,16 +345,14 @@ async def app(scope, receive, send):
                 STATE["gen"] = lambda text: (w + " " for w in text.split())  # stand-in for a model
                 await send({"type": "lifespan.startup.complete"})
             elif msg["type"] == "lifespan.shutdown":
-                STATE.clear()
+                STATE.clear()                         # release what startup loaded
                 await send({"type": "lifespan.shutdown.complete"})
                 return
     elif scope["type"] == "http":
-        body = b""
-        while True:                                   # read the whole request body
+        body, more = b"", True
+        while more:                                   # read the whole request body
             msg = await receive()
-            body += msg.get("body", b"")
-            if not msg.get("more_body"):
-                break
+            body, more = body + msg.get("body", b""), msg.get("more_body", False)
         await send({"type": "http.response.start", "status": 200,
                     "headers": [(b"content-type", b"text/plain")]})
         for token in STATE["gen"](body.decode() or "hello world"):
@@ -416,9 +375,9 @@ async def call_llm(prompt: str) -> str:
     await asyncio.sleep(60)                  # stand-in for a 60-second provider call
     return f"answer to {prompt!r}"
 
-async def wait_for_disconnect(request: Request, poll_s: float = 0.5) -> None:
+async def wait_for_disconnect(request: Request) -> None:
     while not await request.is_disconnected():   # reads http.disconnect from receive()
-        await asyncio.sleep(poll_s)
+        await asyncio.sleep(0.5)
 
 @app.post("/complete")
 async def complete(request: Request, body: dict):
@@ -476,6 +435,9 @@ inside the stream for failures after it starts.
 - **Measure event-loop lag.** Use on every async agent service: schedule a no-op task every second and
   record how late it runs as a metric. Alert when lag climbs under load, because it means something
   (often a sync tool or SDK) is blocking the loop.
+- **Validate before the stream, error events after.** Run every check that can fail before returning the
+  `StreamingResponse` (so bad input is a real 4xx), cap agent streams with a step budget (8 steps, say),
+  and send `event: error` with a JSON body for failures after the 200 is out.
 
 ## Trade-offs
 - **Cheap idle connections vs one shared loop.** One event loop serves thousands of idle connections

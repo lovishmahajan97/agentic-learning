@@ -288,45 +288,38 @@ flowchart TD
 ## Examples
 ### Following a wrapped tool error to its root
 An agent tool wraps a JSON parse failure in its own `ToolError`. The script prints the chained trace,
-walks `__cause__` to the root, finds the deepest frame in our own file and emits one structured log
+walks `__cause__` to the root, finds the deepest frame in our own file and prints one structured log
 line (tested with Python 3.9.6 and 3.12.14, jq 1.7.1).
 
 ```python
-import json, logging, sys, traceback
+import json, traceback
 
-class ToolError(Exception):
-    """Raised at the tool boundary; the model sees this message."""
+class ToolError(Exception):                      # raised at the tool boundary; the model sees it
+    pass
 
-def parse_tool_args(raw):                      # 3. where the bad data finally breaks
+def parse_tool_args(raw):                        # 3. where the bad data finally breaks
     return json.loads(raw)
 
-def call_tool(name, raw_args):                 # 2. the tool boundary wraps the low-level error
+def call_tool(name, raw_args):                   # 2. the tool boundary wraps the low-level error
     try:
-        args = parse_tool_args(raw_args)
+        return parse_tool_args(raw_args)
     except json.JSONDecodeError as e:
         raise ToolError(f"{name}: model sent invalid JSON arguments") from e
-    return {"tool": name, "args": args}
 
-def agent_step(step, raw_args):                # 1. the agent loop, where the error surfaces
+def agent_step(step, raw_args):                  # 1. the agent loop, where the error surfaces
     return call_tool("search_orders", raw_args)
 
-logging.basicConfig(stream=sys.stdout, format="%(message)s", level=logging.INFO)
-log = logging.getLogger("agent")
-raw = '{"customer_id": "C-1001", "limit": 3,}'  # trailing comma, as a model sometimes emits
-
+raw = '{"customer_id": "C-1001", "limit": 3,}'   # trailing comma, as a model sometimes emits
 try:
     agent_step(4, raw)
 except ToolError as err:
-    print(traceback.format_exc())               # cause block prints first, wrapper second
+    print(traceback.format_exc())                # cause block prints first, wrapper second
     root = err
-    while root.__cause__ is not None:          # walk "raise ... from" to the original error
+    while root.__cause__ is not None:            # walk "raise ... from" to the original error
         root = root.__cause__
-    ours = [f for f in traceback.extract_tb(root.__traceback__) if f.filename == __file__]
-    frame = ours[-1]                           # deepest frame in OUR code, not the stdlib
-    log.error(json.dumps({"level": "error", "trace_id": "t-7f3a", "step": 4,
-                          "error": type(err).__name__, "root_cause": type(root).__name__,
-                          "root_msg": str(root), "where": f"{frame.name}:{frame.lineno}",
-                          "raw_args": raw}))
+    frame = [f for f in traceback.extract_tb(root.__traceback__) if f.filename == __file__][-1]
+    print(json.dumps({"trace_id": "t-7f3a", "step": 4, "error": type(err).__name__,
+                      "root_cause": type(root).__name__, "where": f"{frame.name}:{frame.lineno}"}))
 ```
 
 Output, with the stdlib frames trimmed and paths shortened (Python 3.11+ also underlines each failing
@@ -335,7 +328,7 @@ expression with `^^^^` markers):
 ```text
 Traceback (most recent call last):
   File "read_trace.py", line 11, in call_tool
-    args = parse_tool_args(raw_args)
+    return parse_tool_args(raw_args)
   File "read_trace.py", line 7, in parse_tool_args
     return json.loads(raw)
   ... 3 frames inside json/__init__.py and json/decoder.py ...
@@ -344,15 +337,15 @@ json.decoder.JSONDecodeError: Expecting property name enclosed in double quotes:
 The above exception was the direct cause of the following exception:
 
 Traceback (most recent call last):
-  File "read_trace.py", line 24, in <module>
+  File "read_trace.py", line 20, in <module>
     agent_step(4, raw)
-  File "read_trace.py", line 17, in agent_step
+  File "read_trace.py", line 16, in agent_step
     return call_tool("search_orders", raw_args)
   File "read_trace.py", line 13, in call_tool
     raise ToolError(f"{name}: model sent invalid JSON arguments") from e
 ToolError: search_orders: model sent invalid JSON arguments
 
-{"level": "error", "trace_id": "t-7f3a", "step": 4, "error": "ToolError", "root_cause": "JSONDecodeError", ...}
+{"trace_id": "t-7f3a", "step": 4, "error": "ToolError", "root_cause": "JSONDecodeError", "where": "parse_tool_args:7"}
 ```
 
 Then filter the log from the terminal: `python3 read_trace.py | tail -1 | jq -c '{root_cause, where}'`

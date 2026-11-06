@@ -162,11 +162,12 @@ flowchart TD
 
 ## Examples
 ### Tool registry and policy-enforcing executor
-Consequence tiers and required scopes per tool; the executor enforces the user's scopes, a step budget, a
-spend cap and approval for tier-2 actions. The model never sees credentials. Runs as is on Python 3.12.
+Consequence tiers and required scopes per tool; the executor enforces the user's scopes, a step budget
+and approval for tier-2 actions, and audits every decision. The model never sees credentials. Runs as is
+on Python 3.12.
 
 ```python
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 @dataclass
@@ -176,59 +177,38 @@ class Tool:
     tier: int                    # 0 read, 1 reversible write, 2 irreversible / external / money
     scopes: set[str]             # permissions the *user's* token must carry, not the service's
 
-@dataclass
-class Session:
-    user_scopes: set[str]
-    approve: Callable[[str, dict], bool]       # asks a human and shows the exact arguments
-    budget: dict = field(default_factory=lambda: {"calls": 25, "spent": 0, "spend_cap": 5000})
-    audit: list = field(default_factory=list)
-
-def execute(session: Session, tool: Tool, args: dict) -> str:
-    def done(outcome: str, msg: str) -> str:                         # every decision is audited, denials too
-        session.audit.append({"tool": tool.name, "args": args, "tier": tool.tier, "outcome": outcome})
-        return msg
-    if session.budget["calls"] <= 0:
-        return done("budget", "ERROR: step budget exhausted; stop and report progress")
-    session.budget["calls"] -= 1
-    if not tool.scopes <= session.user_scopes:                      # permissions axis
-        return done("scope", f"ERROR: {tool.name} requires {tool.scopes - session.user_scopes}")
-    if tool.tier == 2:                                               # autonomy axis
-        cents = int(args.get("amount_cents", 0))
-        if session.budget["spent"] + cents > session.budget["spend_cap"]:
-            return done("spend_cap", "ERROR: spend cap reached for this session")
-        if not session.approve(tool.name, args):
-            return done("denied", "DENIED by user; choose another course of action")
-        session.budget["spent"] += cents
-    return done("executed", tool.fn(**args))
+def execute(tool: Tool, args: dict, user_scopes: set[str], budget: dict, approve: Callable, audit: list) -> str:
+    if budget["calls"] <= 0:
+        msg = "ERROR: step budget exhausted; stop and report progress"
+    elif not tool.scopes <= user_scopes:                             # permissions axis
+        msg = f"ERROR: {tool.name} requires {tool.scopes - user_scopes}"
+    elif tool.tier == 2 and not approve(tool.name, args):            # autonomy axis: approve exact args
+        msg = "DENIED by user; choose another course of action"
+    else:
+        msg = tool.fn(**args)
+    budget["calls"] -= 1
+    audit.append({"tool": tool.name, "args": args, "outcome": msg})  # every decision, denials too
+    return msg
 
 TOOLS = {t.name: t for t in [                                        # functionality axis: two tools, no shell
     Tool("get_order", lambda order_id: f"order {order_id}: $89.99, delivered", 0, {"orders:read"}),
-    Tool("issue_refund", lambda order_id, amount_cents: f"refunded {amount_cents}", 2, {"orders:refund"}),
-]}
-s = Session(user_scopes={"orders:read"},
-            approve=lambda name, a: input(f"Allow {name} {a}? [y/N] ").strip().lower() == "y")
-print(execute(s, TOOLS["get_order"], {"order_id": "ORD-104233"}))
-print(execute(s, TOOLS["issue_refund"], {"order_id": "ORD-104233", "amount_cents": 8999}))
-# -> ERROR: issue_refund requires {'orders:refund'}. A first-line agent's token cannot refund,
-#    however persuasive the model, the customer, or an injected ticket is about it.
+    Tool("issue_refund", lambda order_id, amount_cents: f"refunded {amount_cents}", 2, {"orders:refund"})]}
+budget, audit, scopes, ask = {"calls": 25}, [], {"orders:read"}, lambda name, args: False  # ask: a human
+print(execute(TOOLS["get_order"], {"order_id": "ORD-104233"}, scopes, budget, ask, audit))
+print(execute(TOOLS["issue_refund"], {"order_id": "ORD-104233", "amount_cents": 8999}, scopes, budget, ask, audit))
+# ERROR: issue_refund requires {'orders:refund'}: no prompt or injected ticket can talk the token into it
 ```
 
 ### Blast-radius calculator
 The count factor is the smallest of rate-limited throughput and every cap in force.
 
 ```python
-def worst_case_calls(rate_per_s: float, hours: float, session_cap=None, daily_cap=None, sessions=1):
-    uncapped = int(rate_per_s * hours * 3600)
-    caps = [uncapped]
-    if session_cap is not None:
-        caps.append(session_cap * sessions)
-    if daily_cap is not None:
-        caps.append(daily_cap)
-    return min(caps)
+def worst_case_calls(rate_per_s: float, hours: float, *caps: int) -> int:
+    return min([int(rate_per_s * hours * 3600), *caps])     # throughput, or the tightest cap in force
 
-print(worst_case_calls(1, 8))                                         # 28800 sends overnight
-print(worst_case_calls(1, 8, session_cap=25, daily_cap=200, sessions=40))  # 200: the daily cap binds
-print(worst_case_calls(1, 8, session_cap=25, daily_cap=200, sessions=1))   # 25: one runaway session
+print(worst_case_calls(1, 8))                # 28800 sends overnight
+print(worst_case_calls(1, 8, 25 * 40, 200))  # 200: 40 sessions x 25 calls, but the daily cap binds
+print(worst_case_calls(1, 8, 25, 200))       # 25: one runaway session
 ```
 
 ### Enforcing tenant scope in the resource layer
@@ -262,6 +242,9 @@ COMMIT;
   descriptions on every update, blocking new or redefined functions until reviewed.
 - **Budgets per task class with a kill switch.** Set step, spend and rows-affected caps per workflow, have
   the agent report "budget exhausted" rather than fail silently, and alert on sessions that hit caps.
+- **Spend cap on money tools.** Before asking for approval, check a per-session spend cap (for example
+  5,000 cents) and add the amount to spent only after approval, so a run of small refunds cannot add up
+  past it.
 
 ## Trade-offs
 - **Narrow typed tools vs engineering effort.** Policeable, but every new capability is work; for

@@ -177,27 +177,24 @@ flowchart TD
 import asyncio
 
 GRAPH = {
-    "pricing_A":  {"deps": [], "task": "Find current list pricing for vendor A; return {plans:[...]}"},
-    "pricing_B":  {"deps": [], "task": "Find current list pricing for vendor B; return {plans:[...]}"},
-    "features_A": {"deps": [], "task": "List vendor A features for SSO, audit, SLA; return {features:{}}"},
-    "features_B": {"deps": [], "task": "List vendor B features for SSO, audit, SLA; return {features:{}}"},
+    "pricing_A":  {"deps": [], "task": "Vendor A list pricing; return {plans:[...]}"},
+    "pricing_B":  {"deps": [], "task": "Vendor B list pricing; return {plans:[...]}"},
+    "features_A": {"deps": [], "task": "Vendor A SSO, audit, SLA; return {features:{}}"},
+    "features_B": {"deps": [], "task": "Vendor B SSO, audit, SLA; return {features:{}}"},
     "compare":    {"deps": ["pricing_A", "pricing_B", "features_A", "features_B"],
-                   "task": "Build a comparison table; flag conflicts; return {table:[...], conflicts:[...]}"},
-    "recommend":  {"deps": ["compare"],
-                   "task": "Recommend one vendor for a 200-seat team; cite table rows; return {text:...}"},
+                   "task": "Comparison table; flag conflicts; return {table:[...], conflicts:[...]}"},
+    "recommend":  {"deps": ["compare"], "task": "Recommend one vendor; cite table rows; return {text:...}"},
 }
 BRIEF = "Buyer: 200-seat fintech, needs SSO and audit logs, budget 40k/year."
 
 async def run_subtask(name, upstream):
-    spec = GRAPH[name]
-    inputs = {d: upstream[d] for d in spec["deps"]}        # only declared dependencies cross the seam
-    return await call_model(brief=BRIEF, task=spec["task"], inputs=inputs, max_tool_calls=6)
+    inputs = {d: upstream[d] for d in GRAPH[name]["deps"]}   # only declared deps cross the seam
+    return await call_model(brief=BRIEF, task=GRAPH[name]["task"], inputs=inputs, max_tool_calls=6)
 
 async def execute(graph):
     done = {}
     while len(done) < len(graph):
-        ready = [n for n, s in graph.items()
-                 if n not in done and all(d in done for d in s["deps"])]
+        ready = [n for n, s in graph.items() if n not in done and all(d in done for d in s["deps"])]
         if not ready:
             raise RuntimeError("cycle or unsatisfiable dependency in graph")
         results = await asyncio.gather(*(run_subtask(n, done) for n in ready))

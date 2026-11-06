@@ -337,136 +337,66 @@ flowchart TD
 ```
 
 ## Examples
-### Manual instrumentation of a RAG answer
-A root span, a retrieval child and a model-call child carrying GenAI attributes, exported in batches to a
-Collector with 25% head sampling. `retrieve`, `build` and `llm` stand for your own code and an
-OpenAI-compatible client.
+### Manual instrumentation with head sampling
+A root span and a model-call child carrying GenAI attributes, exported in batches with 25% head sampling.
+The in-memory exporter stands in for the OTLP exporter so it runs offline; token counts are fixed numbers
+where real code reads `resp.usage`.
 
 ```python
-from opentelemetry import trace
+# pip install opentelemetry-sdk
+from opentelemetry import trace, propagate
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.trace import SpanKind, Status, StatusCode
+from opentelemetry.trace import SpanKind
 
-provider = TracerProvider(
-    resource=Resource.create({"service.name": "support-bot", "deployment.environment.name": "prod"}),
-    sampler=ParentBased(TraceIdRatioBased(0.25)),   # keep 1 trace in 4; children follow the root decision
-)
-provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint="otel-collector:4317", insecure=True)))
+provider = TracerProvider(resource=Resource.create({"service.name": "support-bot"}),
+                          sampler=ParentBased(TraceIdRatioBased(0.25)))  # keep 1 trace in 4
+exporter = InMemorySpanExporter()      # production: OTLPSpanExporter(endpoint="otel-collector:4317")
+provider.add_span_processor(BatchSpanProcessor(exporter))
 trace.set_tracer_provider(provider)
 tracer = trace.get_tracer("support-bot")
 
 def answer(question: str) -> str:
-    with tracer.start_as_current_span("support.answer") as root:          # no parent in context: trace root
-        root.set_attribute("app.question_chars", len(question))
-        with tracer.start_as_current_span("retrieve") as s:
-            docs = retrieve(question)
-            s.set_attribute("retrieval.document_count", len(docs))
+    with tracer.start_as_current_span("support.answer"):              # no parent: trace root
         with tracer.start_as_current_span("chat gpt-4o-mini", kind=SpanKind.CLIENT) as s:
-            s.set_attributes({"gen_ai.provider.name": "openai", "gen_ai.operation.name": "chat",
-                              "gen_ai.request.model": "gpt-4o-mini"})
-            try:
-                resp = llm.chat.completions.create(model="gpt-4o-mini", messages=build(question, docs))
-            except Exception as e:
-                s.record_exception(e); s.set_status(Status(StatusCode.ERROR)); raise
-            s.set_attributes({"gen_ai.usage.input_tokens": resp.usage.prompt_tokens,
-                              "gen_ai.usage.output_tokens": resp.usage.completion_tokens})
-            return resp.choices[0].message.content
+            s.set_attributes({"gen_ai.operation.name": "chat", "gen_ai.request.model": "gpt-4o-mini",
+                              "gen_ai.usage.input_tokens": 812, "gen_ai.usage.output_tokens": 96})
+            headers = {}
+            propagate.inject(headers)          # what an outgoing HTTP call would carry
+            return headers["traceparent"]
 
-# Short-lived process (CLI, Lambda, batch job)? Flush before exit or the batch processor drops the tail:
-# provider.force_flush(); provider.shutdown()
+flags = [answer(f"question {i}")[-2:] for i in range(1000)]
+provider.force_flush()                         # short-lived process: flush or lose the tail
+print(flags.count("01"), len(exporter.get_finished_spans()))   # ~250 sampled, ~500 spans (2 each)
 ```
 
-What crosses the wire is small:
-- **The header.** If `retrieve` called a vector service over instrumented HTTP, the request would carry
-  `traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`: version `00`, the 32-hex trace id
-  shared by all three spans, the 16-hex id of the calling span, and flags `01` meaning "sampled".
-- **Unsampled requests.** Three quarters carry `-00` instead; downstream services see that and record nothing,
-  which is how one root decision keeps a trace all-or-nothing.
-- **Export side.** The batch processor holds finished spans in a bounded queue and ships them every few
-  seconds or when a batch fills; if the queue overflows under load it drops spans rather than block your
-  request.
-- **With an instrumented HTTP client** making the model call, the `CLIENT` span and `traceparent` injection
-  appear without the manual span; keep the GenAI attributes on a wrapping span or let an LLM instrumentation
-  library set them.
-
-### Tracing an agent loop: one root, a span per model call and tool call
-The agent run is the root; each turn's model call and each tool call is a child, and tool calls run as
-asyncio tasks. `call_model` and `TOOLS` stand for your own client and tool registry.
-
-```python
-import asyncio, json
-from opentelemetry import trace
-from opentelemetry.trace import SpanKind, Status, StatusCode
-
-tracer = trace.get_tracer("research-agent")   # provider set up as in the previous example
-
-async def run_tool(call):
-    # asyncio tasks copy the current context, so this span parents to the turn span
-    with tracer.start_as_current_span(f"tool {call.name}", kind=SpanKind.INTERNAL) as s:
-        s.set_attributes({"app.tool.name": call.name, "app.tool.args_chars": len(call.arguments)})
-        try:
-            return await TOOLS[call.name](**json.loads(call.arguments))
-        except Exception as e:
-            s.record_exception(e); s.set_status(Status(StatusCode.ERROR)); return {"error": str(e)}
-
-async def run_agent(task: str, max_steps: int = 8):
-    with tracer.start_as_current_span("agent.run") as root:
-        root.set_attribute("app.agent.max_steps", max_steps)
-        messages = [{"role": "user", "content": task}]
-        for step in range(max_steps):
-            with tracer.start_as_current_span(f"agent.turn {step}"):
-                with tracer.start_as_current_span("chat gpt-4o-mini", kind=SpanKind.CLIENT) as s:
-                    s.set_attributes({"gen_ai.operation.name": "chat", "gen_ai.request.model": "gpt-4o-mini"})
-                    msg, usage = await call_model(messages)
-                    s.set_attributes({"gen_ai.usage.input_tokens": usage.input,
-                                      "gen_ai.usage.output_tokens": usage.output})
-                if not msg.tool_calls:
-                    root.set_attribute("app.agent.steps", step + 1); return msg.content
-                results = await asyncio.gather(*(run_tool(c) for c in msg.tool_calls))
-                messages += [msg.to_dict()] + [{"role": "tool", "tool_call_id": c.id,
-                             "content": json.dumps(r)} for c, r in zip(msg.tool_calls, results)]
-        root.set_status(Status(StatusCode.ERROR, "max_steps reached"))
-```
-
-- **Parallel tool calls appear as siblings** under the turn span, so the trace view shows them overlapping.
-- **The `app.*` attributes are your own namespace.** Recent GenAI conventions also describe agent and tool
-  spans (for example an `execute_tool` operation and tool-name attributes); they are experimental, so check
-  the version you pin before relying on exact names.
-- **A failed tool is an ERROR span but not a crash,** because the error goes back to the model as a tool
-  result; the root is marked ERROR only when the step budget runs out.
+- **The header** looks like `traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`: version
+  `00`, the 32-hex trace id shared by every span, the 16-hex id of the calling span, and flags `01` meaning
+  "sampled".
+- **Unsampled requests** carry `-00`; downstream services see that and record nothing, which is how one
+  root decision keeps a trace all-or-nothing.
+- **The batch processor** holds finished spans in a bounded queue and ships them every few seconds or when a
+  batch fills; if the queue overflows it drops spans rather than block your request.
 
 ### Collector gateway: keep every error, 10% of the rest
-A production gateway config using the contrib `tail_sampling` processor. A trace is kept if any policy
-matches, so errors and slow traces are always retained.
+A gateway config using the contrib `tail_sampling` processor. A trace is kept if any policy matches, so
+errors and slow traces are always retained.
 
 ```yaml
 receivers:
   otlp:
     protocols:
-      grpc:
-        endpoint: 0.0.0.0:4317
-      http:
-        endpoint: 0.0.0.0:4318
+      grpc: {endpoint: 0.0.0.0:4317}
 processors:
-  memory_limiter:
-    check_interval: 1s
-    limit_mib: 1024
   tail_sampling:
     decision_wait: 10s            # buffer spans this long before deciding
     policies:
-      - name: errors
-        type: status_code
-        status_code: {status_codes: [ERROR]}
-      - name: slow
-        type: latency
-        latency: {threshold_ms: 5000}
-      - name: baseline
-        type: probabilistic
-        probabilistic: {sampling_percentage: 10}
+      - {name: errors, type: status_code, status_code: {status_codes: [ERROR]}}
+      - {name: slow, type: latency, latency: {threshold_ms: 5000}}
+      - {name: baseline, type: probabilistic, probabilistic: {sampling_percentage: 10}}
   batch: {}
 exporters:
   otlp:
@@ -476,7 +406,7 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, tail_sampling, batch]
+      processors: [tail_sampling, batch]
       exporters: [otlp]
 ```
 
@@ -520,6 +450,13 @@ memory to hold `decision_wait` seconds of full traffic (here 40,000 spans for 10
   production traffic only, using the instrumentation library's content-capture setting (for the OpenAI
   instrumentation that follows the GenAI conventions, `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`).
   Monitor span size and storage growth.
+- **Memory limiter first on the gateway.** Put `memory_limiter` (for example `check_interval: 1s`,
+  `limit_mib: 1024`) before `tail_sampling` in the pipeline, so a traffic spike makes the Collector refuse
+  data instead of being OOM-killed. Monitor refused spans.
+- **A failed tool is an ERROR span, not a failed run.** When the error goes back to the model as a tool
+  result, mark only the tool span ERROR (`record_exception` plus status); mark the run root ERROR only when
+  the step budget runs out. Parallel tool calls run as asyncio tasks, which copy the context, so they show
+  as sibling spans under their turn.
 
 ## Trade-offs
 - **Vendor neutrality vs uneven maturity.** One instrumentation for every backend, but maturity varies across

@@ -196,13 +196,10 @@ review, since some constants (a policy document id) are legitimately reused.
 ```python
 def copied_args(pred_calls, prompts, train_arg_values):
     """Flag argument values that come from training traces instead of the current request."""
-    flagged = []
-    for call, prompt in zip(pred_calls, prompts):
-        for key, value in call["arguments"].items():
-            v = str(value)
-            if v in train_arg_values and v not in prompt:
-                flagged.append((call["name"], key, v))
-    return flagged
+    return [(call["name"], key, str(v))
+            for call, prompt in zip(pred_calls, prompts)
+            for key, v in call["arguments"].items()
+            if str(v) in train_arg_values and str(v) not in prompt]
 
 train_arg_values = {"o-1042", "c-77", "49.99", "refund_policy_v2"}   # literals seen in training traces
 prompts = ["Refund order o-5531, it arrived broken",
@@ -244,27 +241,20 @@ The rule from the scenario as code: stop after three evaluations without improve
 checkpoint.
 
 ```python
-class EarlyStopping:
-    """Stop when the validation metric has not improved by min_delta for `patience` evaluations."""
-    def __init__(self, patience=3, min_delta=0.005, mode="min"):
-        self.patience, self.min_delta = patience, min_delta
-        self.sign = 1 if mode == "min" else -1
-        self.best, self.best_step, self.bad_evals = None, None, 0
-
-    def update(self, value, step) -> bool:
-        improved = self.best is None or self.sign * (self.best - value) > self.min_delta
-        if improved:
-            self.best, self.best_step, self.bad_evals = value, step, 0
+def early_stop(val_losses, patience=3, min_delta=0.005):
+    """Return (stop_epoch, best_epoch): stop after `patience` evals without a min_delta improvement."""
+    best, best_epoch, bad = float("inf"), 0, 0
+    for epoch, loss in enumerate(val_losses, start=1):
+        if best - loss > min_delta:
+            best, best_epoch, bad = loss, epoch, 0
         else:
-            self.bad_evals += 1
-        return self.bad_evals >= self.patience      # True -> stop and reload best_step's checkpoint
+            bad += 1
+        if bad >= patience:
+            return epoch, best_epoch                 # stop, then reload best_epoch's checkpoint
+    return len(val_losses), best_epoch
 
-stop = EarlyStopping(patience=3)
-for epoch, val_loss in enumerate([1.38, 1.21, 1.18, 1.19, 1.25, 1.33, 1.44, 1.52, 1.61, 1.71], start=1):
-    if stop.update(val_loss, step=epoch):
-        print(f"stop at epoch {epoch}; best was epoch {stop.best_step} (val {stop.best})")
-        break
-# -> stop at epoch 6; best was epoch 3 (val 1.18)
+print(early_stop([1.38, 1.21, 1.18, 1.19, 1.25, 1.33, 1.44, 1.52, 1.61, 1.71]))
+# (6, 3): stop at epoch 6; best was epoch 3 (val 1.18)
 ```
 
 ### Verbatim-overlap check before release
@@ -279,22 +269,14 @@ def ngrams(text, n):
 def verbatim_rate(generations, train_targets, n=8):
     """Share of generations that copy at least one n-word span from any training target."""
     seen = set().union(*(ngrams(t, n) for t in train_targets))
-    flagged = [g for g in generations if ngrams(g, n) & seen]
-    return len(flagged) / len(generations), flagged
+    return sum(bool(ngrams(g, n) & seen) for g in generations) / len(generations)
 
-train_targets = [
-    "Thanks for reaching out. I have refunded the duplicate charge to your card ending 4417 today.",
-    "Please clear your browser cache and sign in again; the invoice page should then load normally.",
-]
+train_targets = ["Thanks for reaching out. I have refunded the duplicate charge to your card ending 4417."]
 generations = [  # model outputs on held-out prompts
-    "Thanks for reaching out. I have refunded the duplicate charge to your card ending 4417 today.",
+    "Thanks for reaching out. I have refunded the duplicate charge to your card ending 4417.",
     "You can export your data from Settings, then Account, then Download archive.",
-    "Please clear your browser cache and sign in again; that usually fixes a blank login page.",
 ]
-rate, flagged = verbatim_rate(generations, train_targets)
-print(f"verbatim rate = {rate:.0%}")          # 67%: two of three held-out answers copy training text
-for g in flagged:
-    print("COPIED:", g[:60])
+print(f"verbatim rate = {verbatim_rate(generations, train_targets):.0%}")   # 50%: one answer copies training text
 ```
 
 ## Production patterns

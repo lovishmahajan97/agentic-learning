@@ -233,7 +233,6 @@ Enforces classification, routes for capability and bursts only eligible traffic.
 names are placeholders.
 
 ```python
-from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
@@ -247,28 +246,22 @@ class Request:
     data_class: DataClass
     needs_frontier: bool        # task requires a capability only the hosted model has
     latency_budget_ms: int
-    site: str | None = None     # set for site-local traffic
 
-ONPREM_QUEUE_WAIT_MS = {"central": 0, "plant-7": 0}   # refreshed from engine metrics
+onprem_queue_wait_ms = 0        # refreshed from engine metrics
 BURST_THRESHOLD_MS = 800
 
 def route(r: Request) -> str:
-    if r.data_class is DataClass.RESTRICTED:
+    if r.data_class is DataClass.RESTRICTED:             # classification first, always
         if r.needs_frontier:
             raise PermissionError("restricted data cannot use the hosted frontier model")
         return "onprem:central"                          # no burst, no fallback, by policy
-    if r.site and r.latency_budget_ms < 300:
-        return f"onprem:{r.site}"                        # site-local pool, degraded mode if central is down
-    if r.needs_frontier:
-        return "cloud:eu-region"                         # private endpoint, approved region
-    if ONPREM_QUEUE_WAIT_MS["central"] > BURST_THRESHOLD_MS and r.latency_budget_ms < 5_000:
-        return "cloud:eu-region"                         # interactive eligible burst only;
-                                                         # deferrable work waits for owned GPUs
+    if r.needs_frontier or (onprem_queue_wait_ms > BURST_THRESHOLD_MS and r.latency_budget_ms < 5_000):
+        return "cloud:eu-region"                         # capability, or interactive burst only
     return "onprem:central"                              # owned capacity is sunk cost: keep it busy
 
 print(route(Request(DataClass.RESTRICTED, False, 2000)))        # onprem:central
 print(route(Request(DataClass.INTERNAL, True, 2000)))           # cloud:eu-region
-ONPREM_QUEUE_WAIT_MS["central"] = 1500
+onprem_queue_wait_ms = 1500
 print(route(Request(DataClass.PUBLIC, False, 2000)))            # cloud:eu-region (burst)
 ```
 
@@ -356,6 +349,8 @@ Illustrative numbers, in replicas of one model.
   or model change ships. Monitor the score gap between routes, which predicts burst-time regressions.
 - **Credentials only where used.** Cloud credentials live with the cloud-facing gateway component, never on
   on-prem serving nodes. Monitor with secret scanning and access audits on both sides.
+- **Site-local traffic stays local.** Route site-tagged requests with a tight latency budget (for example
+  under 300 ms) to the site's own pool, which keeps serving in degraded mode if central is down.
 
 ## Trade-offs
 - **Owned cost vs fixed quantity.** Owned GPUs lower cost per token at high utilization, but are a fixed

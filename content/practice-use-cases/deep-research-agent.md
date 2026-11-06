@@ -165,39 +165,25 @@ format and the check stay the same.
 import re
 
 CORPUS = {  # stand-in for fetched pages: url -> extracted text
-    "https://example.org/a": "The Rust 1.0 release shipped in May 2015 after years of development.",
+    "https://example.org/a": "Rust 1.0 shipped in May 2015 after years of development.",
     "https://example.org/b": "Go 1.0 was released in March 2012 with a compatibility promise.",
 }
-
-def search(query):
-    terms = set(query.lower().split())
-    scored = [(sum(t in text.lower() for t in terms), url) for url, text in CORPUS.items()]
-    return [url for s, url in sorted(scored, reverse=True) if s > 0]
-
 notes = []
 def save_evidence(url, quote):
     if quote not in CORPUS[url]:
         raise ValueError("quote must be copied verbatim from the page")
     notes.append({"id": len(notes) + 1, "url": url, "quote": quote})
-    return notes[-1]["id"]
 
-for q in ["rust 1.0 release", "go 1.0 released"]:     # sub-questions from the planner
-    top = search(q)[0]
-    sentence = re.split(r"(?<=\.)\s", CORPUS[top])[0]
-    save_evidence(top, sentence)
-
+save_evidence("https://example.org/a", "Rust 1.0 shipped in May 2015")
+save_evidence("https://example.org/b", "Go 1.0 was released in March 2012")
 report = "Go 1.0 shipped in March 2012 [2]. Rust 1.0 followed in May 2015 [1]. Both are popular [3]."
 
-def verify(report, notes):
-    by_id = {n["id"]: n for n in notes}
-    for sent in re.split(r"(?<=\.)\s", report):
-        ids = [int(i) for i in re.findall(r"\[(\d+)\]", sent)]
-        ok = ids and all(i in by_id for i in ids)
-        print(("OK  " if ok else "FLAG"), sent, [by_id[i]["url"] for i in ids if i in by_id])
-
-verify(report, notes)
-# The third sentence cites a note that does not exist, so it is flagged. A judge model then checks
-# that each OK sentence is actually entailed by its quotes, not just that the ids exist.
+ids = {n["id"] for n in notes}
+for sent in re.split(r"(?<=\.)\s", report):
+    cited = {int(i) for i in re.findall(r"\[(\d+)\]", sent)}
+    print("OK  " if cited and cited <= ids else "FLAG", sent)
+# OK   Go 1.0 ... [2].  /  OK   Rust 1.0 ... [1].  /  FLAG Both are popular [3].
+# A judge model then checks that each OK sentence is entailed by its quotes, not just that ids exist.
 ```
 
 ### Worked targets for a first research agent

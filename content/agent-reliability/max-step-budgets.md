@@ -342,20 +342,8 @@ flowchart TD
 
 ## Examples
 ### A multi-dimension budget with projection and sub-budgets
-- **What it does:** caps steps, tokens and seconds with one soft warning at 80% of whichever is closest;
-  refuses a call whose *projected* cost breaches the token limit and returns a labelled partial; and
-  `child()` / `absorb()` fund a sub-agent from what remains and debit the parent on its return.
-
-Why the warning also fires on `last`, traced for a run whose context grows by about 15k tokens per step
-(step *n* sends roughly 15k × n; cumulative spend after *n* steps is 15k × n(n+1)/2):
-
-| After step | Cumulative | Next call | Decision |
-|---|---|---|---|
-| 5 | 225k (56%) | step six sends 90k: 225k + 90k + 4k ≤ 400k fits | but six and seven together would not, so warn with step six |
-| 6 | 315k (still under the 80% line) | step seven would project to 424k | stop with a partial |
-
-- **Lesson:** a purely fractional soft line would never have fired. With quadratic growth, "under 80%"
-  becomes "cannot afford another call" in one step, so the projection must drive the warning.
+- **What it does:** caps steps, tokens and seconds; `can_afford()` checks the *projected* cost of the next
+  call; `child()` / `absorb()` fund a sub-agent from what remains and debit the parent on its return.
 
 ```python
 import time
@@ -364,7 +352,7 @@ from dataclasses import dataclass, field
 @dataclass
 class Budget:
     max_steps: int = 20; max_tokens: int = 400_000; max_seconds: float = 600
-    soft_fraction: float = 0.8; steps: int = 0; tokens: int = 0; warned: bool = False
+    steps: int = 0; tokens: int = 0
     started: float = field(default_factory=time.monotonic)
 
     def charge(self, usage):                     # usage block from the API response
@@ -382,70 +370,49 @@ class Budget:
 
     def child(self, share: float = 0.25) -> "Budget":   # slice of what is left, never 0
         left = max(0.0, 1 - self.fraction_used()) * share
-        return Budget(max_steps=max(1, int(self.max_steps * left)),
-                      max_tokens=max(1, int(self.max_tokens * left)),
-                      max_seconds=max(1.0, self.max_seconds * left))
+        return Budget(max(1, int(self.max_steps * left)), max(1, int(self.max_tokens * left)),
+                      max(1.0, self.max_seconds * left))
 
     def absorb(self, child: "Budget"):          # parent pays for the child on return
         self.steps += child.steps; self.tokens += child.tokens
+```
 
-def run(state, model, budget: Budget, max_out=4_000):
-    while True:
-        ctx = state.context_tokens()
-        if not budget.can_afford(ctx, max_out):  # wrap_up: no-tools call, paid from a
-            return {"status": "partial", "reason": "budget_exhausted",   # reserve kept
-                    "draft": state.wrap_up()}                            # outside max_tokens
-        last = not budget.can_afford(ctx, max_out, calls=2)   # room for one more call only
-        if not budget.warned and (last or budget.fraction_used() >= budget.soft_fraction):
-            budget.warned = True
-            state.push_user("Budget nearly used. Submit your best result now "
-                            "and list anything unfinished.")
-        resp = model(state.messages)
-        budget.charge(resp.usage)
-        if state.handle(resp):                   # True once submit_result is accepted
-            return {"status": "succeeded", "result": state.result}
+### Runnable: a stuck run whose context grows 15k per step
+Paste below the class. The soft warning fires at 80% used *or* when only one more call fits.
 
-# --- runnable check (Python 3.10+): a stuck run whose context grows 15k per step ---
+```python
 from types import SimpleNamespace as NS
 
-class StuckState:                                # never submits, like a looping agent
-    def __init__(self): self.messages, self.n = [], 0
-    def context_tokens(self): return 15_000 * (self.n + 1)
-    def push_user(self, text): print(f"warning injected before step {self.n + 1}")
-    def handle(self, resp): self.n += 1; return False
-    def wrap_up(self): return f"summary after {self.n} steps"
+def run(budget, context_tokens, max_out=4_000, soft=0.8):   # a stuck agent: never submits
+    n, warned = 0, False
+    while True:
+        ctx = context_tokens(n)
+        if not budget.can_afford(ctx, max_out):  # real loop: return a labelled partial draft
+            return {"status": "partial", "reason": "budget_exhausted", "steps": n}
+        last = not budget.can_afford(ctx, max_out, calls=2)   # room for one more call only
+        if not warned and (last or budget.fraction_used() >= soft):
+            warned = True                        # real loop: push "submit your best result now"
+            print(f"warning injected before step {n + 1}")
+        budget.charge(NS(input_tokens=ctx, output_tokens=0))  # stands in for model(...).usage
+        n += 1
 
-state = StuckState()
-model = lambda messages: NS(usage=NS(input_tokens=state.context_tokens(), output_tokens=0))
 b = Budget()
-print(run(state, model, b), b.tokens)            # warns before step 6; partial at 315000
+print(run(b, lambda n: 15_000 * (n + 1)), b.tokens)  # warns before step 6; partial at 315000
 child = b.child(); print(child.max_steps, child.max_tokens)   # 1 21250: a slice of what is left
 ```
 
-### Runnable: simulate quadratic token growth
-Pure Python, no API. It reproduces the trace above and shows why step counts understate cost.
+### Worked trace: why the warning also fires on `last`
+Step *n* sends roughly 15k × n; cumulative spend after *n* steps is 15k × n(n+1)/2:
 
-```python
-def simulate(per_step=15_000, budget=400_000, max_out=4_000, soft=0.8):
-    used, n = 0, 0
-    while True:
-        ctx = per_step * (n + 1)                  # context sent on the next call
-        if used + ctx + max_out > budget:
-            return n, used, "stop: next call would breach"
-        last = used + 2 * (ctx + max_out) > budget
-        warn = last or used / budget >= soft
-        n += 1
-        used += ctx                               # input only, for simplicity
-        print(f"step {n}: sent {ctx//1000}k, used {used//1000}k ({used/budget:.0%})"
-              + ("  <- warn" if warn else ""))
+| After step | Cumulative | Next call | Decision |
+|---|---|---|---|
+| 5 | 225k (56%) | step six sends 90k: 225k + 90k + 4k ≤ 400k fits | but six and seven together would not, so warn with step six |
+| 6 | 315k (still under the 80% line) | step seven would project to 424k | stop with a partial |
 
-print(simulate())             # warns on step 6 at 79%, stops before step 7
-for steps in (8, 10, 20):     # re-sent context units: 36, 55, 210
-    print(steps, "steps ->", sum(range(1, steps + 1)), "units of re-sent context")
-```
-
-- **Read the output:** 8 to 10 steps is a 25% rise in steps but about 1.5x in re-sent context; 20 steps
-  re-send 210 units, nearly six times the 8-step run.
+- **Lesson:** a purely fractional soft line would never have fired. With quadratic growth, "under 80%"
+  becomes "cannot afford another call" in one step, so the projection must drive the warning.
+- **Steps understate cost:** re-sent context units are n(n+1)/2, so 8 to 10 steps (36 to 55 units) is a
+  25% rise in steps but about 1.5x in context; 20 steps re-send 210 units.
 
 ## Production patterns
 - **Use the framework's turn cap as the outer backstop.** In the OpenAI Agents SDK pass `max_turns` to
@@ -465,6 +432,8 @@ for steps in (8, 10, 20):     # re-sent context units: 36, 55, 210
 - **Per-call timeouts under the wall-clock budget.** Wrap every tool call in a timeout (for example
   `asyncio.wait_for`) and set the SDK client's request timeout, so the wall-clock budget can actually
   interrupt. Monitor p99 tool latency and timeout counts per tool.
+- **Pay the wrap-up from a reserve.** On exhaustion make one no-tools call that writes the labelled
+  partial (best draft plus what is unfinished), funded from a reserve kept outside `max_tokens`.
 
 ## Trade-offs
 - **Tight budget vs long-tail tasks.** It bounds cost and latency precisely but truncates the long-tail

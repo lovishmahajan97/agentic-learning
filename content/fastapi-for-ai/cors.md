@@ -316,100 +316,26 @@ sequenceDiagram
 ```
 
 ## Examples
-### Chat UI calling a FastAPI backend with a bearer token
-A UI at `https://chat.acme.com` (and a local dev server) reads a request ID and rate-limit hint from
-responses.
+### Chat UI policy, verified with TestClient (runnable)
+A UI at `https://chat.acme.com` calls the API with a bearer token and reads a request ID and rate-limit
+hint from responses. The script then simulates browser preflights and a simple request.
 
 ```python
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import os
-
-app = FastAPI()
-
-origins = ["https://chat.acme.com"]
-if os.getenv("ENV") == "dev":
-    origins += ["http://localhost:3000"]
-
-app.add_middleware(                      # add last => outermost, wraps auth and rate limiting
-    CORSMiddleware,
-    allow_origins=origins,               # exact list; never "*" together with credentials
-    allow_credentials=False,             # bearer tokens, not cookies
-    allow_methods=["GET", "POST"],
-    allow_headers=["authorization", "content-type", "idempotency-key"],
-    expose_headers=["x-request-id", "retry-after"],
-    max_age=600,                         # cache preflight results for 10 minutes
-)
-
-@app.post("/v1/chat")
-async def chat(body: dict):
-    return {"reply": "..."}
-```
-
-What the browser does with `fetch("https://api.acme.com/v1/chat", {method: "POST", headers:
-{Authorization: "Bearer ...", "Content-Type": "application/json"}})`: it first sends `OPTIONS` from
-the page's origin, then acts on the answer.
-
-| Caller | Exchange | Outcome |
-|---|---|---|
-| page on `https://chat.acme.com` | `OPTIONS` → 200 with allowed methods and headers, then the POST | works |
-| page on `https://evil.example` | 400 preflight with no `Allow-Origin` | its script never sends the POST |
-| `evil.example` sending a form-encoded POST with no custom headers | simple request, no preflight | *reaches your server and runs*; the browser only hides the response |
-| `curl` from anywhere | no CORS at all | reaches `/v1/chat` |
-
-- **State-changing routes must reject requests** that lack a credential the attacker's page cannot
-  obtain, such as the bearer token here.
-- **That is why the bearer token must be validated**: curl ignores CORS entirely.
-
-### Agent run endpoint that streams to a browser UI
-The UI starts a run with `fetch` (so it can send `Authorization`), reads the run id header to show a
-"cancel" button, and reads `Retry-After` when the run is rate limited.
-
-```python
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-import json, uuid
-
-app = FastAPI()
-# auth and rate-limit middleware added here, before CORS ...
-app.add_middleware(
-    CORSMiddleware,                                    # added last => outermost
-    allow_origins=["https://chat.acme.com"],
-    allow_methods=["POST", "DELETE"],                  # start a run, cancel a run
-    allow_headers=["authorization", "content-type", "idempotency-key"],
-    expose_headers=["x-run-id", "retry-after"],        # the UI script reads these
-    max_age=600,
-)
-
-@app.post("/v1/agent/runs")
-async def start_run(body: dict):
-    run_id = str(uuid.uuid4())
-    async def events():
-        yield f"data: {json.dumps({'type': 'run_started', 'run_id': run_id})}\n\n"
-        yield f"data: {json.dumps({'type': 'tool_call', 'name': 'search'})}\n\n"
-        yield f"data: {json.dumps({'type': 'final', 'text': '...'})}\n\n"
-    return StreamingResponse(events(), media_type="text/event-stream",
-                             headers={"x-run-id": run_id})
-```
-
-| Symptom in the UI | Real cause | Fix |
-|---|---|---|
-| "CORS error", run never starts | `idempotency-key` missing from `allow_headers` | add it; check the preflight's 400 body |
-| Run streams, cancel button shows `null` run id | `x-run-id` not exposed | add to `expose_headers` or send it in the first event |
-| Busy hours: "CORS error" instead of "slow down" | rate limiter outside CORS returns a bare 429 | add CORS last so it is outermost |
-
-### Verify the policy with TestClient (runnable)
-Simulate preflights and a simple request, and see the wildcard-plus-credentials reflection.
-
-```python
+# pip install fastapi httpx   (TestClient needs httpx)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["https://chat.acme.com"],
-                   allow_methods=["POST"], allow_headers=["authorization", "content-type"])
+app.add_middleware(                            # add last => outermost, wraps auth and rate limiting
+    CORSMiddleware,
+    allow_origins=["https://chat.acme.com"],   # exact list; never "*" together with credentials
+    allow_credentials=False,                   # bearer tokens, not cookies
+    allow_methods=["GET", "POST"],
+    allow_headers=["authorization", "content-type", "idempotency-key"],
+    expose_headers=["x-request-id", "retry-after"],
+    max_age=600,                               # cache preflight results for 10 minutes
+)
 
 @app.post("/v1/chat")
 async def chat():
@@ -419,13 +345,19 @@ c = TestClient(app)
 def preflight(origin, headers="authorization, content-type"):
     r = c.options("/v1/chat", headers={"Origin": origin,
         "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": headers})
-    return r.status_code, r.headers.get("access-control-allow-origin"), r.text
+    return r.status_code, r.text
 
-print(preflight("https://chat.acme.com"))                 # (200, 'https://chat.acme.com', 'OK')
-print(preflight("https://evil.example"))                  # (400, None, 'Disallowed CORS origin')
-print(preflight("https://chat.acme.com", "x-api-key"))    # 400 'Disallowed CORS headers'
-r = c.post("/v1/chat", headers={"Origin": "https://evil.example"})
-print(r.status_code, r.headers.get("access-control-allow-origin"))  # 200 None: it ran anyway
+print(preflight("https://chat.acme.com"))                 # (200, 'OK')
+print(preflight("https://evil.example"))                  # (400, 'Disallowed CORS origin')
+print(preflight("https://chat.acme.com", "x-api-key"))    # (400, 'Disallowed CORS headers')
+print(c.post("/v1/chat", headers={"Origin": "https://evil.example"}).status_code)  # 200: it ran anyway
+```
+
+### Pitfall: wildcard plus credentials reflects any origin (runnable)
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.testclient import TestClient
 
 app2 = FastAPI()
 app2.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True)
@@ -434,6 +366,28 @@ r = TestClient(app2).get("/me", headers={"Origin": "https://evil.example", "Cook
 print(r.headers.get("access-control-allow-origin"),          # https://evil.example (reflected)
       r.headers.get("access-control-allow-credentials"))     # true
 ```
+
+### Worked scenario: what the browser does
+For `fetch("https://api.acme.com/v1/chat", {method: "POST", headers: {Authorization: "Bearer ...",
+"Content-Type": "application/json"}})` the browser first sends `OPTIONS` from the page's origin.
+
+| Caller | Exchange | Outcome |
+|---|---|---|
+| page on `https://chat.acme.com` | `OPTIONS` → 200 with allowed methods and headers, then the POST | works |
+| page on `https://evil.example` | 400 preflight with no `Allow-Origin` | its script never sends the POST |
+| `evil.example` sending a form-encoded POST with no custom headers | simple request, no preflight | *reaches your server and runs*; the browser only hides the response |
+| `curl` from anywhere | no CORS at all | reaches `/v1/chat` |
+
+- **State-changing routes must reject requests** that lack a credential the attacker's page cannot
+  obtain, such as the bearer token here; curl ignores CORS entirely.
+
+An agent run UI that streams events and shows a cancel button fails in these typical ways:
+
+| Symptom in the UI | Real cause | Fix |
+|---|---|---|
+| "CORS error", run never starts | `idempotency-key` missing from `allow_headers` | add it; check the preflight's 400 body |
+| Run streams, cancel button shows `null` run id | `x-run-id` not exposed | add to `expose_headers` or send it in the first event |
+| Busy hours: "CORS error" instead of "slow down" | rate limiter outside CORS returns a bare 429 | add CORS last so it is outermost |
 
 ## Production patterns
 - **Origins from per-environment config** — for every deployed API. Load the allowlist from settings

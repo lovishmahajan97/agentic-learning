@@ -255,11 +255,8 @@ hardware is one node of eight 80 GB GPUs. State per GPU before activations, from
 
 ### FSDP full fine-tune of a 7B model on eight GPUs
 A minimal full-parameter fine-tune with FSDP in `FULL_SHARD` mode (the ZeRO-3 equivalent), wrapping per
-decoder block and checkpointing activations per block. The model is loaded in bf16 to keep the example
-short; production runs usually keep fp32 master weights through the mixed-precision policy.
-
-In an agent project the placeholder batch would be rendered trajectories. Launch with
-`torchrun --nproc_per_node=8 train.py`.
+decoder block. The model is loaded in bf16 to keep the example short; production runs usually keep fp32
+master weights through the mixed-precision policy. Launch with `torchrun --nproc_per_node=8 train.py`.
 
 ```python
 import os, functools, torch, torch.distributed as dist
@@ -270,76 +267,51 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 
 dist.init_process_group("nccl")
 rank = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(rank)
-name = "Qwen/Qwen2.5-7B"
-tok = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16)
-model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-
-model = FSDP(
-    model,
-    auto_wrap_policy=functools.partial(transformer_auto_wrap_policy,
-                                      transformer_layer_cls={Qwen2DecoderLayer}),
-    sharding_strategy=ShardingStrategy.FULL_SHARD,      # params, grads, optimizer state all sharded
-    mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16),
-    device_id=rank, use_orig_params=True,
-)
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B")
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B", dtype=torch.bfloat16)
+model = FSDP(model, device_id=rank, use_orig_params=True,
+             auto_wrap_policy=functools.partial(transformer_auto_wrap_policy,
+                                                transformer_layer_cls={Qwen2DecoderLayer}),
+             sharding_strategy=ShardingStrategy.FULL_SHARD,  # params, grads, optimizer state sharded
+             mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16))
 opt = torch.optim.AdamW(model.parameters(), lr=1e-5)
 
-batch = tok(["Replace me with a sharded DataLoader."] * 4, return_tensors="pt", padding=True).to(rank)
-labels = batch["input_ids"].clone(); labels[batch["attention_mask"] == 0] = -100
+batch = tok(["Replace me with rendered agent trajectories."] * 4, return_tensors="pt").to(rank)
 for step in range(10):
-    loss = model(**batch, labels=labels).loss
+    loss = model(**batch, labels=batch["input_ids"]).loss
     loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
-    if rank == 0: print(step, round(loss.item(), 4))
+    if rank == 0: print(step, round(loss.item(), 4))   # loss falls step by step
 dist.destroy_process_group()
-# Per-GPU budget, roughly: Qwen2.5-7B is ~7.6B params. With everything in bf16 (weights, grads,
-# two AdamW moments = 8 bytes/param) that is ~61 GB of state / 8 ranks ≈ 7.6 GB per GPU; with fp32
-# master weights and moments it is the 16-byte budget, ~15 GB per GPU. On top sit one gathered block
-# (~233M params ≈ 0.47 GB in bf16, two with prefetch), checkpointed block inputs and one live block's
-# activations. Note every rank first loads the full 15 GB on CPU: 8 × 15 GB of host RAM.
 ```
 
-### Planning calculator: memory, bubble and calendar time
+- **Per-GPU budget, roughly.** Qwen2.5-7B is ~7.6B params. As written (all bf16, 8 bytes/param) that is
+  ~7.6 GB of state per GPU across 8 ranks; with fp32 master weights and moments it is the 16-byte budget,
+  ~15 GB per GPU. On top sit one gathered block (~0.47 GB in bf16) and activations.
+
+### Planning calculator: memory and bubble
 Pure Python, no GPU. It reproduces the lesson's numbers so you can plug in your own model and cluster
 before agreeing to a fine-tune plan.
 
 ```python
-GB = 1e9
-
-def state_gb(params, n, scheme):
+def state_gb(p, n, scheme):
     """Per-GPU training state in GB, Adam in mixed precision (16 bytes/param), before activations."""
-    p = params
-    per = {
-        "DDP":    16 * p,
-        "ZeRO-1": 2 * p + 2 * p + 12 * p / n,   # optimizer state sharded
-        "ZeRO-2": 2 * p + 14 * p / n,           # gradients sharded too
-        "ZeRO-3": 16 * p / n,                   # parameters sharded too
-    }[scheme]
-    return per / GB
+    return {"DDP":    16 * p,
+            "ZeRO-1": 4 * p + 12 * p / n,     # optimizer state sharded
+            "ZeRO-2": 2 * p + 14 * p / n,     # gradients sharded too
+            "ZeRO-3": 16 * p / n}[scheme] / 1e9   # parameters sharded too
 
 def bubble(p_stages, m_micro):
     return (p_stages - 1) / (m_micro + p_stages - 1)
 
-def train_years(params, tokens, flops_per_gpu, gpus=1):
-    return 6 * params * tokens / (flops_per_gpu * gpus) / (3600 * 24 * 365)
-
 for s in ("DDP", "ZeRO-1", "ZeRO-2", "ZeRO-3"):
     print(f"7B on 8 GPUs, {s:6s}: {state_gb(7e9, 8, s):6.1f} GB")
-print(f"70B ZeRO-3: 8 GPUs {state_gb(70e9, 8, 'ZeRO-3'):.0f} GB, 16 GPUs {state_gb(70e9, 16, 'ZeRO-3'):.0f} GB")
 print(f"bubble p=4: m=16 {bubble(4, 16):.0%}, m=4 {bubble(4, 4):.0%}")
-print(f"7B x 1T tokens at 400 TFLOP/s: {train_years(7e9, 1e12, 400e12):.1f} years on 1 GPU, "
-      f"{train_years(7e9, 1e12, 400e12, gpus=1024) * 365:.1f} days on 1,024")
 # 7B on 8 GPUs, DDP   :  112.0 GB
 # 7B on 8 GPUs, ZeRO-1:   38.5 GB
 # 7B on 8 GPUs, ZeRO-2:   26.2 GB
 # 7B on 8 GPUs, ZeRO-3:   14.0 GB
-# 70B ZeRO-3: 8 GPUs 140 GB, 16 GPUs 70 GB
 # bubble p=4: m=16 16%, m=4 43%
-# 7B x 1T tokens at 400 TFLOP/s: 3.3 years on 1 GPU, 1.2 days on 1,024
 ```
-
-The 1,024-GPU figure assumes perfect scaling; real runs lose some of it to communication, which is why
-scaling efficiency is measured, not assumed.
 
 ### Worked scenario: a multi-node run that scaled badly
 A team moved a ZeRO-3 fine-tune of their agent model from one node of eight GPUs to four nodes
@@ -374,6 +346,12 @@ A team moved a ZeRO-3 fine-tune of their agent model from one node of eight GPUs
 - **Keep tensor parallelism inside the node.** In Megatron-LM, set `--tensor-model-parallel-size` no
   larger than GPUs per node and use `--pipeline-model-parallel-size` to span nodes. Monitor MFU; a drop to
   single digits signals TP traffic on a slow link. The same rule holds when serving a large agent model.
+- **Checkpoint activations per FSDP block and mask padding.** Call
+  `model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})` before
+  wrapping, and set padded label positions to -100 so they do not count in the loss.
+- **Pretraining time is measured, not assumed.** 6 × params × tokens gives the FLOPs: 7B on 1T tokens at
+  400 TFLOP/s is ~3.3 years on one GPU, ~1.2 days on 1,024 only with perfect scaling, which real runs lose
+  some of to communication.
 
 ## Trade-offs
 - **DDP: simplest vs full state on every GPU.** The simplest and most compute-efficient scheme, but every

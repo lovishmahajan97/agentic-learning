@@ -261,39 +261,27 @@ flowchart TD
 ### Isolating a failing agent tool by differential replay
 A `search_orders` tool fails in one agent run and works in another. The script replays both recorded
 argument sets, then swaps one field at a time from the good call to the bad one (tested with Python
-3.9.6).
+3.9.6 and 3.12.14).
 
 ```python
-import json
-
-ORDERS = {"C-1001": [{"id": f"o{i}", "total": 10 * i} for i in range(1, 9)]}
-
-def search_orders(customer_id, limit=5, status="any"):     # the agent tool under suspicion
-    rows = ORDERS.get(customer_id.strip().upper(), [])
-    return rows[:limit]
-
+ORDERS = {"C-1001": [{"id": f"o{i}"} for i in range(1, 9)]}
+def search_orders(customer_id, limit=5, status="any"):    # the agent tool under suspicion
+    return ORDERS.get(customer_id.strip().upper(), [])[:limit]
 def run(args):
     try:
         return "ok", search_orders(**args)
-    except Exception as e:                                  # record the failure, do not hide it
+    except Exception as e:                                 # record the failure, do not hide it
         return "fail", f"{type(e).__name__}: {e}"
-
-# 1. Reproduce: replay the exact arguments from the trace, not a paraphrase of them.
-good = json.loads('{"customer_id": "C-1001", "limit": 3, "status": "open"}')   # step 4 of a passing run
-bad = json.loads('{"customer_id": " c-1001", "limit": "3", "status": "open"}') # step 4 of the failing run
+# 1. Reproduce: replay the exact recorded arguments, not a paraphrase of them.
+good = {"customer_id": "C-1001", "limit": 3, "status": "open"}
+bad = {"customer_id": " c-1001", "limit": "3", "status": "open"}
 print("good:", run(good)[0], "| bad:", run(bad))
-
 # 2. Isolate: start from the good call and change ONE field at a time to the bad value.
 for field in good:
-    probe = dict(good, **{field: bad[field]})
-    print(f"swap {field!r:14} ->", run(probe)[0])
-
-# 3. Hypothesis: the model sends limit as a string; slicing a list with a str raises TypeError.
-# 4. Verify: the fix must make the bad call pass AND keep the good call identical.
+    print(f"swap {field!r:14} ->", run(dict(good, **{field: bad[field]}))[0])
+# 3. Hypothesis: limit arrives as a string. 4. Verify: coerce at the tool boundary.
 def search_orders(customer_id, limit=5, status="any"):
-    rows = ORDERS.get(customer_id.strip().upper(), [])
-    return rows[: int(limit)]                               # coerce at the tool boundary
-
+    return ORDERS.get(customer_id.strip().upper(), [])[: int(limit)]
 assert run(bad) == run(good) == ("ok", ORDERS["C-1001"][:3])
 print("verified: bad call now matches good call")
 # Output:

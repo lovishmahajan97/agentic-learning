@@ -323,81 +323,63 @@ flowchart TD
 ## Examples
 ### A fake LLM, tested sync and async
 A fake LLM via dependency override, tested once synchronously with `TestClient` and once asynchronously
-with `ASGITransport`. Requires `pytest-asyncio`.
+with `ASGITransport`. Requires `pytest-asyncio`; save as `test_app.py` and run `pytest -q`.
 
 ```python
 import httpx, pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-class LLM:
-    async def complete(self, prompt: str) -> str: raise NotImplementedError
-
-def get_llm() -> LLM: return LLM()
-
 app = FastAPI()
+def get_llm(): raise NotImplementedError         # the real provider client in production
 
 @app.post("/summarise")
-async def summarise(body: dict, llm: LLM = Depends(get_llm)):
-    if not body.get("text"):
-        return {"summary": ""}
-    return {"summary": await llm.complete(f"Summarise: {body['text']}")}
+async def summarise(body: dict, llm=Depends(get_llm)):
+    if not body.get("text"): return {"summary": ""}   # empty input never reaches the model
+    return {"summary": await llm.complete(body["text"])}
 
-class FakeLLM(LLM):
-    def __init__(self): self.prompts: list[str] = []
-    async def complete(self, prompt: str) -> str:
-        self.prompts.append(prompt); return "short version"
-
+class FakeLLM(list):                             # the fake is the list of prompts it received
+    async def complete(self, prompt): self.append(prompt); return "short version"
 @pytest.fixture
 def fake():
     f = FakeLLM(); app.dependency_overrides[get_llm] = lambda: f
     yield f
-    app.dependency_overrides.clear()          # never leak overrides between tests
+    app.dependency_overrides.clear()             # never leak overrides between tests
 
 def test_sync(fake):
-    with TestClient(app) as client:          # context manager runs lifespan
+    with TestClient(app) as client:              # context manager runs lifespan
         r = client.post("/summarise", json={"text": "long doc"})
-    assert r.json() == {"summary": "short version"} and len(fake.prompts) == 1
+    assert r.json() == {"summary": "short version"} and fake == ["long doc"]
 
 @pytest.mark.asyncio
 async def test_async_skips_model_on_empty(fake):
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
         r = await c.post("/summarise", json={"text": ""})
-    assert r.json() == {"summary": ""} and fake.prompts == []
+    assert r.json() == {"summary": ""} and fake == []
 ```
 
 - **Cost:** both tests exercise routing, dependency injection and serialisation, run in milliseconds and
   cost nothing.
-- **The sync test proves** the request reached the fake exactly once through the override.
 - **The async test proves a negative:** the empty-input branch never touched the model, which no amount
   of mocking the HTTP layer would show as clearly.
 - **Real-model behaviour** belongs in a separate, smaller suite.
 
 ### Testing an agent's tool loop with a scripted fake
 The fake returns a tool call on the first turn and a final answer on the second. The test asserts the
-tool ran once, its result reached the model, and the loop stopped. The message shapes are this app's own,
-not a provider's.
+tool's result reached the model and the loop stopped. Add it to the same file; the message shapes are
+this app's own, not a provider's.
 
 ```python
-from fastapi import Depends, FastAPI
-from fastapi.testclient import TestClient
+def get_tools(): raise NotImplementedError       # real tools injected in production
 
-agent_app = FastAPI()
-
-def get_agent_llm(): raise NotImplementedError        # real client injected in production
-def get_tools(): raise NotImplementedError
-
-@agent_app.post("/agent")
-async def run_agent(body: dict, llm=Depends(get_agent_llm), tools=Depends(get_tools)):
+@app.post("/agent")
+async def run_agent(body: dict, llm=Depends(get_llm), tools=Depends(get_tools)):
     messages = [{"role": "user", "content": body["q"]}]
-    for _ in range(5):                                # hard step cap
+    for _ in range(5):                           # hard step cap
         out = await llm.step(messages)
         if out["type"] == "final":
-            return {"answer": out["text"], "steps": len(messages)}
-        result = await tools[out["name"]](**out["args"])
-        messages += [{"role": "assistant", "tool": out["name"]},
-                     {"role": "tool", "content": result}]
+            return {"answer": out["text"]}
+        messages.append({"role": "tool", "content": await tools[out["name"]](**out["args"])})
     return {"answer": None, "error": "step_limit"}
 
 class ScriptedLLM:
@@ -406,62 +388,21 @@ class ScriptedLLM:
         self.seen.append(list(messages)); return self.script.pop(0)
 
 def test_tool_result_reaches_model_and_loop_stops():
-    calls = []
-    async def weather(city): calls.append(city); return "18C"
+    async def weather(city): return "18C"
     llm = ScriptedLLM([{"type": "tool", "name": "weather", "args": {"city": "Oslo"}},
                        {"type": "final", "text": "It is 18C in Oslo."}])
-    agent_app.dependency_overrides[get_agent_llm] = lambda: llm
-    agent_app.dependency_overrides[get_tools] = lambda: {"weather": weather}
+    app.dependency_overrides.update({get_llm: lambda: llm, get_tools: lambda: {"weather": weather}})
     try:
-        with TestClient(agent_app) as client:
+        with TestClient(app) as client:
             r = client.post("/agent", json={"q": "Weather in Oslo?"})
-        assert r.json()["answer"] == "It is 18C in Oslo." and calls == ["Oslo"]
-        assert llm.seen[1][-1] == {"role": "tool", "content": "18C"}   # appended before turn 2
     finally:
-        agent_app.dependency_overrides.clear()
+        app.dependency_overrides.clear()
+    assert r.json() == {"answer": "It is 18C in Oslo."}
+    assert llm.seen[1][-1] == {"role": "tool", "content": "18C"}   # appended before turn 2
 ```
 
 - **Add a second script** that only ever returns tool calls and assert `error == "step_limit"`, which
   proves the runaway-loop guard works without spending a token.
-
-### Failure paths: mapped errors and unhandled bugs
-The same fake pattern extends to failures. A `FailingLLM` raises your provider-error type, and the test
-asserts the endpoint maps it to, say, 502 with your error body. Builds on the first app above.
-
-```python
-from fastapi import Request
-from fastapi.responses import JSONResponse
-
-class ProviderError(Exception): ...
-
-@app.exception_handler(ProviderError)
-async def provider_error(request: Request, exc: ProviderError):
-    return JSONResponse({"error": "upstream_failed"}, status_code=502)
-
-class FailingLLM(LLM):
-    async def complete(self, prompt: str) -> str: raise ProviderError("rate limited")
-
-class BuggyLLM(LLM):
-    async def complete(self, prompt: str) -> str: raise KeyError("bug")
-
-def test_provider_error_maps_to_502():
-    app.dependency_overrides[get_llm] = lambda: FailingLLM()
-    try:
-        with TestClient(app) as client:                      # handled: a normal response
-            r = client.post("/summarise", json={"text": "x"})
-        assert r.status_code == 502 and r.json() == {"error": "upstream_failed"}
-    finally:
-        app.dependency_overrides.clear()
-
-def test_unhandled_bug_is_500_for_clients():
-    app.dependency_overrides[get_llm] = lambda: BuggyLLM()
-    try:
-        with TestClient(app, raise_server_exceptions=False) as client:   # see the status
-            r = client.post("/summarise", json={"text": "x"})
-        assert r.status_code == 500
-    finally:
-        app.dependency_overrides.clear()
-```
 
 ### Which client for which test
 | Test needs | Use | Lifespan |
@@ -493,6 +434,9 @@ def test_unhandled_bug_is_500_for_clients():
 - **A separate, small real-model suite.** Keep fakes for the fast suite and mark real-provider tests with
   a custom marker (for example `@pytest.mark.live`) run on a schedule, not per commit; agent quality
   belongs in evals, not here. Monitor its cost per run and its flake rate.
+- **Test failure paths with failing fakes.** Override the LLM dependency with a fake that raises your
+  provider-error type and assert the registered handler's status (for example 502 with your error body);
+  for unhandled bugs, build `TestClient(app, raise_server_exceptions=False)` to assert the 500 clients see.
 
 ## Trade-offs
 - **`TestClient` simplicity vs loop isolation.** It keeps tests synchronous and simple, but runs the app on

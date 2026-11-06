@@ -353,63 +353,44 @@ sequenceDiagram
 
 ## Examples
 ### FastAPI contract with an ARQ worker
-The job row is committed before enqueueing, the status endpoint hides other users' jobs, and the worker
-checks status first: a redelivered job is a no-op, a retry skips documents already summarised, and only
-transient provider errors are retried.
-- **Placeholders:** `db` is your async data-access layer, `TransientLLMError` is however your client
-  signals a 429, 5xx or timeout, and `ctx["llm"]` is a shared client your `on_startup` hook (not shown)
-  puts into `ctx`.
+The job row is committed before enqueueing; the worker checks status first, so a redelivered job is a
+no-op, a retry skips documents already summarised, and only transient provider errors are retried.
+
+`db` is your async data layer, `TransientLLMError` is how your client signals a 429, 5xx or timeout, and
+`ctx["llm"]` is a client your `on_startup` hook puts into `ctx`.
 
 ```python
 import uuid
-from fastapi import FastAPI, HTTPException, Request, Response
-from pydantic import BaseModel
+from fastapi import FastAPI, Request
 
-app = FastAPI()                       # lifespan creates app.state.arq = await create_pool(RedisSettings())
-
-class Req(BaseModel):
-    user_id: str
-    corpus_id: str
+app = FastAPI()                # lifespan sets app.state.arq = await create_pool(RedisSettings())
 
 @app.post("/jobs/summaries", status_code=202)
-async def create(body: Req, request: Request, response: Response):
+async def create(corpus_id: str, request: Request):
     job_id = str(uuid.uuid4())
-    await db.create_job(job_id, owner=body.user_id, status="queued")        # commit BEFORE enqueue
-    await request.app.state.arq.enqueue_job("summarize_corpus", job_id, body.corpus_id, _job_id=job_id)
-    response.headers["Location"] = f"/jobs/{job_id}"
+    await db.create_job(job_id, status="queued")                     # commit BEFORE enqueue
+    await request.app.state.arq.enqueue_job("summarize_corpus", job_id, corpus_id, _job_id=job_id)
     return {"job_id": job_id, "status_url": f"/jobs/{job_id}"}
+```
 
-@app.get("/jobs/{job_id}")
-async def status(job_id: str, user_id: str, response: Response):      # user_id: from your auth dependency in real code
-    job = await db.get_job(job_id)
-    if job is None or job.owner != user_id:
-        raise HTTPException(404)                                            # 404, not 403: don't leak ids
-    if job.status in ("queued", "running"):
-        response.headers["Retry-After"] = "5"
-    return {"status": job.status, "progress": job.progress, "result_url": job.result_url, "error": job.error}
-
+```python
 # worker.py  — run with:  arq worker.WorkerSettings
 from arq import Retry
 from arq.connections import RedisSettings
 
 async def summarize_corpus(ctx, job_id: str, corpus_id: str):
-    if await db.job_status(job_id) == "succeeded":                          # at-least-once: redelivery is a no-op
+    if await db.job_status(job_id) == "succeeded":       # at-least-once: redelivery is a no-op
         return
     await db.set_status(job_id, "running")
     try:
-        docs = await db.docs(corpus_id)
-        for i, doc in enumerate(docs, 1):
-            if await db.has_summary(doc.id):                                 # resume: don't pay twice
-                continue
-            await db.upsert_summary(doc.id, await ctx["llm"].summarize(doc))   # idempotent write per doc
-            await db.set_progress(job_id, i, len(docs))
-        await db.set_status(job_id, "succeeded", result_url=f"/corpora/{corpus_id}/summaries")
-    except TransientLLMError as exc:                                         # 429/5xx/timeout from the provider
-        if ctx["job_try"] < 3:                                               # keep in step with max_tries
-            raise Retry(defer=ctx["job_try"] * 30)                           # back off longer on each try
-        await db.set_status(job_id, "failed", error=type(exc).__name__); raise   # out of tries: row must not stay "running"
-    except Exception as exc:
-        await db.set_status(job_id, "failed", error=type(exc).__name__); raise   # ARQ records failure; only arq.Retry re-runs
+        for doc in await db.docs(corpus_id):
+            if not await db.has_summary(doc.id):          # resume: don't pay twice
+                await db.upsert_summary(doc.id, await ctx["llm"].summarize(doc))
+    except Exception as exc:                              # only arq.Retry re-runs a job
+        if isinstance(exc, TransientLLMError) and ctx["job_try"] < 3:   # 429/5xx/timeout; max_tries
+            raise Retry(defer=ctx["job_try"] * 30)        # back off longer on each try
+        await db.set_status(job_id, "failed"); raise      # row must not stay "running"
+    await db.set_status(job_id, "succeeded")
 
 class WorkerSettings:
     functions = [summarize_corpus]
@@ -418,8 +399,7 @@ class WorkerSettings:
 ```
 
 ### The same job on Celery, configured for at-least-once
-Celery's defaults favour throughput over durability; these settings flip that. All are standard Celery
-configuration keys and task options.
+Celery's defaults favour throughput over durability; these standard settings flip that.
 
 ```python
 import asyncio
@@ -436,42 +416,7 @@ app.conf.update(
 @app.task(bind=True, autoretry_for=(TransientLLMError,), retry_backoff=True, max_retries=5,
           soft_time_limit=1500, time_limit=1800)
 def summarize_corpus(self, job_id: str, corpus_id: str):
-    # Celery task bodies are sync: drive the async implementation explicitly.
-    asyncio.run(summarize_corpus_async(job_id, corpus_id))   # same idempotent body as the ARQ version
-```
-
-### A long agent run as a checkpointed ARQ job
-Each step is persisted before the next starts, so a redelivered job resumes at the last finished step
-and a side-effecting tool sees the same idempotency key on a retry. `ctx["agent"]` and `db` are
-placeholders for your agent step function and data layer.
-- **The key only covers an identical retry.** A crash between `call_tool` and `append_step` re-runs step
-  n, and the model may then propose a different call under the same key. When that matters, persist the
-  tool decision first and execute it from the stored record on resume.
-
-```python
-MAX_STEPS = 15
-
-async def run_agent_job(ctx, job_id: str):
-    job = await db.get_job(job_id)
-    if job.status in ("succeeded", "failed", "cancelled"):              # terminal states are immutable
-        return
-    await db.set_status(job_id, "running")
-    steps = await db.load_steps(job_id)                                  # resume: transcript so far
-    while len(steps) < MAX_STEPS:
-        if await db.job_status(job_id) == "cancelled":                   # cancel checked at step boundary
-            return
-        n = len(steps) + 1
-        step = await ctx["agent"].next_step(job.input, steps)            # one model call
-        if step.tool_call:
-            step.tool_result = await ctx["agent"].call_tool(
-                step.tool_call, idempotency_key=f"{job_id}:{n}")         # same key on redelivery
-        await db.append_step(job_id, n, step)                            # upsert on (job_id, n)
-        await db.set_progress(job_id, n, MAX_STEPS)
-        steps.append(step)
-        if step.final_answer:
-            await db.set_status(job_id, "succeeded", result=step.final_answer)
-            return
-    await db.set_status(job_id, "failed", error="step budget exhausted")
+    asyncio.run(summarize_corpus_async(job_id, corpus_id))   # sync task body drives the async one
 ```
 
 ### Worked scenario: sizing workers against a provider rate limit
@@ -486,11 +431,8 @@ minute, ~4 s per call.
 | Fastest possible corpus time | 1,000 / 10 calls/s | ~100 s |
 | Double to 8 workers | 8 × 10 = 80 in flight, still 10 calls/s allowed | only more 429s and retries |
 
-More workers past the rate limit add retries, not throughput; CPU never enters the sum.
-
-- **The same arithmetic holds for agent jobs.** An agent job makes one model call per step, so 40 agent
-  jobs in flight each waiting ~4 s per step saturate the same 600-per-minute limit; size `max_jobs` by
-  calls in flight, not by job count.
+More workers past the rate limit add retries, not throughput; CPU never enters the sum. An agent job
+makes one model call per step, so size `max_jobs` by calls in flight, not by job count.
 
 ## Production patterns
 - **Checkpoint agent steps, not just jobs.** Agent teams persist every step (model output, tool call,
@@ -512,6 +454,14 @@ More workers past the rate limit add retries, not throughput; CPU never enters t
 - **Status route as a cheap read.** Serve `GET /jobs/{id}` from the job row with `Retry-After`, owner
   checks and 404 for others' jobs; add SSE or webhooks once polling dominates. Monitor polls per job and
   status-route share of total QPS.
+- **Resumable agent runs as jobs.** Load the persisted steps on start, check for cancellation at each
+  step boundary, upsert each step on `(job_id, n)`, key tool calls `f"{job_id}:{n}"`, cap the run (for
+  example 15 steps) and mark it `failed` when the budget runs out; terminal states are immutable.
+- **Persist the tool decision before running it.** A step's idempotency key only covers an identical
+  retry: a crash between the tool call and saving the step lets the model propose a different call.
+- **Write progress and failure on the job row.** Update progress per item for the status route, set
+  `failed` with the error type on any non-retried exception, and return `Retry-After: 5` while queued or
+  running.
 
 ## Trade-offs
 - **Durability and scaling vs operational weight.** Workers scale horizontally and jobs survive restarts,

@@ -328,125 +328,58 @@ flowchart TD
 
 ## Examples
 ### Agent scenario: a validated next-action step
-A planner that must either call a registered tool with the right arguments or finish. The registry is
-passed as validation context, so an invented tool name triggers a reask instead of a crash.
+A planner that must either call a registered tool or finish. The registry is passed as validation
+context, so an invented tool name triggers a reask instead of a crash.
 
 ```python
+# pip install "instructor==1.17.0" openai
 from typing import Literal
 import instructor
 from openai import OpenAI
-from pydantic import BaseModel, Field, ValidationInfo, model_validator
+from pydantic import BaseModel, ValidationInfo, model_validator
 
 class NextAction(BaseModel):
-    reasoning: str = Field(description="One or two sentences: why this action now")   # first: reason, then act
+    reasoning: str                       # first: field order is generation order
     action: Literal["call_tool", "finish"]
-    tool: str | None = Field(None, description="Tool name when action is call_tool")
-    args: dict = Field(default_factory=dict)
-    answer: str | None = Field(None, description="Final answer when action is finish")
+    tool: str | None = None
+    answer: str | None = None
 
     @model_validator(mode="after")
     def check_against_registry(self, info: ValidationInfo):
         tools = (info.context or {}).get("tools", {})
         if self.action == "call_tool" and self.tool not in tools:
             raise ValueError(f"unknown tool {self.tool!r}; choose one of {sorted(tools)}")
-        if self.action == "finish" and not self.answer:
-            raise ValueError("action is finish but answer is empty; write the answer")
-        return self
-
-TOOLS = {"search_docs": lambda query: f"3 hits for {query}",
-         "get_ticket": lambda ticket_id: {"id": ticket_id, "status": "open"}}
-client = instructor.from_openai(OpenAI())
-messages = [{"role": "user", "content": "Is ticket 42 still open? Answer in one line."}]
-
-for step in range(8):                                    # hard step budget for the run
-    act = client.chat.completions.create(
-        model="gpt-4o-mini", response_model=NextAction, max_retries=2,
-        context={"tools": TOOLS}, messages=messages)
-    if act.action == "finish":
-        print(act.answer); break
-    result = TOOLS[act.tool](**act.args)                 # wrap in try/except in real code
-    messages += [{"role": "assistant", "content": act.model_dump_json()},
-                 {"role": "user", "content": f"Tool {act.tool} returned: {result}"}]
-```
-
-- **`reasoning` comes first** because field order is generation order; the decision is made after the
-  model has written why.
-- **Two checks in one validator:** the tool exists, and a finish carries an answer. Both are rules a JSON
-  schema cannot express on its own.
-- **Bad tool arguments still raise at call time.** Validate them too (for example a Pydantic model per
-  tool) or return the exception text to the model as the tool result.
-
-### Meeting extraction with a cross-field rule
-Extracting a meeting from an email, with a business rule the schema alone cannot express. An assistant
-agent would run this on an email a tool just fetched.
-
-```python
-from datetime import date
-from typing import Literal
-import instructor
-from openai import OpenAI
-from pydantic import BaseModel, Field, model_validator
-
-class Meeting(BaseModel):
-    title: str = Field(description="Short title, max 8 words")
-    start: date
-    end: date
-    kind: Literal["internal", "customer", "interview"]
-    attendees: list[str] = Field(description="Email addresses only")
-
-    @model_validator(mode="after")
-    def end_not_before_start(self):
-        if self.end < self.start:
-            raise ValueError(f"end {self.end} is before start {self.start}; re-read the dates")
         return self
 
 client = instructor.from_openai(OpenAI())
-
-meeting, raw = client.chat.completions.create_with_completion(
-    model="gpt-4o-mini",                 # any tool-calling model
-    response_model=Meeting,
-    max_retries=3,                       # at most 3 calls: the first try plus up to 2 reasks
-    messages=[{"role": "user", "content":
-        "Offsite with Acme from 3 to 5 March 2025. Invite ana@acme.com and raj@us.io."}],
-)
-print(meeting.model_dump())
-print(raw.usage.total_tokens)            # recent versions sum usage across all attempts here
+act = client.chat.completions.create(
+    model="gpt-4o-mini", response_model=NextAction, max_retries=2,
+    context={"tools": {"get_ticket": ..., "search_docs": ...}},
+    messages=[{"role": "user", "content": "Is ticket 42 still open?"}])
+print(act.action, act.tool)              # call_tool get_ticket
 ```
 
-- **If the first reply sets `end` before `start`,** the validator's message goes back and the second
-  call usually fixes it.
-- **If all three attempts fail,** the exception tells you which validation kept failing.
-- **Usage accounting:** recent versions accumulate token usage from every attempt into the returned
-  completion's `usage` for the major providers; confirm that for your version and provider before you
-  build cost reporting on it.
+- **The validator message is the correction signal.** It names the legal tools, so the reask converges.
+- **A rule a JSON schema cannot express:** the tool must exist in *this* run's registry.
 
 ### Grounded quotes via validation context
-The validator rejects any quote not found verbatim in the source, which forces a reask. In a RAG agent the
-source is the retrieved chunks, so the final answer cannot cite text that was never retrieved.
+The validator rejects any quote not found verbatim in the source, which forces a reask.
 
 ```python
 from pydantic import BaseModel, ValidationInfo, field_validator
 
 class Evidence(BaseModel):
-    claim: str
     quote: str
 
     @field_validator("quote")
     @classmethod
     def quote_in_source(cls, v: str, info: ValidationInfo) -> str:
-        source = (info.context or {}).get("source", "")
-        if v not in source:
+        if v not in (info.context or {}).get("source", ""):
             raise ValueError("quote is not verbatim in the source; copy it exactly")
         return v
 
-contract = open("contract.txt").read()
-ev = client.chat.completions.create(       # client from the example above
-    model="gpt-4o-mini",
-    response_model=Evidence,
-    max_retries=2,
-    context={"source": contract},           # validation_context= on older versions
-    messages=[{"role": "user", "content": f"What is the termination notice period?\n\n{contract}"}],
-)
+print(Evidence.model_validate({"quote": "30 days"}, context={"source": "notice: 30 days"}))
+# quote='30 days'   (a made-up quote raises ValidationError, which Instructor turns into a reask)
 ```
 
 ### Worked scenario: what retries cost on a long contract
@@ -486,6 +419,10 @@ Illustrative token counts for one 20k-token contract that fails validation on ev
 - **Gate schema changes on an eval set.** Field names, docstrings and descriptions are prompt text; rerun a
   labelled set before merging a model change. Track first-pass validation rate, since a fall signals
   prompt or model drift.
+- **Validate tool arguments too.** A valid tool name with bad arguments still raises when the tool runs;
+  use a Pydantic model per tool or return the exception text to the model as the tool result.
+- **Confirm usage accounting per version.** Recent versions sum token usage from every attempt into the
+  `usage` returned by `create_with_completion` for the major providers; verify yours before cost reports.
 
 ## Trade-offs
 - **Less glue vs another dependency.** One `response_model` argument replaces schema, parsing and retry

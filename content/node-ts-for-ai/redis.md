@@ -358,50 +358,40 @@ flowchart TD
 
 ## Examples
 ### Completion cache and fixed-window rate limiter
-A completion cache and a fixed-window rate limiter using ioredis. The limiter is a Lua script so the
-increment and the expiry are set atomically; the cache key hashes the fields that affect the output in a
-fixed order.
-
-Every Redis failure on the hot path degrades rather than failing the request: the limiter fails open,
-the cache falls through to the provider. Fixed windows allow up to twice the limit across a window
-boundary; use a sliding window or token bucket when that matters.
+The limiter is a Lua script so the increment and the expiry happen atomically; the cache key hashes the
+fields that affect the output in a fixed order. A Redis failure degrades instead of failing the request:
+the limiter fails open, the cache falls through to the provider.
 
 ```ts
 import Redis from "ioredis";
 import { createHash } from "node:crypto";
 
 const redis = new Redis(process.env.REDIS_URL!, { maxRetriesPerRequest: 1, enableOfflineQueue: false });
-redis.on("error", (e) => console.error("redis", e.message));   // an unhandled 'error' event would crash the process
+redis.on("error", (e) => console.error("redis", e.message));   // an unhandled 'error' event crashes the process
 
-// Atomic fixed-window limiter: the first hit in a window sets the TTL.
-redis.defineCommand("hitWindow", {
-  numberOfKeys: 1,
-  lua: `local n = redis.call('INCR', KEYS[1])
-        if n == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
-        return n`,
-});
+// Atomic fixed window: the first hit in a window sets the TTL.
+const HIT = `local n = redis.call('INCR', KEYS[1]) if n == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end return n`;
 export async function allow(tenant: string, limit = 60, windowMs = 60_000): Promise<boolean> {
-  const bucket = Math.floor(Date.now() / windowMs);
-  try {
-    const n: number = await (redis as any).hitWindow(`rl:${tenant}:${bucket}`, windowMs);
-    return n <= limit;
-  } catch { return true; }                                          // Redis down: fail open (a policy choice)
+  const key = `rl:${tenant}:${Math.floor(Date.now() / windowMs)}`;
+  try { return ((await redis.eval(HIT, 1, key, windowMs)) as number) <= limit; }
+  catch { return true; }                                          // Redis down: fail open (a policy choice)
 }
 
-// Cache-aside for deterministic completions.
-export async function cachedComplete(req: { model: string; system: string; messages: unknown[]; temperature: number; maxTokens: number },
+export async function cachedComplete(req: { model: string; prompt: string; temperature: number },
                                      call: () => Promise<string>, ttlSec = 3600): Promise<string> {
   if (req.temperature !== 0) return call();                      // sampled output: do not cache
-  const material = JSON.stringify([req.model, req.system, req.messages, req.temperature, req.maxTokens]);  // fixed field order
-  const key = "llm:" + createHash("sha256").update(material).digest("hex");
-  try {
-    const hit = await redis.get(key);
-    if (hit !== null) return hit;
-  } catch { /* Redis down: fall through to the provider */ }
+  const key = "llm:" + createHash("sha256").update(JSON.stringify([req.model, req.prompt, req.temperature])).digest("hex");
+  const hit = await redis.get(key).catch(() => null);            // Redis down: fall through to the provider
+  if (hit !== null) return hit;
   const out = await call();
-  redis.set(key, out, "EX", ttlSec).catch(() => {});             // best effort, never awaited on the hot path
+  redis.set(key, out, "EX", ttlSec).catch(() => {});             // best effort, never awaited
   return out;
 }
+
+await new Promise((r) => redis.once("ready", r));                // offline queue is off: wait for the connection
+console.log(await allow("acme", 1), await allow("acme", 1));     // true false
+console.log(await cachedComplete({ model: "m", prompt: "hi", temperature: 0 }, async () => "hello")); // hello
+await redis.quit();
 ```
 
 ### A run lock with safe release and refresh
@@ -419,8 +409,7 @@ const REFRESH = `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call
 export async function withRunLock<T>(runId: string, work: () => Promise<T>, ttlMs = 30_000): Promise<T | "busy"> {
   const key = `run:${runId}:lock`;
   const token = randomUUID();
-  const ok = await redis.set(key, token, "PX", ttlMs, "NX");       // "OK" or null
-  if (ok !== "OK") return "busy";
+  if ((await redis.set(key, token, "PX", ttlMs, "NX")) !== "OK") return "busy";
   const timer = setInterval(() => { redis.eval(REFRESH, 1, key, token, ttlMs).catch(() => {}); }, ttlMs / 3);
   try {
     return await work();
@@ -430,45 +419,6 @@ export async function withRunLock<T>(runId: string, work: () => Promise<T>, ttlM
   }
 }
 ```
-
-### Agent scenario: short-term memory and a tool-result cache
-An agent keeps the last 20 turns per conversation in a capped list that expires after a day of
-inactivity, and caches read-only tool results for 5 minutes so repeated steps in a run, or parallel
-runs, do not re-hit the same API.
-
-```ts
-import Redis from "ioredis";
-import { createHash } from "node:crypto";
-const redis = new Redis(process.env.REDIS_URL!, { maxRetriesPerRequest: 1, enableOfflineQueue: false });
-redis.on("error", (e) => console.error("redis", e.message));
-
-export async function remember(tenant: string, convo: string, turn: object) {
-  const key = `t:{${tenant}}:mem:${convo}`;
-  try {
-    await redis.multi()
-      .lpush(key, JSON.stringify(turn)) // newest first
-      .ltrim(key, 0, 19)                // keep the last 20 turns
-      .expire(key, 86_400)              // forget after a day idle
-      .exec();
-  } catch { /* Redis down: best effort, the run continues without memory */ }
-}
-export async function recall(tenant: string, convo: string): Promise<object[]> {
-  try { return (await redis.lrange(`t:{${tenant}}:mem:${convo}`, 0, -1)).reverse().map((s) => JSON.parse(s)); }
-  catch { return []; }                  // Redis down: run without short-term memory
-}
-
-// Only for read-only, idempotent tools: never cache a tool that sends, pays or writes.
-export async function cachedTool(tenant: string, name: string, args: unknown, run: () => Promise<string>, ttlSec = 300) {
-  const key = `t:{${tenant}}:tool:${name}:` + createHash("sha256").update(JSON.stringify(args)).digest("hex");
-  try { const hit = await redis.get(key); if (hit !== null) return hit; } catch { /* fall through */ }
-  const out = await run();
-  redis.set(key, out, "EX", ttlSec).catch(() => {});
-  return out;
-}
-```
-
-- **Caveat on argument hashing.** `JSON.stringify` keeps insertion order, so normalise tool arguments
-  (sorted keys) before hashing, or the same call produces different keys.
 
 ### Worked scenario: sizing and a stampede
 Illustrative numbers for a completion cache, using the entry size from the trade-offs below.
@@ -501,6 +451,18 @@ Illustrative numbers for a completion cache, using the entry size from the trade
 - **Jittered TTLs plus single-flight on expensive entries.** Set the TTL to the base plus a random
   fraction (for example up to 10%) and guard fills with an `NX` key. Monitor provider calls per minute
   right after deploys and cache flushes.
+- **Fixed windows allow up to twice the limit across a window boundary.** Use a sliding window or token
+  bucket when that burst matters.
+- **Hash every field that changes the output.** The completion cache key covers model, system prompt,
+  messages, temperature and max tokens in a fixed order; normalise tool arguments (sorted keys) before
+  hashing, because `JSON.stringify` keeps insertion order.
+- **Short-term memory as a capped list (`remember`/`recall`).** `LPUSH` the turn, `LTRIM key 0 19` to keep the last 20 and
+  `EXPIRE key 86400` in one `MULTI`, under a tenant-tagged key such as `t:{tenant}:mem:<convo>`; on a Redis
+  error, run without memory rather than failing.
+- **With `enableOfflineQueue: false`, commands sent before `ready` fail at once.** Wait for the client's
+  `ready` event at boot, or the first requests fail open and miss the cache.
+- **Cache only read-only, idempotent tool results** (`cachedTool`, for example a 5-minute TTL), never a tool that sends,
+  pays or writes.
 
 ## Trade-offs
 - **Speed and expiry vs RAM.** Microsecond atomic operations and built-in expiry, but everything lives in

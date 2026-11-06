@@ -319,8 +319,6 @@ import schemathesis
 from app.main import create_app
 from app.deps import get_llm_client
 
-SNAPSHOT = pathlib.Path(__file__).parent / "openapi.snapshot.json"
-
 class FakeLLM:                                   # schema-valid, free, deterministic
     async def complete(self, messages, model):
         return {"content": "ok", "finish_reason": "stop",
@@ -330,11 +328,8 @@ app = create_app()
 app.dependency_overrides[get_llm_client] = lambda: FakeLLM()
 
 def test_schema_matches_snapshot():
-    current = app.openapi()
-    expected = json.loads(SNAPSHOT.read_text())
-    assert current == expected, (
-        "OpenAPI changed. Run `python scripts/export_openapi.py`, commit the snapshot, "
-        "and check the breaking-change report in CI.")
+    snapshot = pathlib.Path(__file__).parent / "openapi.snapshot.json"
+    assert app.openapi() == json.loads(snapshot.read_text()), "OpenAPI changed: re-export and review"
 
 # Schemathesis 4.x entry point; 3.x used schemathesis.from_asgi(...)
 schema = schemathesis.openapi.from_asgi("/openapi.json", app)
@@ -344,84 +339,58 @@ def test_api_honours_schema(case):
     case.call_and_validate()   # fails on 5xx, undocumented status codes, or bodies off-schema
 ```
 
-On a pull request that renamed `usage.total_tokens`:
-1. The snapshot test fails (visible).
-2. The diff tool flags a removed response property (breaking).
-3. The reviewer must restore the field, add it alongside the new name with a deprecation, or cut a new
-   version.
+On a pull request that renamed `usage.total_tokens`, the snapshot test fails, the diff tool flags a
+removed response property, and the reviewer must restore the field, alias it with a deprecation, or cut
+a new version.
 
 ### Agent scenario: replay recorded tool calls against the new request models
-Sample real tool calls from agent traces (exported as JSON Lines) and validate each one against the
-current Pydantic request model. Any call that used to succeed and now fails is a break for the agent.
+Validate real tool calls from agent traces against the current request model. `extra="forbid"` in the
+replay only surfaces arguments the new model would silently drop with the default `extra="ignore"`.
 
 ```python
-# tests/test_agent_tool_replay.py
-import json, pathlib
 from pydantic import BaseModel, ConfigDict, ValidationError
-from app.tools import SearchIn, RefundIn        # the request models behind tool routes
 
-TOOL_MODELS: dict[str, type[BaseModel]] = {"tools_search": SearchIn, "tools_refund": RefundIn}
-TRACES = pathlib.Path(__file__).parent / "agent_tool_calls.sample.jsonl"
-# one line per recorded call: {"tool": "tools_search", "arguments": {...}}
+class SearchIn(BaseModel):                       # new version dropped `top_k`
+    query: str
 
-def strict(model: type[BaseModel]) -> type[BaseModel]:
-    """Same fields, but unknown arguments fail instead of being silently ignored."""
+def strict(model):
     return type(f"Strict{model.__name__}", (model,), {"model_config": ConfigDict(extra="forbid")})
 
-def test_recorded_agent_calls_still_validate():
-    failures = []
-    for line in TRACES.read_text().splitlines():
-        call = json.loads(line)
-        model = TOOL_MODELS.get(call["tool"])
-        if model is None:
-            failures.append(f"tool {call['tool']} no longer exists")
-            continue
-        try:
-            strict(model).model_validate(call["arguments"])
-        except ValidationError as e:
-            failures.append(f"{call['tool']}: {e.errors()[0]['msg']} at {e.errors()[0]['loc']}")
-    assert not failures, "agent tool calls the new schema rejects:\n" + "\n".join(failures[:20])
+recorded = [{"query": "refund policy"}, {"query": "late fees", "top_k": 3}]   # from production traces
+for args in recorded:
+    try:
+        strict(SearchIn).model_validate(args)
+        print("ok", args)
+    except ValidationError as e:
+        print("break", [err["loc"] for err in e.errors()])
+# ok {'query': 'refund policy'}
+# break [('top_k',)]      without forbid this call would pass and top_k would be dropped
 ```
 
-- **`extra="forbid"` in the replay only** surfaces the sneaky case: an argument the agent sends that the
-  new model would silently drop with the default `extra="ignore"`.
-- **Refresh the sample** from production traces on a schedule, so it reflects what the current model and
-  prompt actually send.
-
 ### A tiny breaking-change classifier (runnable, stdlib only)
-Not a replacement for oasdiff, but it shows the asymmetric rule as code. Requests must not accept less;
-responses must not promise less.
+Not a replacement for oasdiff, but it shows the asymmetric rule as code. Requests must not require
+more; responses must not promise less.
 
 ```python
-def fields(schema, model):
-    s = schema["components"]["schemas"][model]
-    return set(s.get("properties", {})), set(s.get("required", []))
+def props(schema, model):
+    s = schema[model]
+    return set(s["properties"]), set(s["required"])
 
 def breaking(old, new, requests, responses):
     out = []
-    for m in requests:                                   # server must not accept less
-        (op, oreq), (np_, nreq) = fields(old, m), fields(new, m)
-        out += [f"{m}: new required request field '{f}'" for f in sorted(nreq - oreq)]
-        out += [f"{m}: request field '{f}' removed (silently ignored)" for f in sorted(op - np_)]
+    for m in requests:                                   # server must not require more
+        out += [f"{m}: new required request field '{f}'" for f in props(new, m)[1] - props(old, m)[1]]
     for m in responses:                                  # server must not promise less
-        (op, oreq), (np_, nreq) = fields(old, m), fields(new, m)
-        out += [f"{m}: response field '{f}' removed" for f in sorted(op - np_)]
-        out += [f"{m}: response field '{f}' no longer required" for f in sorted((oreq - nreq) & np_)]
+        out += [f"{m}: response field '{f}' removed" for f in props(old, m)[0] - props(new, m)[0]]
     return out
 
-old = {"components": {"schemas": {
-    "ChatIn": {"properties": {"messages": {}, "temperature": {}}, "required": ["messages"]},
-    "Usage": {"properties": {"prompt_tokens": {}, "total_tokens": {}},
-              "required": ["prompt_tokens", "total_tokens"]}}}}
-new = {"components": {"schemas": {
-    "ChatIn": {"properties": {"messages": {}, "tenant_id": {}}, "required": ["messages", "tenant_id"]},
-    "Usage": {"properties": {"prompt_tokens": {}, "tokens": {}}, "required": ["prompt_tokens", "tokens"]}}}}
+old = {"ChatIn": {"properties": ["messages"], "required": ["messages"]},
+       "Usage": {"properties": ["prompt_tokens", "total_tokens"], "required": []}}
+new = {"ChatIn": {"properties": ["messages", "tenant_id"], "required": ["messages", "tenant_id"]},
+       "Usage": {"properties": ["prompt_tokens", "tokens"], "required": []}}
 
-for line in breaking(old, new, requests=["ChatIn"], responses=["Usage"]):
-    print(line)
-# ChatIn: new required request field 'tenant_id'
-# ChatIn: request field 'temperature' removed (silently ignored)
-# Usage: response field 'total_tokens' removed
+print(breaking(old, new, requests=["ChatIn"], responses=["Usage"]))
+# ["ChatIn: new required request field 'tenant_id'", "Usage: response field 'total_tokens' removed"]
 ```
 
 ### Worked scenario: a break that slips into the baseline
@@ -458,6 +427,10 @@ for line in breaking(old, new, requests=["ChatIn"], responses=["Usage"]):
 - **Pacts for many consumers.** When several teams consume the API, have each publish Pact expectations
   and verify them in the provider pipeline before deploy. Monitor: consumers with unverified pacts, and
   fields no pact uses (safe removal candidates).
+- **Refresh the replay sample** from production traces on a schedule, so it reflects what the current
+  model and prompt actually send.
+- **Removed request fields and newly optional response fields are breaks too.** A dropped request field
+  is silently ignored; a response field that stops being required can vanish for clients that rely on it.
 
 ## Trade-offs
 - **Strict equality vs noise.** Strict snapshot equality catches every change, but it also fails on

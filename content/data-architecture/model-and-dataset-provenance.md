@@ -253,93 +253,59 @@ when task success drops.
 ```python
 import hashlib, json
 
-def digest(obj) -> str:
-    data = obj if isinstance(obj, bytes) else json.dumps(obj, sort_keys=True).encode()
-    return hashlib.sha256(data).hexdigest()[:12]
+digest = lambda obj: hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:12]
 
 def release_manifest(model_id, system_prompt, tools, index_version, router_ckpt_digest):
     return {"model_id": model_id,                          # a dated id, never a moving alias
-            "system_prompt": digest(system_prompt.encode()),
-            "tools": {t["name"]: digest(t) for t in tools},
+            "system_prompt": digest(system_prompt),
+            **{f"tools.{t['name']}": digest(t) for t in tools},
             "index_version": index_version,
             "router_checkpoint": router_ckpt_digest}
 
-def diff(a: dict, b: dict, prefix=""):
-    for k in sorted(set(a) | set(b)):
-        va, vb = a.get(k), b.get(k)
-        if isinstance(va, dict) and isinstance(vb, dict):
-            yield from diff(va, vb, prefix + k + ".")
-        elif va != vb:
-            yield f"{prefix}{k}: {va} -> {vb}"
+def diff(a: dict, b: dict) -> list[str]:
+    return [f"{k}: {a.get(k)} -> {b.get(k)}" for k in sorted(a.keys() | b.keys()) if a.get(k) != b.get(k)]
 
 tools = [{"name": "search_docs", "input_schema": {"query": "string"}},
          {"name": "refund", "input_schema": {"order_id": "string", "amount_usd": "number"}}]
 v3 = release_manifest("model-2025-01-15", "You are a support agent.", tools, "docs_v6", "9ab")
 tools[1]["input_schema"]["amount_usd"] = "integer"         # a tool schema edit nobody announced
 v4 = release_manifest("model-2025-01-15", "You are a support agent.", tools, "docs_v7", "c42")
-print(list(diff(v3, v4)))   # index_version, router_checkpoint and tools.refund changed
+print(*diff(v3, v4), sep="\n")   # index_version, router_checkpoint and tools.refund changed
 ```
 
 The model ids and digests here are placeholders; use your provider's dated model identifiers.
 
 ### A manifest writer for a fine-tuning run
-It hashes the dataset snapshot and base model files, captures code and environment identifiers, and writes
-a JSON manifest beside the checkpoint. The training call is a stub; everything around it is what
-provenance requires.
+The training job calls it right after saving the checkpoint. It hashes the dataset snapshot, the eval set
+and the checkpoint, captures code identifiers, and writes a JSON manifest beside the checkpoint.
 
 ```python
-import hashlib, json, subprocess, sys, platform, time
+import hashlib, json, sys, time
 from pathlib import Path
 
-def file_digest(p: Path) -> str:
-    h = hashlib.sha256()
-    with p.open("rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
+def tree_digest(root: Path) -> str:                      # Merkle-style root over per-file SHA-256s
+    per_file = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in sorted(root.rglob("*")) if p.is_file()}
+    return hashlib.sha256(json.dumps(per_file, sort_keys=True).encode()).hexdigest()
 
-def tree_digest(root: Path) -> dict:
-    files = sorted(p for p in root.rglob("*") if p.is_file())
-    per_file = {str(p.relative_to(root)): file_digest(p) for p in files}
-    root_hash = hashlib.sha256(json.dumps(per_file, sort_keys=True).encode()).hexdigest()
-    return {"root": root_hash, "files": len(per_file), "per_file": per_file}
-
-def git_commit() -> str:
-    return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-
-def train(out_dir: Path, params: dict) -> Path:       # stand-in for the real trainer
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ckpt = out_dir / "model.safetensors"
-    ckpt.write_bytes(b"weights-placeholder")
-    return ckpt
-
-def run(base_model: dict, dataset_dir: Path, eval_dir: Path, out_dir: Path, params: dict):
-    data, evalset = tree_digest(dataset_dir), tree_digest(eval_dir)
-    overlap = set(data["per_file"].values()) & set(evalset["per_file"].values())
-    if overlap:
-        raise SystemExit(f"eval files present in training snapshot: {len(overlap)}")
-    ckpt = train(out_dir, params)
-    manifest = {
-        "base_model": base_model,                       # {"repo": ..., "revision": <commit hash>}
-        "datasets": [{"path": str(dataset_dir), "digest": data["root"], "files": data["files"],
-                      "license": "customer-restricted:acme"}],
-        "eval_set_digest": evalset["root"],
-        "code": {"commit": git_commit(), "python": sys.version.split()[0], "platform": platform.platform()},
-        "params": params,
-        "outputs": {"checkpoint": str(ckpt), "digest": file_digest(ckpt)},
+def write_manifest(base_model, dataset_dir: Path, eval_dir: Path, ckpt: Path, params, commit) -> None:
+    (ckpt.parent / "manifest.json").write_text(json.dumps({
+        "base_model": base_model,                        # {"repo": ..., "revision": <commit hash>}
+        "datasets": [{"digest": tree_digest(dataset_dir), "license": "customer-restricted:acme"}],
+        "eval_set_digest": tree_digest(eval_dir),
+        "code": {"commit": commit, "python": sys.version.split()[0]},   # commit = `git rev-parse HEAD`
+        "params": params,                                # full hyperparameters and the seed
+        "outputs": {"checkpoint": ckpt.name, "digest": hashlib.sha256(ckpt.read_bytes()).hexdigest()},
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
-    return manifest
+    }, indent=2, sort_keys=True))
 ```
 
-The overlap check is deliberately crude (whole-file hashes); a real contamination check hashes individual
-examples or n-grams. The licence field on the dataset is what later blocks this checkpoint from being
-promoted to a shared, multi-customer deployment.
+The contamination check that must pass before training is the next example. The licence field on the
+dataset is what later blocks this checkpoint from being promoted to a shared, multi-customer deployment.
 
 ### Example-level contamination check: exact digests plus n-grams
-The step the crude file check above defers. Normalizing before hashing catches reformatted copies; shared
-n-grams catch light paraphrases. The 8-token n-gram size is an illustrative choice; tune it on your data.
+Run it before training, between the training snapshot and every eval set. Normalizing before hashing
+catches reformatted copies; shared n-grams catch light paraphrases. The 8-token n-gram size is an illustrative choice; tune it on your data.
 
 ```python
 import hashlib, re
@@ -347,28 +313,23 @@ import hashlib, re
 def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", text.lower())).strip()
 
-def digest(text: str) -> str:
-    return hashlib.sha256(normalize(text).encode()).hexdigest()
-
 def ngrams(text: str, n: int = 8) -> set[tuple[str, ...]]:
     toks = normalize(text).split()
     return {tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)}
 
-def contamination(train: list[str], evalset: list[str], n: int = 8, min_shared: int = 1):
-    train_digests = {digest(t) for t in train}
-    train_grams = set().union(*(ngrams(t, n) for t in train))
+def contamination(train: list[str], evalset: list[str], n: int = 8):
+    digest = lambda t: hashlib.sha256(normalize(t).encode()).hexdigest()
+    train_digests, train_grams = {digest(t) for t in train}, set().union(*(ngrams(t, n) for t in train))
     exact = [e for e in evalset if digest(e) in train_digests]
-    near = [e for e in evalset if e not in exact and len(ngrams(e, n) & train_grams) >= min_shared]
+    near = [e for e in evalset if e not in exact and ngrams(e, n) & train_grams]
     return exact, near
 
 train = ["How do I reset my password? Go to Settings, then Security, then Reset.",
          "Refunds are issued to the original card within five business days of approval."]
 evalset = ["how do I reset my password?  go to settings, then security, then reset",   # reformatted copy
-           "Refunds are issued to the original card within five business days, per policy.",
-           "What is the API rate limit for the free tier?"]
+           "Refunds are issued to the original card within five business days, per policy."]
 exact, near = contamination(train, evalset)
-print(len(exact), "exact;", len(near), "near-duplicate;", len(evalset) - len(exact) - len(near), "clean")
-# 1 exact; 1 near-duplicate; 1 clean
+print(len(exact), "exact;", len(near), "near-duplicate")   # 1 exact; 1 near-duplicate
 ```
 
 ### Worked scenario: diffing manifests after a router regression
@@ -408,6 +369,9 @@ than `router-v3` in production. Diff the two manifests (illustrative values):
 - **Contamination gate before training.** Use whenever eval sets exist. Run the digest and n-gram overlap
   check between the training snapshot and every registered eval set, including agent task suites, and
   record the result in the manifest. Monitor overlap counts per run.
+- **Hash large files in blocks.** Stream checkpoints and shards through SHA-256 in 1 MB blocks rather than
+  reading whole files into memory, and record the environment (library versions, platform) beside the
+  code commit.
 
 ## Trade-offs
 - **Exact inputs vs immutable storage.** Content-addressed snapshots make inputs exact but require immutable

@@ -164,37 +164,29 @@ Runnable with the standard library. The model only chooses to call `issue_refund
 
 ```python
 import sqlite3, hashlib
-from datetime import date
 
 db = sqlite3.connect(":memory:")
 db.executescript("""
-CREATE TABLE orders(id TEXT PRIMARY KEY, customer TEXT, total REAL, placed TEXT);
+CREATE TABLE orders(id TEXT PRIMARY KEY, customer TEXT);
 CREATE TABLE refunds(key TEXT PRIMARY KEY, order_id TEXT, amount REAL, status TEXT);
-INSERT INTO orders VALUES ('A1','c42',40.0,'2026-10-01'),('A2','c42',900.0,'2026-10-10');
+INSERT INTO orders VALUES ('A1','c42'),('A2','c42');
 """)
-AUTO_LIMIT, WINDOW_DAYS = 100.0, 30
+AUTO_LIMIT = 100.0
 
-def issue_refund(session_customer, order_id, amount, ticket_id, today=date(2026, 10, 20)):
-    row = db.execute("SELECT customer,total,placed FROM orders WHERE id=?", (order_id,)).fetchone()
+def issue_refund(session_customer, order_id, amount, ticket_id):
+    row = db.execute("SELECT customer FROM orders WHERE id=?", (order_id,)).fetchone()
     if not row or row[0] != session_customer:
         return {"ok": False, "error": "order not found for this customer"}
-    if amount <= 0 or amount > row[1]:
-        return {"ok": False, "error": f"amount must be between 0 and {row[1]}"}
-    if (today - date.fromisoformat(row[2])).days > WINDOW_DAYS:
-        return {"ok": False, "error": "outside refund window, escalate to a human"}
     key = hashlib.sha256(f"{ticket_id}:{order_id}".encode()).hexdigest()[:16]
     prior = db.execute("SELECT status FROM refunds WHERE key=?", (key,)).fetchone()
     if prior:
         return {"ok": True, "status": prior[0], "idempotent_replay": True}
-    if db.execute("SELECT 1 FROM refunds WHERE order_id=?", (order_id,)).fetchone():
-        return {"ok": False, "error": "order already refunded, escalate to a human"}
     status = "executed" if amount <= AUTO_LIMIT else "pending_approval"
     db.execute("INSERT INTO refunds VALUES (?,?,?,?)", (key, order_id, amount, status))
     return {"ok": True, "status": status}
 
 print(issue_refund("c42", "A1", 40.0, "T-1"))    # executed
 print(issue_refund("c42", "A1", 40.0, "T-1"))    # replay, no second payment
-print(issue_refund("c42", "A1", 40.0, "T-9"))    # new ticket, same order: one refund per order
 print(issue_refund("c42", "A2", 900.0, "T-2"))   # pending_approval
 print(issue_refund("c99", "A1", 40.0, "T-3"))    # wrong customer, refused
 ```
@@ -238,6 +230,9 @@ baseline week of tickets.
   expected tool sequence and outcome, and gate prompt or model changes on it (see `evals/golden-dataset`).
 - **Trace every turn.** Log intent, retrieved article ids, tool calls with arguments and results, and
   the final reply in one trace, so a bad refund can be explained end to end.
+- **Every policy check lives in the refund tool.** Besides ownership, limit and idempotency, check the
+  amount is between 0 and the order total, the order is inside the refund window (for example 30 days),
+  and the order has not already been refunded under another ticket; otherwise escalate to a human.
 
 ## Trade-offs
 - **Containment vs customer trust.** Pushing the agent to resolve more tickets raises savings but also

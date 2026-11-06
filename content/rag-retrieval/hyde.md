@@ -225,31 +225,23 @@ The agent may pass `draft_passage`; if it does not and the first pass is weak, t
 ```python
 import numpy as np
 
-SEARCH_TOOL = {
-    "name": "search_wiki",
-    "description": ("Search the internal wiki. Optionally pass draft_passage: two or three sentences "
-                    "written the way a wiki page would answer. It is only used to find pages; it is "
-                    "never evidence, so cite only the passages this tool returns."),
-    "input_schema": {"type": "object",
-                     "properties": {"query": {"type": "string"},
-                                    "draft_passage": {"type": "string"}},
-                     "required": ["query"]},
-}
-
 def search_wiki(query, draft_passage=None, k=10, n=5, min_score=0.0):
-    def search(vec):
-        return rerank_scored(query, index.search(vec, k))       # rerank against the query, always
+    """Tool. draft_passage is optional answer-shaped text used only to find pages, never returned."""
     q_vec = embed(query, kind="query")
     if not draft_passage:
-        first = search(q_vec)
+        first = rerank_scored(query, index.search(q_vec, k))    # [(score, passage), ...]
         if first and first[0][0] >= min_score:
             return {"status": "ok", "passages": [c for _, c in first[:n]], "hyde": "off"}
         draft_passage = llm(f"Write a short wiki passage that answers: {query}", max_tokens=150)
-    v = np.mean([embed(draft_passage[:2000], kind="passage"), q_vec], axis=0)   # same encoder as index
-    hits = search(v / np.linalg.norm(v))
-    return {"status": "ok" if hits else "no_evidence",         # the draft is never returned
+    v = np.mean([embed(draft_passage[:2000], kind="passage"), q_vec], axis=0)  # same encoder as index
+    hits = rerank_scored(query, index.search(v / np.linalg.norm(v), k))      # rerank against the query
+    return {"status": "ok" if hits else "no_evidence",        # the draft is never returned
             "passages": [c for _, c in hits[:n]], "hyde": "on"}
 ```
+
+The tool description shown to the model says the draft is two or three sentences written the way a
+wiki page would answer, that it is only used to find pages, and that it is never evidence, so the agent
+cites only the passages the tool returns.
 
 Illustrative cost for an agent that searches 3 times per task (substitute your measured rates):
 

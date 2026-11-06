@@ -227,88 +227,58 @@ The five interfaces as code. The point is the shape:
   "repeat" replays the same stored sample and the measured noise is zero.
 
 ```python
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Any, Callable
-import hashlib, json, pathlib, time
+import hashlib, json, pathlib
 
-@dataclass
-class Item:                      # one row of a content-hashed dataset version
-    id: str; input: dict; expected: Any = None; slice: str = "default"
+@dataclass                       # one row of a content-hashed dataset version
+class Item: id: str; input: dict; expected: Any = None
 
-@dataclass
-class Scorer:                    # name + version travel with every score it produces
-    name: str; version: str; fn: Callable[[Item, str], tuple[float, str]]
+@dataclass                       # name + version travel with every score it produces
+class Scorer: name: str; version: str; fn: Callable[[Item, str], float]
 
-Target = Callable[[dict], str]   # the production code path, with the pinned bundle inside
+def json_field_equals(field: str) -> Scorer:                        # deterministic family
+    return Scorer(f"json_eq:{field}", "1", lambda it, out: float(json.loads(out).get(field) == it.expected))
 
-def json_field_equals(field: str) -> Scorer:            # deterministic family
-    def fn(item, out):
-        try:
-            return float(json.loads(out).get(field) == item.expected), ""
-        except json.JSONDecodeError:
-            return 0.0, "invalid JSON"
-    return Scorer(f"json_eq:{field}", "1", fn)
+def rubric_judge(judge: Callable, rubric_version: str) -> Scorer:   # model-graded family
+    return Scorer("judge", rubric_version,   # judge prompt asks for {"score": 0..1, "reason": "..."}
+                  lambda it, out: json.loads(judge({"output": out, "reference": it.expected}))["score"])
 
-def rubric_judge(judge: Target, rubric_version: str) -> Scorer:   # model-graded family
-    def fn(item, out):
-        v = json.loads(judge({"input": item.input, "output": out, "reference": item.expected}))
-        return float(v["score"]), v["reason"]          # judge prompt asks for {"score": 0..1, "reason": "..."}
-    return Scorer("judge", rubric_version, fn)
-
-def run(dataset_version: str, items: list[Item], target: Target, scorers: list[Scorer], bundle: dict) -> dict:
+def run(dataset_version: str, items: list[Item], target: Callable, scorers: list[Scorer], bundle: dict) -> dict:
     h = lambda o: hashlib.sha256(json.dumps(o, sort_keys=True).encode()).hexdigest()[:12]
     gen_id = h({"dataset": dataset_version, "bundle": bundle})          # what determines the outputs
     run_id = h({"gen": gen_id, "scorers": [f"{s.name}@{s.version}" for s in scorers]})
     path = pathlib.Path(f"outputs/{gen_id}.jsonl"); path.parent.mkdir(exist_ok=True)
     done = {r["id"]: r["output"] for r in map(json.loads, path.open())} if path.exists() else {}
-    rows = []
     with path.open("a") as raw:
-        for it in items:
-            if it.id not in done:                       # a new judge reuses these: re-scoring costs judge calls only
-                done[it.id] = target(it.input)
-                raw.write(json.dumps({"id": it.id, "output": done[it.id]}) + "\n"); raw.flush()
-            out = done[it.id]                           # persisted before any scorer runs
-            scores = [dict(zip(("value", "rationale"), s.fn(it, out)), scorer=f"{s.name}@{s.version}")
-                      for s in scorers]                 # one call per scorer: a judge call costs money
-            rows.append({"item": asdict(it), "output": out, "scores": scores})
-    return {"run_id": run_id, "gen_id": gen_id, "started": time.time(), "rows": rows}
+        for it in [it for it in items if it.id not in done]:   # resume or re-score: no target call
+            done[it.id] = target(it.input)
+            raw.write(json.dumps({"id": it.id, "output": done[it.id]}) + "\n")   # persisted before scoring
+    rows = [{"id": it.id, "output": done[it.id],
+             "scores": {f"{s.name}@{s.version}": s.fn(it, done[it.id]) for s in scorers}} for it in items]
+    return {"run_id": run_id, "gen_id": gen_id, "rows": rows}
 ```
 
 ### Plugging an agent into the same skeleton
-Continues the skeleton above. The target runs the real agent loop and returns its trajectory as JSON; three
-deterministic trajectory scorers read it. `run_agent` and `TOOL_SCHEMAS` are your loop and your tools'
-argument schemas; `validate` is any JSON-schema check.
+Continues the skeleton above. The target runs the real agent loop and returns its trajectory as JSON; two
+deterministic trajectory scorers read it, and a tool-argument validity scorer follows the same shape.
+`run_agent` is your loop.
 
 ```python
 def agent_target(inp):                              # the production loop, tools sandboxed or recorded
     trace = run_agent(inp["task"], max_steps=10)
-    return json.dumps({"final": trace.final_answer, "state": trace.final_state,
-                       "calls": [{"tool": c.name, "args": c.args} for c in trace.tool_calls]})
+    return json.dumps({"state": trace.final_state, "calls": [c.name for c in trace.tool_calls]})
 
 def final_state_matches() -> Scorer:                # did the task get done?
-    def fn(item, out):
-        t = json.loads(out)
-        ok = all(t["state"].get(k) == v for k, v in item.expected["state"].items())
-        return float(ok), "" if ok else f"state {t['state']}"
-    return Scorer("final_state", "1", fn)
-
-def tool_args_valid() -> Scorer:                    # were the calls well-formed?
-    def fn(item, out):
-        calls = json.loads(out)["calls"]
-        bad = [c["tool"] for c in calls if not validate(c["args"], TOOL_SCHEMAS[c["tool"]])]
-        return float(not bad), f"invalid args for {bad}" if bad else ""
-    return Scorer("tool_args_valid", "1", fn)
+    return Scorer("final_state", "1", lambda it, out: float(
+        all(json.loads(out)["state"].get(k) == v for k, v in it.expected.items())))
 
 def within_steps(limit: int) -> Scorer:             # did it get there efficiently?
-    def fn(item, out):
-        n = len(json.loads(out)["calls"])
-        return float(n <= limit), f"{n} tool calls"
-    return Scorer("within_steps", str(limit), fn)
+    return Scorer("within_steps", str(limit), lambda it, out: float(len(json.loads(out)["calls"]) <= limit))
 
-items = [Item("r1", {"task": "Refund order 1182"}, {"state": {"order_1182": "refunded"}}, "refunds")]
-bundle = {"model": "vendor-model-2025-04-14", "prompt": "support_agent@v14", "tools": "tools@3f9a"}
-report = run("agent-golden-v3@71ab02", items, agent_target,
-             [final_state_matches(), tool_args_valid(), within_steps(6)], bundle)
+items = [Item("r1", {"task": "Refund order 1182"}, {"order_1182": "refunded"})]
+report = run("agent-golden-v3@71ab02", items, agent_target, [final_state_matches(), within_steps(6)],
+             {"model": "vendor-model-2025-04-14", "prompt": "support_agent@v14", "tools": "tools@3f9a"})
 ```
 
 ### Using it: a judge upgrade re-scores without re-running the app
@@ -326,10 +296,8 @@ def judge(req):                                 # stand-in for a pinned judge mo
     calls["judge"] += 1
     return json.dumps({"score": 1.0, "reason": "matches reference"})
 
-items = [Item("t1", {"text": "I want my money back"}, "refund", "refunds"),
-         Item("t2", {"text": "Where is my parcel"}, "other", "shipping")]
+items = [Item("t1", {"text": "I want my money back"}, "refund"), Item("t2", {"text": "Where is my parcel"}, "other")]
 bundle = {"model": "vendor-model-2025-04-14", "prompt": "intent@v7", "params": {"temperature": 0}}
-
 r1 = run("golden-v8@5c2e91", items, app, [json_field_equals("intent"), rubric_judge(judge, "rubric-v3")], bundle)
 r2 = run("golden-v8@5c2e91", items, app, [json_field_equals("intent"), rubric_judge(judge, "rubric-v4")], bundle)
 print(r1["gen_id"] == r2["gen_id"], r1["run_id"] != r2["run_id"])   # True True: same outputs, new run
@@ -366,6 +334,10 @@ each "target call" is a whole run of several model and tool calls, so the zeros 
 - **Trace-to-dataset loop** — when incidents keep surprising you. Make "add this trace to the candidate
   set" one action in the platform, with review before it enters a golden version. Monitor the fraction of
   incidents that already had a dataset item.
+- **Scores carry a rationale and survive bad output.** Store the judge's reason next to each score, and
+  score an unparseable output as 0 with a reason such as "invalid JSON" instead of crashing the run.
+- **Tool-argument validity as its own scorer** for agents: validate each call's args against the tool's JSON
+  schema and report which tools failed.
 
 ## Trade-offs
 - **Comparability vs fit.** One framework across teams makes numbers comparable but forces every task into

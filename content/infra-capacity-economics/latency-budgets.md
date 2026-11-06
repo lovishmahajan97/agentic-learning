@@ -236,80 +236,48 @@ Target: task answered within 15 s at p95. Measured p95s at peak load (illustrati
 ```python
 import asyncio, time
 
-class Deadline:
-    def __init__(self, seconds): self.end = time.monotonic() + seconds
-    def remaining(self): return self.end - time.monotonic()
-
 STEP_P95, ANSWER_P95 = 2.5, 3.0       # measured per-iteration and final-step p95 at peak
+NUDGE = "Answer now from the evidence above."
 
 async def run_agent(task, remaining_s, call_model, run_tool, max_steps=8):
-    dl = Deadline(remaining_s)         # from the propagated deadline, not a fresh 15 s
-    transcript, partial = [task], False
+    end = time.monotonic() + remaining_s      # from the propagated deadline, not a fresh 15 s
+    transcript = [task]
     for _ in range(max_steps):
-        if dl.remaining() < STEP_P95 + ANSWER_P95:
-            partial = True             # no room for another step: answer with what we have
-            break
-        try:
-            step = await asyncio.wait_for(call_model(transcript), dl.remaining() - ANSWER_P95)
-        except asyncio.TimeoutError:
-            partial = True             # slow model step: keep the answer budget, stop exploring
-            break
+        if end - time.monotonic() < STEP_P95 + ANSWER_P95:
+            break                             # no room for another step: answer with what we have
+        step = await call_model(transcript)
         if step.get("final"):
             return step["text"], False
-        try:                           # each tool gets at most what the loop can spare
-            out = await asyncio.wait_for(run_tool(step["tool"], step["args"]),
-                                         min(step.get("timeout", 5.0), dl.remaining() - ANSWER_P95))
+        try:                                  # each tool gets at most what the loop can spare
+            out = await asyncio.wait_for(run_tool(step["tool"]), end - time.monotonic() - ANSWER_P95)
         except asyncio.TimeoutError:
-            out = {"error": "tool timed out"}      # tell the model, let it choose another path
+            out = {"error": "tool timed out"} # tell the model, let it choose another path
         transcript += [step, out]
-    final = await asyncio.wait_for(call_model(transcript + ["Answer now from the evidence above."]),
-                                   max(0.5, dl.remaining()))
-    return final["text"], partial
+    return (await call_model(transcript + [NUDGE]))["text"], True     # partial answer
+
+async def model(t):                   # fake model: answers after two tool calls or when nudged
+    return {"final": True, "text": "answer"} if len(t) >= 5 or t[-1] == NUDGE else {"tool": "lookup"}
+async def tool(name): return {"ok": name}
+print(asyncio.run(run_agent("refund?", 15, model, tool)))   # ('answer', False)
+print(asyncio.run(run_agent("refund?", 4, model, tool)))    # ('answer', True): 4 s < 2.5 + 3.0
 ```
 
 - **`remaining_s` comes from the deadline set at the edge**, so upstream delay is already subtracted.
 - **The stop rule** is "time left covers one more step plus the answer", not a fixed step count, so a slow
   gateway or slow tool automatically leaves fewer iterations.
 - **A timed-out tool becomes an observation** the model can route around, instead of an exception that
-  kills the task; a timed-out model step ends the loop but still leaves the answer step its budget.
+  kills the task.
 
-### Deadline-aware stages in a RAG step
-```python
-import asyncio, time
-
-class Deadline:
-    def __init__(self, seconds): self.end = time.monotonic() + seconds
-    def remaining(self): return self.end - time.monotonic()
-
-async def stage(fn, budget, dl, keep=0.0, optional=False, fallback=None):
-    avail = dl.remaining() - keep           # leave room for the stages after this one
-    if optional and avail < budget:
-        return fallback                     # skip an optional step rather than squeeze it
-    try:
-        return await asyncio.wait_for(fn(), max(0.0, min(budget, avail)))
-    except asyncio.TimeoutError:
-        if optional:
-            return fallback
-        raise
-
-PREFILL_P95 = 0.8                           # measured queue + prefill at peak
-
-async def first_token(query, remaining_s, rewrite, retrieve, rerank, generate):
-    dl = Deadline(remaining_s)              # from the propagated deadline header, not a fresh 2.0 s
-    q = await stage(lambda: rewrite(query), 0.30, dl, keep=0.15 + PREFILL_P95,
-                    optional=True, fallback=query)
-    docs = await stage(lambda: retrieve(q), 0.15, dl, keep=PREFILL_P95)
-    docs = await stage(lambda: rerank(q, docs), 0.20, dl, keep=PREFILL_P95,
-                       optional=True, fallback=docs[:5])
-    return await stage(lambda: generate(q, docs), dl.remaining(), dl)
-```
+### Worked scenario: deadline-aware stages in a RAG step
+Same 2.0 s TTFT target. Each stage gets `min(its budget, time left minus what later stages keep)`, and the
+optional rewrite (0.30 s) and rerank (0.20 s) are skipped rather than squeezed.
 
 - **Normal request:** about 1.87 s is left (2.0 s minus 130 ms of edge and gateway) and the rewrite runs.
 - **Slow gateway:** if the queue ate an extra 700 ms, only 1.17 s is left. The rewrite needs its 0.30 s
-  plus the 0.95 s kept for retrieval and generation, so it is skipped automatically, and generation's
-  0.8 s share stays protected.
-- **The bug this prevents:** creating `Deadline(2.0)` inside this function would silently ignore upstream
-  delay, which is exactly what deadline propagation exists to stop.
+  plus the 0.95 s kept for retrieval (0.15 s) and generation (0.8 s), so it is skipped automatically, and
+  generation's 0.8 s share stays protected.
+- **The bug this prevents:** creating a fresh 2.0 s deadline inside the RAG step would silently ignore
+  upstream delay, which is exactly what deadline propagation exists to stop.
 
 ### Percentiles do not add: a quick simulation
 Pure Python; three sequential steps with skewed (lognormal) latencies.
@@ -361,6 +329,8 @@ for n in (1, 10, 50, 100):          # fan-out: chance at least one call hits its
 - **Hedge only idempotent reads, with a cap.** Send a second copy after the p95 delay for retrieval, cache
   or read-only tool calls, never for tools with side effects, and limit hedges to a small fraction of
   traffic. Monitor extra load from hedging and turn it off under saturation.
+- **Bound the model step as well as tools.** Wrap each agent model call in a timeout of time left minus
+  the answer reserve; on timeout stop exploring and still give the final answer step its budget.
 
 ## Trade-offs
 - **Tight per-step allocations vs churn.** They make regressions visible early, but over-precise budgets

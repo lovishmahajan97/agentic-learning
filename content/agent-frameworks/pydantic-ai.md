@@ -286,7 +286,7 @@ class RefundDecision(BaseModel):
     reason: str
 
 agent = Agent("openai:gpt-4o-mini", deps_type=Deps, output_type=RefundDecision,
-              instructions="Orders under 30 days old and not refunded are eligible for a full refund.")
+              instructions="Orders under 30 days old are eligible for a full refund.")
 
 @agent.tool
 async def get_order(ctx: RunContext[Deps], order_id: str) -> dict:
@@ -296,21 +296,13 @@ async def get_order(ctx: RunContext[Deps], order_id: str) -> dict:
         raise ModelRetry(f"No order {order_id} for this customer. Ask the user to check the ID.")
     return order
 
-@agent.output_validator
-async def within_total(ctx: RunContext[Deps], out: RefundDecision) -> RefundDecision:
-    order = ctx.deps.orders.get(out.order_id)
-    if order and out.amount_usd > order["total_usd"]:
-        raise ModelRetry("Refund amount cannot exceed the order total.")
-    return out
-
-deps = Deps("c1", {"A1": {"customer_id": "c1", "total_usd": 80.0, "days_ago": 12, "refunded": False}})
+deps = Deps("c1", {"A1": {"customer_id": "c1", "total_usd": 80.0, "days_ago": 12}})
 result = agent.run_sync("Can I get my money back for order A1?", deps=deps)
-print(result.output)        # RefundDecision(order_id='A1', eligible=True, amount_usd=80.0, ...)
-print(result.usage())
+print(result.output)        # order_id='A1' eligible=True amount_usd=80.0 reason='...'
 ```
 
-- **Three layers of contract:** `Field(ge=0)` in the type, ownership in the tool, cross-field logic in the
-  validator. Each failure becomes a retry, not an exception in your handler.
+- **Two layers of contract:** `Field(ge=0)` in the type, ownership in the tool. Each failure becomes a
+  retry, not an exception in your handler.
 - **Ownership check uses deps,** so the model cannot read another customer's order by guessing IDs.
 
 ### Production shape: tests without the network, budgets and stored history
@@ -366,6 +358,8 @@ async def handle(msg: str, deps: Deps, history_json: bytes | None):
   cost per case.
 - **Fail over providers deliberately.** Use `FallbackModel` with two providers for availability, but run
   the eval set against both, because a fallback model that breaks your output type is not a fallback.
+- **Cross-field rules in an output validator.** Checks that need deps, such as "refund cannot exceed the
+  order total", go in `@agent.output_validator` and raise `ModelRetry` so the model corrects itself.
 
 ## Trade-offs
 - **Explicit types vs speed of prototyping.** Defining deps and output models takes minutes up front and

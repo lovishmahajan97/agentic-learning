@@ -359,8 +359,8 @@ flowchart TD
 
 ## Examples
 ### Executor-side policy check
-A policy check that runs in the executor, not in the prompt. Denials come back as structured tool results
-so the model can adapt, and credentials are injected only after the check passes.
+A policy check that runs in the executor, not in the prompt. It sees parsed arguments before any side
+effect.
 
 ```python
 from dataclasses import dataclass, field
@@ -374,36 +374,45 @@ class Policy:
     write_roots: tuple[Path, ...] = ()
     egress_allow: tuple[str, ...] = ()              # hostname globs
     needs_approval: set[str] = field(default_factory=set)
-    version: str = "v1"                             # stamped on every audit row
 
 RESEARCH = Policy({"read_file", "search", "http_get"}, egress_allow=("*.internal.example",))
 CODING = Policy({"read_file", "write_file", "run_tests"}, write_roots=(Path("/workspace/task-123"),))
 SUPPORT = Policy({"lookup_order", "refund"}, needs_approval={"refund"})
 
 def check(policy: Policy, name: str, args: dict) -> str:
-    """'allow' | 'ask' | 'deny' — evaluated on parsed arguments, before any side effect."""
+    """'allow' | 'ask' | 'deny', evaluated before any side effect."""
     if name not in policy.allowed_tools:
         return "deny"
     if name == "write_file":
         target = Path(args["path"]).resolve()               # resolve() defeats ../ tricks
         if not any(target.is_relative_to(root) for root in policy.write_roots):
             return "deny"
-    if name in ("http_get", "http_post"):
+    if name == "http_get":
         host = urlparse(args["url"]).hostname or ""
         if not any(fnmatch.fnmatch(host, pat) for pat in policy.egress_allow):
             return "deny"              # the HTTP client must also refuse redirects off the list
     return "ask" if name in policy.needs_approval else "allow"
+```
 
+### Executor: check, audit, then run
+`execute` wraps `check`: every verdict is audited, a deny comes back as a result the model can re-plan
+from, and the scoped token is fetched only once the call is allowed.
+
+```python
 def execute(policy, name, args, *, user, run_id, approve, vault, tools, audit):
     verdict = check(policy, name, args)
-    audit.write(run_id=run_id, user=user, tool=name, args=args, verdict=verdict,
-                policy_version=policy.version)
+    audit.append({"run_id": run_id, "user": user, "tool": name, "args": args, "verdict": verdict})
     if verdict == "deny":
         return {"ok": False, "error": f"{name} is not permitted in this task"}  # model re-plans
     if verdict == "ask" and not approve(name, args):
         return {"ok": False, "error": "declined by operator"}
     token = vault.token_for(user=user, tool=name, ttl_s=300)   # scoped, short-lived, never in context
     return tools[name](**args, _token=token)
+
+audit = []
+print(execute(SUPPORT, "send_email", {}, user="u1", run_id="r1",
+              approve=None, vault=None, tools={}, audit=audit))
+# {'ok': False, 'error': 'send_email is not permitted in this task'}
 ```
 
 ### Tests that pin the policy
@@ -455,6 +464,9 @@ A support agent started with one all-scopes key. Scores are illustrative (reach 
   with no network, a read-only root filesystem and CPU, memory and time limits (for example
   `docker run --network none --read-only --memory 512m`), with no credentials mounted. Monitor: sandbox
   timeouts and attempted network calls.
+- **Check, audit, then inject.** Write one audit row per verdict with run id, user, arguments and policy
+  version; return a deny as a structured result (`{"ok": False, "error": "... not permitted"}`) so the model
+  re-plans; fetch the scoped token (for example a 300 s TTL) only after the call is allowed and approved.
 
 ## Trade-offs
 - **Narrow profiles vs dead ends.** Per-task profiles cut blast radius but raise the rate of "I cannot do

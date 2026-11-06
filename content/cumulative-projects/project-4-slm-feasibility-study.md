@@ -205,7 +205,7 @@ Standard library only. The baseline is real; `candidate_stub` shows how invalid 
 where you call your local SLM. Run on Python 3.9.
 
 ```python
-import json, re, statistics, time
+import json, re, time
 
 # Narrow task: route a support ticket to one of 4 queues and return strict JSON.
 LABELS = {"billing", "shipping", "account", "other"}
@@ -223,7 +223,7 @@ def baseline(text):                                   # always build the dumbest
 def candidate_stub(text):                             # replace with a call to an SLM (Ollama, vLLM, llama.cpp)
     return '{"queue": "billing"}' if "charg" in text else "Sure! The queue is: shipping"
 
-def evaluate(name, model, price_per_call_usd=0.0):
+def evaluate(name, model):
     lat, correct, valid = [], 0, 0
     for text, gold in EVAL:
         t0 = time.perf_counter(); raw = model(text); lat.append((time.perf_counter() - t0) * 1000)
@@ -231,14 +231,10 @@ def evaluate(name, model, price_per_call_usd=0.0):
             q = json.loads(raw)["queue"]; valid += q in LABELS; correct += q == gold
         except (ValueError, KeyError, TypeError):
             pass                                       # invalid output counts as wrong, never silently fixed
-    lat.sort()
-    p95 = lat[min(len(lat) - 1, int(0.95 * len(lat)))]
-    return {"model": name, "accuracy": correct / len(EVAL), "valid_json": valid / len(EVAL),
-            "p50_ms": round(statistics.median(lat), 3), "p95_ms": round(p95, 3),
-            "cost_per_1k_usd": round(price_per_call_usd * 1000, 2)}
-
-for row in (evaluate("rules-baseline", baseline), evaluate("slm-stub", candidate_stub)):
-    print(row)
+    p95 = sorted(lat)[min(len(lat) - 1, int(0.95 * len(lat)))]
+    return {"model": name, "accuracy": correct / len(EVAL), "valid_json": valid / len(EVAL), "p95_ms": round(p95, 3)}
+print(evaluate("rules-baseline", baseline))  # accuracy 1.0, valid_json 1.0
+print(evaluate("slm-stub", candidate_stub))  # accuracy 0.125, valid_json 0.125
 ```
 
 The rules baseline scores accuracy 1.0 and the stub 0.125 with valid JSON 0.125. Read both results

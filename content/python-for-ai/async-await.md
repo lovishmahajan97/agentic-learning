@@ -330,26 +330,24 @@ async def crm(customer: str) -> str:
 
 TOOLS = {"search": search, "weather": weather, "crm": crm}
 
-async def run_one(call: dict[str, str], sem: asyncio.Semaphore, budget_s: float) -> dict[str, object]:
-    async with sem:
+async def run_one(call: dict[str, str], sem: asyncio.Semaphore) -> dict[str, object]:
+    async with sem:                                   # cap on tools in flight
         try:
-            async with asyncio.timeout(budget_s):
+            async with asyncio.timeout(2.0):          # per-tool budget
                 out = await TOOLS[call["name"]](call["arg"])
             return {"tool_use_id": call["id"], "content": out}
         except TimeoutError:
             return {"tool_use_id": call["id"], "content": f"{call['name']} timed out", "is_error": True}
 
-async def run_tool_calls(calls: list[dict[str, str]], max_parallel: int = 4) -> list[dict[str, object]]:
-    sem = asyncio.Semaphore(max_parallel)
-    return await asyncio.gather(*(run_one(c, sem, budget_s=2.0) for c in calls))  # keeps call order
+async def run_tool_calls(calls: list[dict[str, str]]) -> list[dict[str, object]]:
+    sem = asyncio.Semaphore(4)
+    return await asyncio.gather(*(run_one(c, sem) for c in calls))  # keeps call order
 
 calls = [{"id": "t1", "name": "search", "arg": "refund policy"},
-         {"id": "t2", "name": "weather", "arg": "Oslo"},
-         {"id": "t3", "name": "crm", "arg": "acme"}]
+         {"id": "t2", "name": "weather", "arg": "Oslo"}, {"id": "t3", "name": "crm", "arg": "acme"}]
 t0 = time.perf_counter()
-for r in asyncio.run(run_tool_calls(calls)):
-    print(r)
-print(f"{time.perf_counter() - t0:.1f}s")   # about 2.0s: bounded by the timeout, not 0.8 + 0.5 + 5.0
+print(asyncio.run(run_tool_calls(calls))[2])  # {'tool_use_id': 't3', 'content': 'crm timed out', ...}
+print(f"{time.perf_counter() - t0:.1f}s")     # 2.0s: bounded by the timeout, not 0.8 + 0.5 + 5.0
 ```
 
 | Execution of this turn | Step latency (simulated) | Notes |
@@ -361,58 +359,12 @@ print(f"{time.perf_counter() - t0:.1f}s")   # about 2.0s: bounded by the timeout
 
 - **Only parallelise independent calls.** If one tool's output feeds another's input, or two tools write
   the same record, run them in order.
-
-### Capped fan-out, per-call timeout and a token stream
-Twenty simulated model calls with a concurrency cap of five, a per-call timeout, references kept to every
-task, and an async generator standing in for a token stream. `asyncio.sleep` plays the role of network
-latency.
-
-```python
-import asyncio, random, time
-
-MAX_INFLIGHT = 5
-in_flight = peak = 0
-
-async def llm_call(prompt: str, sem: asyncio.Semaphore) -> str:
-    global in_flight, peak
-    async with sem:                                    # at most MAX_INFLIGHT past this line
-        in_flight += 1; peak = max(peak, in_flight)    # safe: no await between these two lines
-        try:
-            async with asyncio.timeout(2.0):           # per-call budget; raises TimeoutError
-                await asyncio.sleep(random.uniform(0.2, 0.6))   # stands in for the network wait
-            return f"answer to {prompt!r}"
-        finally:
-            in_flight -= 1
-
-async def fan_out(prompts: list[str]) -> list[str | BaseException]:
-    sem = asyncio.Semaphore(MAX_INFLIGHT)
-    tasks = [asyncio.create_task(llm_call(p, sem)) for p in prompts]   # keep references
-    return await asyncio.gather(*tasks, return_exceptions=True)
-
-async def stream_tokens(text: str):
-    for tok in text.split():
-        await asyncio.sleep(0.02)                      # a real client awaits each chunk here
-        yield tok
-
-async def main() -> None:
-    t0 = time.perf_counter()
-    results = await fan_out([f"q{i}" for i in range(20)])
-    print(f"{len(results)} results in {time.perf_counter() - t0:.2f}s, peak in-flight={peak}")
-    # roughly: 20 results in ~1.7-1.9s, peak in-flight=5  (sequential ~8s)
-    async for tok in stream_tokens("tokens arrive as the model produces them"):
-        print(tok, end=" ", flush=True)
-    print()
-
-asyncio.run(main())
-```
-
 - **Break it on purpose:** replace `await asyncio.sleep(...)` with `time.sleep(...)` and the run takes the
-  full sequential time with `peak in-flight=1`: the blocking call never yields, so no other coroutine can
-  start.
+  full sequential time: the blocking call never yields, so no other coroutine can start.
 
-### Worked numbers: the same 20 calls under different settings
-Each call waits 0.2 to 0.6 s (mean 0.4 s), measured with the fan-out above. Times are random, so
-expect run-to-run spread of a few tenths of a second.
+### Worked numbers: 20 calls under different caps
+Twenty simulated model calls, each waiting 0.2 to 0.6 s (mean 0.4 s), fanned out with `gather` under a
+semaphore as above. Times are random, so expect run-to-run spread of a few tenths of a second.
 
 | Setting | Wall time (approx.) | Peak in flight | Why |
 |---|---|---|---|
@@ -433,25 +385,18 @@ import asyncio
 budget = 10            # quota left, in arbitrary token units
 COST = 4
 
-async def model_call() -> None:
-    await asyncio.sleep(0.1)          # stands in for the provider round trip
-
 async def spend_racy() -> None:
     global budget
     if budget >= COST:                # every task passes the check...
-        await model_call()            # ...because all of them suspend here first
+        await asyncio.sleep(0.1)      # ...because all of them suspend at the provider call
         budget -= COST
 
 async def spend_safe() -> None:
     global budget
     if budget < COST:                 # check and reserve with no await in between
         return
-    budget -= COST
-    try:
-        await model_call()
-    except Exception:
-        budget += COST                # refund if the call failed
-        raise
+    budget -= COST                    # refund it in an except block if the call fails
+    await asyncio.sleep(0.1)
 
 async def main() -> None:
     global budget

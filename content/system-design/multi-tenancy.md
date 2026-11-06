@@ -225,8 +225,9 @@ flowchart TD
 ## Examples
 ### FastAPI slice: tenant from the token, carried to every layer
 - **What it shows:** the tenant is resolved from a verified token and stored in a context variable, so
-  deeper layers and `asyncio` tasks inherit it. Retrieval, configuration and token metering are scoped by
-  it; nothing downstream takes `tenant_id` from user input.
+  deeper layers and `asyncio` tasks inherit it. Retrieval, caching and token metering are scoped by it;
+  nothing downstream takes `tenant_id` from user input. `vector_store`, `llm`, `meter` and `queue` are
+  your application's own clients.
 - **The detail that matters:** the dependency is `async def`. FastAPI runs a plain `def` dependency in a
   worker thread with a *copy* of the context, so a `ContextVar.set` made there is silently discarded
   before the endpoint runs.
@@ -240,64 +241,23 @@ tenant_ctx: ContextVar[str] = ContextVar("tenant_id")
 app = FastAPI()
 
 async def current_tenant(authorization: str = Header(...)) -> str:
-    token = authorization.removeprefix("Bearer ")
-    claims = jwt.decode(token, PUBLIC_KEY, algorithms=["RS256"], audience="assistant-api")
-    tenant_id = claims["tenant_id"]           # minted by the IdP, never read from the body
-    tenant_ctx.set(tenant_id)                 # async dep: same context as the endpoint and its tasks
-    return tenant_id                          # (a sync `def` dep would set it in a thread's copy)
+    claims = jwt.decode(authorization.removeprefix("Bearer "), PUBLIC_KEY,
+                        algorithms=["RS256"], audience="assistant-api")
+    tenant_ctx.set(claims["tenant_id"])       # async dep: same context as the endpoint
+    return claims["tenant_id"]                # minted by the IdP, never read from the body
 
 @app.post("/v1/chat")
 async def chat(req: ChatRequest, tenant_id: str = Depends(current_tenant)):
-    cfg = await tenant_config.load(tenant_id)              # model, prompt version, quotas, region
-    await quotas.check(tenant_id, cfg)                     # fail fast before spending tokens
     passages = await vector_store.search(
-        req.message, top_k=8, filter={"tenant_id": tenant_id}   # enforced in the index, not after
-    )
-    result = await llm.complete(
-        model=cfg.model, system=cfg.system_prompt, context=passages, user=req.message,
-        cache_key=f"{tenant_id}:{cfg.prompt_version}",          # cache never crosses tenants
-    )
-    await meter.record(tenant_id, model=cfg.model,
-                       input_tokens=result.usage.input_tokens,
-                       output_tokens=result.usage.output_tokens)
+        req.message, top_k=8, filter={"tenant_id": tenant_id})   # enforced in the index
+    result = await llm.complete(context=passages, user=req.message,
+                                cache_key=f"{tenant_id}:v3")       # cache never crosses tenants
+    await meter.record(tenant_id, usage=result.usage)             # token spend per tenant
     return {"answer": result.text}
 
-# Work handed to a queue must carry the tenant explicitly: context does not cross processes.
-async def enqueue_ingestion(doc_id: str):
-    await queue.send({"tenant_id": tenant_ctx.get(), "doc_id": doc_id})
-```
-
-### Background agent run: tenant in the job, not in the model's arguments
-A queued run rebuilds its tenant scope from the message, then every step uses it: tools get the tenant's
-own connector token, memory is namespaced, and the step and token budget come from tenant config.
-`vault`, `memory`, `meter` and `llm` are your application's own clients.
-
-```python
-async def run_agent_job(msg: dict):
-    tenant_id, run_id = msg["tenant_id"], msg["run_id"]     # set by the API from the verified token
-    if not tenant_id:
-        raise RuntimeError("no tenant: refuse to run")        # fail closed
-    cfg = await tenant_config.load(tenant_id)
-    mem = memory.namespace(f"{tenant_id}:{msg['user_id']}")   # memory never shared across tenants
-    messages = [{"role": "system", "content": cfg.system_prompt},
-                *await mem.recall(msg["task"]),
-                {"role": "user", "content": msg["task"]}]
-    for step in range(cfg.max_steps):
-        await quotas.check_tokens(tenant_id)                   # stop a runaway run mid-loop
-        reply = await llm.complete(model=cfg.model, messages=messages,
-                                   tools=[t for t in TOOLS if t.name in cfg.enabled_tools])
-        await meter.record(tenant_id, run_id=run_id, model=cfg.model,
-                           input_tokens=reply.usage.input_tokens,
-                           output_tokens=reply.usage.output_tokens)
-        messages.append(reply.message)                         # assistant turn incl. tool calls
-        if not reply.tool_calls:
-            await mem.save(msg["task"], reply.text)
-            return reply.text
-        for call in reply.tool_calls:
-            token = await vault.get(tenant_id, connector=call.name)   # this tenant's OAuth token only
-            out = await TOOLS_BY_NAME[call.name].run(call.args, token=token, tenant_id=tenant_id)
-            messages.append({"role": "tool", "tool_call_id": call.id, "content": out})
-    return "stopped: step budget reached"
+# Context does not cross processes: queued work carries the tenant explicitly.
+async def enqueue_agent_run(task: str):
+    await queue.send({"tenant_id": tenant_ctx.get(), "task": task})
 ```
 
 ### Runnable: a per-tenant fair queue for ingestion and agent runs
@@ -308,17 +268,16 @@ waits at most one turn per active tenant, not behind 1,000 queued chunks or agen
 from collections import deque, defaultdict
 
 class FairQueue:
-    """Round-robin across tenants so one tenant's backlog cannot starve the rest."""
     def __init__(self):
         self.queues = defaultdict(deque)   # tenant_id -> pending jobs
         self.turns = deque()               # tenants with pending work, in turn order
 
-    def put(self, tenant_id: str, job: str) -> None:
+    def put(self, tenant_id, job):
         if not self.queues[tenant_id]:
             self.turns.append(tenant_id)   # tenant joins the rotation
         self.queues[tenant_id].append(job)
 
-    def get(self) -> tuple[str, str]:
+    def get(self):
         tenant_id = self.turns.popleft()
         job = self.queues[tenant_id].popleft()
         if self.queues[tenant_id]:
@@ -384,6 +343,10 @@ not a code change.
 - **Per-tenant data keys for deletion.** Use when offboarding must reach backups. Encrypt each tenant's
   data with its own key held in a KMS, record the key ID in the tenant directory, and delete the key at
   offboarding. Monitor time from offboarding request to verified deletion across all stores.
+- **Queued agent runs rebuild tenant scope from the message.** A background run reads the tenant from the
+  job (set by the API from the verified token), fails closed when it is missing, loads model, enabled
+  tools and step budget from tenant config, namespaces memory as `tenant:user`, fetches only that
+  tenant's connector token per tool call, and checks the tenant's token quota inside every loop step.
 
 ## Trade-offs
 - **Pooling: utilisation vs software-only isolation.** It maximises utilisation and minimises operations,

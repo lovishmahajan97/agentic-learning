@@ -232,37 +232,29 @@ TOOL_SCOPES = {"search_docs": {"docs:read"}, "create_ticket": {"tickets:write"},
 TIER = {"search_docs": "auto", "create_ticket": "log", "refund_payment": "approve", "drop_table": "deny"}
 
 def fingerprint(call):                       # canonical bytes -> same args always hash the same
-    return hashlib.sha256(json.dumps(call, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(call, sort_keys=True).encode()).hexdigest()
 
 def tier_for(call):
-    t = TIER.get(call["name"], "approve")    # unknown tools default to the safe side
     if call["name"] == "refund_payment" and call["args"].get("amount", 0) <= 50:
-        t = "log"                            # argument-level refinement
-    return t
+        return "log"                         # argument-level refinement
+    return TIER.get(call["name"], "approve") # unknown tools default to the safe side
 
 def gate(run, call, approvals):
     need = TOOL_SCOPES.get(call["name"], {"__unknown__"})
     if not (need <= run.user_scopes and need <= run.agent_scopes):
         return ("deny", "outside effective authority (user ∩ agent)")
     tier = tier_for(call)
-    if tier == "deny":
-        return ("deny", "action never permitted from an agent")
-    if tier in ("auto", "log"):
-        return ("allow", tier)
+    if tier != "approve":
+        return ("deny", "never from an agent") if tier == "deny" else ("allow", tier)
     fp = fingerprint(call)
     rec = approvals.get(run.id, fp)          # keyed by run AND fingerprint, ignores consumed records
-    live = rec is not None and rec["expires_at"] > time.time()
-    if rec and rec["decision"] == "rejected":
-        return ("deny", f"rejected by {rec['approver']}")
-    if live and rec["decision"] == "approved":
+    if rec and rec["decision"] == "rejected": return ("deny", f"rejected by {rec['approver']}")
+    if rec and rec["expires_at"] > time.time() and rec["decision"] == "approved":
         approvals.consume(rec)               # single use: an identical second call asks again
         return ("allow", f"approved by {rec['approver']}")
-    if live and rec["decision"] == "pending":
-        return ("wait", fp)                  # already asked; do not spam approvers with duplicates
-    approvals.create(run.id, fp, call, ttl_s=4 * 3600)   # new or expired: park the run, a human decides
-    return ("wait", fp)
-# run.user_scopes is re-read from the identity provider when a parked run resumes, so the first check
-# above is also the re-authorization; a cached copy from run start would let a revoked user's run finish.
+    if not rec or rec["expires_at"] <= time.time():
+        approvals.create(run.id, fp, ttl_s=4 * 3600)   # new or expired: park the run, a human decides
+    return ("wait", fp)                      # pending: do not spam approvers with duplicates
 ```
 
 ### Worked trace: three refunds in one support run
@@ -283,29 +275,24 @@ from types import SimpleNamespace
 
 class Approvals:                             # in-memory stand-in for the approvals table
     def __init__(self): self.rows = []
-    def create(self, run_id, fp, call, ttl_s):
-        self.rows.append({"run": run_id, "fp": fp, "call": call, "decision": "pending",
-                          "approver": None, "expires_at": time.time() + ttl_s, "consumed": False})
+    def create(self, run_id, fp, ttl_s):
+        self.rows.append({"run": run_id, "fp": fp, "decision": "pending", "approver": None,
+                          "expires_at": time.time() + ttl_s, "consumed": False})
     def get(self, run_id, fp):
         live = [r for r in self.rows if r["run"] == run_id and r["fp"] == fp and not r["consumed"]]
         return live[-1] if live else None
     def consume(self, rec): rec["consumed"] = True
-    def decide(self, run_id, fp, decision, approver):     # what the approvals inbox calls
-        rec = self.get(run_id, fp); rec["decision"], rec["approver"] = decision, approver
 
-run = SimpleNamespace(id="run_7", user_scopes={"payments:refund", "docs:read"},
-                      agent_scopes={"payments:refund", "docs:read", "tickets:write"})
+run = SimpleNamespace(id="run_7", user_scopes={"payments:refund"},
+                      agent_scopes={"payments:refund", "tickets:write"})
 ap = Approvals()
-small = {"name": "refund_payment", "args": {"order": 812, "amount": 30}}
 big = {"name": "refund_payment", "args": {"order": 812, "amount": 400}}
-print(gate(run, small, ap))                              # ('allow', 'log')
-effect, fp = gate(run, big, ap); print(effect)           # wait
-ap.decide("run_7", fp, "approved", "maya")
+print(gate(run, {"name": "refund_payment", "args": {"amount": 30}}, ap))  # ('allow', 'log')
+effect, fp = gate(run, big, ap); print(effect)                          # wait
+ap.get("run_7", fp).update(decision="approved", approver="maya")         # the approvals inbox
 print(gate(run, big, ap))                                # ('allow', 'approved by maya')
 print(gate(run, big, ap)[0])                             # wait: approval was consumed
-swapped = {"name": "refund_payment", "args": {"order": 812, "amount": 4000}}
-print(gate(run, swapped, ap)[1] == fp)                   # False: different fingerprint
-print(gate(run, {"name": "create_ticket", "args": {}}, ap))  # deny: user lacks tickets:write
+print(gate(run, {"name": "create_ticket", "args": {}}, ap))  # ('deny', ...): user lacks tickets:write
 ```
 
 ## Production patterns
@@ -326,6 +313,8 @@ print(gate(run, {"name": "create_ticket", "args": {}}, ap))  # deny: user lacks 
 - **Fatigue dashboard** — once the gate is live. Chart approval rate, reject rate and median time-to-approve
   per tool; a reject rate near zero means re-tier the tool, and time-to-approve sets the TTL. Monitor
   expired approvals as a share of requests.
+- **Re-authorize on resume** — when a parked run wakes up. Re-read the user's scopes from the identity
+  provider before the gate runs, never a copy cached at run start, or a revoked user's run still finishes.
 
 ## Trade-offs
 - **Intersected scopes vs simple service identity.** You gain least privilege and clean audit attribution,

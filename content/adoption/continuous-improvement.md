@@ -218,33 +218,22 @@ from collections import Counter
 
 # Minimal run summaries from the tracing store: tool calls in order, plus the run outcome.
 runs = [
-    {"id": "r1", "calls": [("search_orders", "ok"), ("issue_refund", "ok")], "outcome": "done"},
-    {"id": "r2", "calls": [("search_orders", "ok")] * 6, "outcome": "max_steps"},
-    {"id": "r3", "calls": [("issue_refund", "error:bad_account_id")], "outcome": "taken_over"},
-    {"id": "r4", "calls": [], "outcome": "answered_without_tools"},
-    {"id": "r5", "calls": [("search_orders", "ok")] * 3, "outcome": "max_steps"},
+    {"id": "r1", "calls": ["search_orders", "issue_refund"], "outcome": "done"},
+    {"id": "r2", "calls": ["search_orders"] * 6, "outcome": "max_steps"},
+    {"id": "r3", "calls": [], "outcome": "answered_without_tools"},
 ]
 
 def bucket(run):
-    names = [name for name, _ in run["calls"]]
-    if any(status.startswith("error:bad_") for _, status in run["calls"]):   # not timeouts
-        return "tool called with bad arguments"
-    if run["outcome"] == "max_steps" and len(names) >= 3 and len(set(names[-3:])) == 1:
+    calls = run["calls"]
+    if run["outcome"] == "max_steps" and len(set(calls[-3:])) == 1:
         return "loop: same tool repeated"
     if run["outcome"] == "answered_without_tools":
         return "skipped required lookup"
     return "ok"
 
-counts = Counter(bucket(r) for r in runs)
-for name, n in counts.most_common():
-    print(f"{name:32} {n}")
-regression_cases = [r["id"] for r in runs if bucket(r) != "ok"]
-print(regression_cases)
-# loop: same tool repeated         2
-# ok                               1
-# tool called with bad arguments   1
-# skipped required lookup          1
-# ['r2', 'r3', 'r4', 'r5']
+print(Counter(bucket(r) for r in runs))
+# Counter({'ok': 1, 'loop: same tool repeated': 1, 'skipped required lookup': 1})
+print([r["id"] for r in runs if bucket(r) != "ok"])   # ['r2', 'r3'] -> regression cases
 ```
 
 | Week | Loop bucket per 1,000 runs | What happened |
@@ -255,51 +244,34 @@ print(regression_cases)
 
 The rates are illustrative; the point is the unit, failures per 1,000 runs, not raw counts.
 
-### Weekly triage and release gate in Python
-Bucket counts come from classified production feedback. The ranking applies the severity override, and
-the gate compares per-slice pass rates on the same frozen regression suite.
+### Weekly triage ranking in Python
+Bucket counts come from classified production feedback. The ranking applies the severity override.
 
 ```python
-from dataclasses import dataclass
-
-@dataclass
-class Bucket:
-    name: str
-    weekly_count: int        # classified production failures this week
-    severity: int            # 1 cosmetic, 3 wrong answer, 5 harmful / non-compliant
-    effort_days: float
-    layer: str               # prompt | retrieval | tool | guardrail | model
-
-def rank_key(b: Bucket):
-    # Severity-5 items jump the queue; the rest are ranked by count x severity / effort.
-    return (b.severity >= 5, b.weekly_count * b.severity / b.effort_days)
-
+# (name, weekly_count, severity 1-5, effort_days)
 buckets = [
-    Bucket("wrong date format", 300, 1, 0.5, "prompt"),           # score 600
-    Bucket("cites superseded policy", 140, 3, 3.0, "retrieval"),  # score 140
-    Bucket("replies in English to French users", 60, 2, 1.0, "prompt"),  # 120
-    Bucket("promises refund outside policy", 12, 5, 2.0, "guardrail"),   # 30, but severity 5
+    ("wrong date format", 300, 1, 0.5),              # score 600
+    ("cites superseded policy", 140, 3, 3.0),        # score 140
+    ("promises refund outside policy", 12, 5, 2.0),  # score 30, but severity 5
 ]
+
+def rank_key(b):
+    name, count, severity, effort = b
+    # Severity-5 items jump the queue; the rest are ranked by count x severity / effort.
+    return (severity >= 5, count * severity / effort)
+
 for b in sorted(buckets, key=rank_key, reverse=True):
-    print(f"{b.name:38} layer={b.layer}")
-
-def release_ok(base: dict, cand: dict, target: str, tol: float = 0.02) -> bool:
-    """Pass rates per slice on the same frozen suite; tol should reflect slice sample size."""
-    improved = cand[target] > base[target]
-    no_regression = all(cand[s] >= base[s] - tol for s in base)
-    return improved and no_regression
-
-base = {"refunds": 0.81, "billing": 0.93, "french": 0.88, "shipping": 0.95}
-cand = {"refunds": 0.97, "billing": 0.94, "french": 0.84, "shipping": 0.95}
-print(release_ok(base, cand, "refunds"))   # False: french fell 4 points, beyond tolerance
+    print(b[0])
+# promises refund outside policy
+# wrong date format
+# cites superseded policy
 ```
 
-- **The refund guardrail goes first** despite the lowest score.
-- **The candidate fixes refunds but is blocked,** because the fix cost the French slice four points. That
-  is exactly the regression reactive patching would have shipped.
+The refund guardrail goes first despite the lowest score.
 
 ### Worked scenario: is the French drop real?
-Illustrative numbers for the blocked release above.
+Illustrative numbers. A candidate lifts the refunds slice from 0.81 to 0.97 on the frozen suite, but the
+French slice falls from 0.88 to 0.84.
 
 | Question | Answer |
 |---|---|
@@ -309,31 +281,26 @@ Illustrative numbers for the blocked release above.
 | Same four points on a 25-case slice | one case: rerun or grow the slice, do not trust a fixed 2-point tolerance |
 | Root cause from a flipped case's trace | the new refund instruction ("always state the policy in English legal terms") overrode the language rule |
 
+That is exactly the regression reactive patching would have shipped.
+
 ### A paired gate that handles few flips
-The fixed tolerance above is a simplification. This gate uses the flips directly and the exact binomial
-test, which stays valid when flips are few.
+This gate uses the flips directly and the exact binomial test, which stays valid when flips are few.
 
 ```python
 from math import comb
 
-def mcnemar(b, c):
+def slice_gate(b, c, alpha=0.05):
     """b = pass->fail flips, c = fail->pass flips, same cases, baseline vs candidate."""
     n = b + c
     if n == 0:
-        return 0.0, 1.0
-    chi2 = (b - c) ** 2 / n
+        return "pass", 1.0
     k = min(b, c)                                   # exact two-sided binomial test
-    p_exact = min(1.0, 2 * sum(comb(n, i) for i in range(k + 1)) / 2 ** n)
-    return chi2, p_exact
+    p = min(1.0, 2 * sum(comb(n, i) for i in range(k + 1)) / 2 ** n)
+    return ("block" if b > c and p < alpha else "pass"), round(p, 3)
 
-def slice_gate(b, c, alpha=0.05):
-    chi2, p = mcnemar(b, c)
-    regressed = b > c and p < alpha
-    return ("block" if regressed else "pass"), round(chi2, 2), round(p, 3)
-
-print(slice_gate(13, 3))    # ('block', 6.25, 0.021)  french slice, 250 cases
-print(slice_gate(2, 1))     # ('pass', 0.33, 1.0)     one net case
-print(slice_gate(4, 0))     # ('pass', 4.0, 0.125)    chi-square says block, exact test says not proven
+print(slice_gate(13, 3))    # ('block', 0.021)  french slice, 250 cases
+print(slice_gate(2, 1))     # ('pass', 1.0)     one net case
+print(slice_gate(4, 0))     # ('pass', 0.125)   chi-square (4.0) says block, exact test says not proven
 ```
 
 ## Production patterns
@@ -356,6 +323,8 @@ print(slice_gate(4, 0))     # ('pass', 4.0, 0.125)    chi-square says block, exa
 - **Random-sample review alongside reported failures** — review a fixed number of random conversations
   each week to catch failures users never report. Monitor the share of buckets discovered only by the
   sample.
+- **Bad-argument tool errors are their own bucket** — classify `error:bad_*` tool responses (wrong account
+  id, malformed field) separately from timeouts, because the fix is the tool schema, not a retry.
 
 ## Trade-offs
 - **Fast release train vs attribution.** It shortens time-to-fix but makes attribution harder; batch fewer

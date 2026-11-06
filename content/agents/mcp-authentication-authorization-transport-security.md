@@ -214,9 +214,8 @@ sequenceDiagram
 ## Examples
 ### Resource-server middleware in front of a Streamable HTTP endpoint
 A Starlette-style HTTP middleware sketch (register with `@app.middleware("http")` in FastAPI or
-Starlette, PyJWT for tokens). It rejects bad origins, validates signature, issuer and audience, enforces
-a per-method scope, and attaches the authenticated subject so tool handlers never trust a model-supplied
-user ID.
+Starlette, PyJWT for tokens). It validates signature, issuer and audience, enforces a per-method scope,
+and attaches the authenticated subject so tool handlers never trust a model-supplied user ID.
 
 ```python
 import jwt
@@ -224,43 +223,32 @@ from starlette.responses import JSONResponse
 
 ISSUER = "https://auth.example.com"
 AUDIENCE = "https://mcp.example.com/mcp"          # canonical server URI = RFC 8707 resource
-ALLOWED_ORIGINS = {"https://app.example.com"}
 JWKS = jwt.PyJWKClient(f"{ISSUER}/.well-known/jwks.json")
 SCOPE_FOR = {"tools/list": "tools:read", "tools/call": "tools:write"}
-
-def unauthorized(detail: str):
-    meta = "https://mcp.example.com/.well-known/oauth-protected-resource"
-    return JSONResponse({"error": detail}, status_code=401,
-                        headers={"WWW-Authenticate": f'Bearer resource_metadata="{meta}"'})
+META = "https://mcp.example.com/.well-known/oauth-protected-resource"
 
 async def mcp_auth(request, call_next):
-    origin = request.headers.get("origin")
-    if origin and origin not in ALLOWED_ORIGINS:          # DNS-rebinding guard
-        return JSONResponse({"error": "bad origin"}, status_code=403)
-    header = request.headers.get("authorization", "")
-    if not header.startswith("Bearer "):
-        return unauthorized("missing token")
-    token = header[len("Bearer "):]
+    token = request.headers.get("authorization", "").removeprefix("Bearer ")
     try:
         key = JWKS.get_signing_key_from_jwt(token).key
         claims = jwt.decode(token, key, algorithms=["RS256"],
                             audience=AUDIENCE, issuer=ISSUER)   # audience check is mandatory
-    except jwt.PyJWTError as exc:
-        return unauthorized(f"invalid token: {exc}")
+    except jwt.PyJWTError as exc:                          # missing, expired, wrong audience
+        return JSONResponse({"error": f"invalid token: {exc}"}, status_code=401,
+                            headers={"WWW-Authenticate": f'Bearer resource_metadata="{META}"'})
     if request.method == "POST":                           # GET opens an SSE stream, no body
         body = await request.json()
-        if not isinstance(body, dict):                     # a batch array would skip the check
+        if not isinstance(body, dict):                     # a batch array would skip the scope check
             return JSONResponse({"error": "batch not supported"}, status_code=400)
         needed = SCOPE_FOR.get(body.get("method"))
         if needed and needed not in claims.get("scope", "").split():
             return JSONResponse({"error": "insufficient_scope"}, status_code=403,
                 headers={"WWW-Authenticate": f'Bearer error="insufficient_scope", scope="{needed}"'})
     request.state.subject = claims["sub"]                  # tool handlers read this, not an argument
-    request.state.tenant = claims.get("tenant")
     return await call_next(request)
 ```
 
-- **Tested:** against PyJWT 2.15 and Starlette 0.49 (`BaseHTTPMiddleware`, `TestClient`) with a stubbed
+- **Tested:** against PyJWT 2.15 and Starlette 1.10 (`BaseHTTPMiddleware`, `TestClient`) with a stubbed
   JWKS: no token, wrong audience and expired tokens get 401, a read-only token on `tools/call` gets 403.
 - **Fail closed:** without the `isinstance` guard a batch (JSON array) skips the scope check; 2025-06-18
   dropped batching, so reject it.
@@ -323,6 +311,9 @@ A user holds tokens for two servers: a low-risk `docs` server and a sensitive `b
 - **Carry the subject into agent traces.** Attach subject, tenant and MCP server name to each tool-call
   span (LangSmith, or OpenTelemetry), so every write in a run names a person. Monitor spans missing a
   subject.
+- **Check `Origin` before the token.** In the same middleware, return `403` for any `Origin` header not
+  in an exact allowlist (the DNS-rebinding guard), and attach the token's tenant next to the subject for
+  tool handlers. Monitor 403s by origin.
 
 ## Trade-offs
 - **Per-user identity vs login ceremony.** OAuth 2.1 with discovery gives per-user identity, consent and

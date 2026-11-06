@@ -375,54 +375,45 @@ flowchart TD
 - **Model identifiers are configuration, not code,** and the two libraries spell them differently:
   Pydantic AI uses `provider:model`, DSPy passes LiteLLM's `provider/model`.
 - **Versions:** parameter names follow Pydantic AI 1.0 and later (`output_type`, `result.output`; older
-  releases used `result_type` and `result.data`) and DSPy 2.5+. Ran on pydantic-ai-slim 2.60.0
-  (`FunctionModel`), DSPy 3.4.1 (`DummyLM`) and LangGraph 1.2.16.
+  releases used `result_type` and `result.data`) and DSPy 2.5+. Ran offline on pydantic-ai-slim 2.66.0
+  (`TestModel`), DSPy 3.4.1 (`DummyLM`) and LangGraph 1.2.20.
+- **Next step for DSPy:** with ~50 labelled tickets and a metric, an optimizer such as `dspy.MIPROv2`
+  rewrites the prompt and picks demonstrations (`.compile(triage, trainset=examples)`).
 
 ```python
 import os
 from typing import Literal
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, RunContext
+import dspy
 
 class Triage(BaseModel):
     category: Literal["billing", "bug", "feature"]   # anything else fails validation
     priority: int = Field(ge=1, le=4)                 # 1 (urgent) to 4
-    reason: str
 
-agent = Agent(os.environ["PYDANTIC_AI_MODEL"],        # "provider:model", e.g. "openai:<model>"
-              deps_type=dict, output_type=Triage,
-              system_prompt="Triage support tickets using the account data available through tools.")
+agent = Agent(os.environ["PYDANTIC_AI_MODEL"], deps_type=dict, output_type=Triage)  # "provider:model"
 
 @agent.tool
 def account_plan(ctx: RunContext[dict], account_id: str) -> str:
-    return ctx.deps["plans"][account_id]          # dependencies are injected, not global
+    return ctx.deps["plans"][account_id]              # dependencies are injected, not global
 
-result = agent.run_sync("Account 42: I was charged twice this month",
-                        deps={"plans": {"42": "enterprise"}})
-print(result.output)       # a validated Triage; a malformed answer triggers a retry with the error shown
+result = agent.run_sync("Account 42: charged twice", deps={"plans": {"42": "enterprise"}})
+print(result.output)   # category='billing' priority=2; an invalid answer is retried with the error
 
-# ---- DSPy: declare the task, compile the prompt ----
-import dspy
-dspy.configure(lm=dspy.LM(os.environ["DSPY_MODEL"]))  # LiteLLM form, "provider/model": not the same string
-
+# DSPy: declare the task; the prompt is compiled, not written
+dspy.configure(lm=dspy.LM(os.environ["DSPY_MODEL"]))  # LiteLLM form "provider/model": a different string
 class TriageSig(dspy.Signature):
     """Classify a support ticket and assign a priority."""
     ticket: str = dspy.InputField()
     category: str = dspy.OutputField(desc="one of billing, bug, feature")
     priority: int = dspy.OutputField(desc="1 (urgent) to 4")
 
-triage = dspy.ChainOfThought(TriageSig)
-print(triage(ticket="I was charged twice this month"))
-
-# With ~50 labelled tickets and a metric, an optimizer rewrites the prompt and picks demonstrations:
-# optimized = dspy.MIPROv2(metric=lambda ex, pred, trace=None: ex.category == pred.category) \
-#                 .compile(triage, trainset=examples)
+print(dspy.ChainOfThought(TriageSig)(ticket="I was charged twice"))  # Prediction(reasoning=..., category='billing', priority=2)
 ```
 
 ### LangGraph: pause for a person, resume from a checkpoint
 The part neither of those addresses.
-1. **First `invoke`** runs `draft`, reaches the interrupt and returns with the state saved under the
-   thread id.
+1. **First `invoke`** reaches the interrupt and returns with the state saved under the thread id.
 2. **Second `invoke`,** possibly days later in another process sharing the same checkpoint store, re-runs
    `legal_approval` from its top with the human's answer.
 
@@ -434,60 +425,21 @@ from langgraph.types import interrupt, Command
 
 class Review(TypedDict, total=False):
     doc: str
-    verdict: str
     approved: bool
 
-def draft(state: Review) -> dict:
-    return {"verdict": f"flag clause 7 of {state['doc']}"}   # a model call in practice
-
 def legal_approval(state: Review) -> dict:
-    answer = interrupt({"verdict": state["verdict"]})        # pause; nothing above this may have side effects
+    answer = interrupt({"doc": state["doc"]})   # pause; nothing above this may have side effects
     return {"approved": answer == "approve"}
 
 g = StateGraph(Review)
-g.add_node("draft", draft); g.add_node("legal_approval", legal_approval)
-g.add_edge(START, "draft"); g.add_edge("draft", "legal_approval"); g.add_edge("legal_approval", END)
+g.add_node("legal_approval", legal_approval)
+g.add_edge(START, "legal_approval"); g.add_edge("legal_approval", END)
 app = g.compile(checkpointer=InMemorySaver())   # a Postgres or SQLite saver is what survives restarts
 
 cfg = {"configurable": {"thread_id": "review-17"}}
-app.invoke({"doc": "msa.pdf"}, cfg)              # stops at the interrupt
-print(app.invoke(Command(resume="approve"), cfg))   # later: resumes from the checkpoint
+app.invoke({"doc": "msa.pdf"}, cfg)                  # stops at the interrupt, state saved
+print(app.invoke(Command(resume="approve"), cfg))    # {'doc': 'msa.pdf', 'approved': True}
 ```
-
-### The common core without a framework
-Runs as-is with a fake model. This is what every framework wraps; knowing it is how you debug them when
-an abstraction leaks.
-
-```python
-import json
-
-def run_agent(call_model, tools, messages, max_steps=10):
-    """The loop every framework wraps: call, execute tool calls, append results, repeat."""
-    for _ in range(max_steps):
-        reply = call_model(messages, tools=list(tools))          # a provider SDK call in practice
-        messages.append({"role": "assistant", "content": reply.get("content"),
-                         "tool_calls": reply.get("tool_calls", [])})
-        if not reply.get("tool_calls"):
-            return reply["content"]                                # no tool call: final answer
-        for tc in reply["tool_calls"]:                             # results in the order the calls were made
-            fn = tools.get(tc["name"])
-            try:
-                out = fn(**json.loads(tc["arguments"])) if fn else f"unknown tool {tc['name']}"
-            except Exception as e:                                 # errors go back to the model
-                out = f"error: {e}"
-            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": str(out)})
-    raise RuntimeError("step budget exhausted")
-
-def fake_model(messages, tools):                                  # stands in for a real model
-    if messages[-1]["role"] == "user":
-        return {"tool_calls": [{"id": "c1", "name": "account_plan", "arguments": '{"account_id": "42"}'}]}
-    return {"content": f"billing, priority 2 (plan: {messages[-1]['content']})"}
-
-print(run_agent(fake_model, {"account_plan": lambda account_id: {"42": "enterprise"}[account_id]},
-                [{"role": "user", "content": "Account 42: charged twice"}]))
-# billing, priority 2 (plan: enterprise)
-```
-
 ### Worked scenario: choosing a stack for a refund agent
 A support team builds an agent that reads 2,000 policy pages, looks up orders, and issues refunds over
 $100 only after a human approves.
@@ -526,6 +478,9 @@ Four layers, each answering a named need; DSPy waits until there are labels.
 - **A thin adapter around the framework.** When exit cost matters. Keep your tools, state types and
   evals framework-neutral and call the framework through one module, so swapping it touches one place.
   Monitor how many files import the framework directly.
+- **Know the loop every framework wraps.** When an abstraction leaks: call the model, run each tool call,
+  append results in call order, repeat under a step budget (for example 10), and return tool errors to
+  the model as results rather than raising. Monitor steps per run against the budget.
 
 ## Trade-offs
 - **Speed now vs dependency later.** A framework buys the loop, persistence and tool wiring in an

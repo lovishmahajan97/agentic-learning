@@ -206,11 +206,9 @@ flowchart TD
 
 ## Examples
 ### Normalise, split and stream any synthesiser
-The engineering around TTS matters as much as the model: normalise text an LLM produced (markdown,
-currency, acronyms), chunk at sentence boundaries, and stream chunks through any synthesiser.
-- Time-to-first-audio is then bounded by the first sentence, not the whole reply.
-- `synthesize` is any function returning PCM bytes for a string; the timing code is what you would ship
-  as metrics.
+Normalise text an LLM produced (markdown, currency, acronyms), chunk at sentence boundaries, and stream
+chunks through any synthesiser, so time-to-first-audio is bounded by the first sentence, not the whole
+reply. `synthesize` is any function returning PCM bytes for a string.
 
 ```python
 import re, time
@@ -222,26 +220,19 @@ def normalize(text: str) -> str:
                   lambda m: num2words(int(m.group(1).replace(",", ""))) + " dollars"
                   + (f" and {num2words(int(m.group(2)))} cents" if m.group(2) else ""), text)
     text = re.sub(r"\b(\d+)%", lambda m: num2words(int(m.group(1))) + " percent", text)
-    text = text.replace("SLA", "S L A").replace("K8s", "kubernetes")   # per-domain lexicon
-    return text
+    return text.replace("SLA", "S L A").replace("K8s", "kubernetes")   # per-domain lexicon
 
-def sentences(text: str):
-    return [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s]
-
-def stream_speech(reply: str, synthesize, sample_rate=24_000, bytes_per_sample=2):
-    t0, first, audio_s = time.perf_counter(), None, 0.0
-    for s in sentences(reply):
+def stream_speech(reply: str, synthesize):
+    t0 = time.perf_counter()
+    for i, s in enumerate(re.split(r"(?<=[.!?])\s+", reply.strip())):
         pcm = synthesize(normalize(s))                         # any TTS backend: bytes of 16-bit PCM
-        if first is None:
-            first = time.perf_counter() - t0                   # time-to-first-audio
-        audio_s += len(pcm) / (sample_rate * bytes_per_sample)
+        if i == 0:
+            print(f"TTFA={time.perf_counter() - t0:.2f}s")     # time-to-first-audio
         yield pcm                                              # play/send while the next sentence renders
-    rtf = (time.perf_counter() - t0) / max(audio_s, 1e-6)
-    print(f"TTFA={first:.2f}s  audio={audio_s:.1f}s  RTF={rtf:.2f}")
 
 reply = "Your **SLA** credit is $1,250.50. That is 12% of the invoice. K8s nodes are back."
-for chunk in stream_speech(reply, synthesize=lambda s: b"\x00" * 48_000):   # stub: 1 s of silence
-    pass   # in production: write chunk to the WebSocket / audio device
+print(normalize(reply))   # Your S L A credit is one thousand, two hundred and fifty dollars and fifty cents. ...
+chunks = list(stream_speech(reply, synthesize=lambda s: b"\x00" * 48_000))  # stub TTS; prints TTFA=0.00s
 ```
 
 ### Latency budget and codec token calculator
@@ -265,22 +256,19 @@ print(codec_tokens(10), 75 * 8 * 10 / 1000)   # 6000 tokens, 6.0 kbps with 1,024
 
 ### Agent turn with barge-in: cancel speech and generation together
 A sketch of one voice-agent turn in `asyncio`. `llm_stream`, `synthesize` and `play` stand for your
-LLM client, TTS backend and audio sink; the point is the shape: speak clause by clause, and on a VAD
-speech-start event cancel both the speaking task and the LLM stream.
+LLM client, TTS backend and audio sink; speak clause by clause, and on a VAD speech-start event cancel
+both the speaking task and the LLM stream.
 
 ```python
 import asyncio, re
 
-CLAUSE_END = re.compile(r"[.!?,;:]\s")
-
-async def speak_reply(llm_stream, synthesize, play, spoken, min_chars=25):
+async def speak_reply(llm_stream, synthesize, play, spoken):
     buf = ""
     async for token in llm_stream:                 # llm_stream: an async generator of text
         buf += token
-        m = CLAUSE_END.search(buf, min_chars)      # release the first clause early
-        if m:
+        if m := re.compile(r"[.!?,;:]\s").search(buf, 25):   # release a clause once 25+ chars buffered
             clause, buf = buf[:m.end()], buf[m.end():]
-            await play(await synthesize(normalize(clause)))   # normalize() from the example above
+            await play(await synthesize(normalize(clause)))   # normalize() from the first example
             spoken.append(clause)                  # record only clauses that finished playing
     if buf.strip():
         await play(await synthesize(normalize(buf)))
@@ -293,10 +281,7 @@ async def agent_turn(llm_stream, synthesize, play, user_started_speaking: asynci
     done, _ = await asyncio.wait({speaking, barge_in}, return_when=asyncio.FIRST_COMPLETED)
     if barge_in in done:
         speaking.cancel()                          # stop TTS and playback
-        try:
-            await speaking
-        except asyncio.CancelledError:
-            pass
+        await asyncio.gather(speaking, return_exceptions=True)   # let the cancel land
         await llm_stream.aclose()                  # then close the stream so generation stops
         return "interrupted", "".join(spoken)      # store only what the user heard
     barge_in.cancel()
@@ -325,6 +310,8 @@ async def agent_turn(llm_stream, synthesize, play, user_started_speaking: asynci
 - **A spoken-style system prompt.** When: the same agent serves chat and voice. How: a voice-specific
   instruction block (short sentences, no markdown, numbers in words for amounts, summarise tool results)
   plus the normaliser as a safety net. Monitor: share of chunks the normaliser had to rewrite.
+- **Track real-time factor next to TTFA.** RTF is synthesis wall time divided by audio seconds (16-bit
+  PCM bytes / (sample_rate x 2), for example at 24 kHz); it must stay below 1 for streaming to keep up.
 
 ## Trade-offs
 - **Non-autoregressive speed vs codec-LM richness.** Non-autoregressive acoustic models give fast,

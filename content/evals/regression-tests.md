@@ -173,36 +173,30 @@ flowchart TD
 ## Examples
 ### Agent scenario: a trajectory case and its deterministic grader
 A smoke-tier case for a support agent. Tools are stubbed with recorded responses, so the grader checks
-which calls the agent made and the backend state it left, not the wording of its reply.
+which calls the agent made, not the wording of its reply.
 
 ```python
-# evals/cases/refund_outside_window.json (one line of regression.jsonl, pretty-printed here)
+# one line of evals/regression.jsonl, pretty-printed here
 CASE = {
     "id": "refund-outside-window", "tags": ["critical", "INC-412", "slice:refunds"],
     "input": "I bought this 45 days ago, refund please. Order A-1009.",
-    "tool_stubs": {"get_order": {"id": "A-1009", "days_since_purchase": 45, "total": 89.0}},
-    "graders": [
-        {"type": "must_call", "tool": "get_order", "args": {"order_id": "A-1009"}},
-        {"type": "must_not_call", "tool": "issue_refund"},      # policy: 30-day window
-        {"type": "max_steps", "value": 4},
-        {"type": "judge_ref", "question": "Does the reply state the 30-day window?"},
-    ],
+    "tool_stubs": {"get_order": {"id": "A-1009", "days_since_purchase": 45}},
+    "graders": [{"type": "must_call", "tool": "get_order"},
+                {"type": "must_not_call", "tool": "issue_refund"},   # policy: 30-day window
+                {"type": "max_steps", "value": 4}],
 }
 
-def grade_trajectory(trace: list[dict], g: dict) -> bool:
-    calls = [s for s in trace if s["type"] == "tool_call"]
+def grade_trajectory(trace, g):
+    tools = [c["tool"] for c in trace]
     if g["type"] == "must_call":
-        return any(c["tool"] == g["tool"] and all(c["args"].get(k) == v for k, v in g["args"].items())
-                   for c in calls)
+        return g["tool"] in tools
     if g["type"] == "must_not_call":
-        return all(c["tool"] != g["tool"] for c in calls)
-    if g["type"] == "max_steps":
-        return len(calls) <= g["value"]
-    raise ValueError(g["type"])                  # judge graders run in the nightly tier
+        return g["tool"] not in tools
+    return len(tools) <= g["value"]                  # max_steps
 
-trace = [{"type": "tool_call", "tool": "get_order", "args": {"order_id": "A-1009"}},
-         {"type": "tool_call", "tool": "issue_refund", "args": {"order_id": "A-1009"}}]
-print([grade_trajectory(trace, g) for g in CASE["graders"] if g["type"] != "judge_ref"])
+trace = [{"tool": "get_order", "args": {"order_id": "A-1009"}},
+         {"tool": "issue_refund", "args": {"order_id": "A-1009"}}]
+print([grade_trajectory(trace, g) for g in CASE["graders"]])
 # [True, False, True]  -> the forbidden refund call fails the case
 ```
 
@@ -217,66 +211,51 @@ for a refund"), on a 120-case agent suite with *k* = 3:
 | Gate | – | Blocked: the agent now refunds outside the window |
 
 ### pytest suite over a JSONL case file
-Each case runs *k* times, critical cases must pass every time, other cases fail only if they clearly
-got worse than the recorded baseline, and the fixture writes candidate pass rates so a separate step can
-diff them per slice. Checked with pytest 9.1 against a stub `myapp`.
+Each case runs *k* times; critical cases must pass every time, other cases fail only if they dropped
+more than one sample below the same-job baseline. Checked with pytest 9.1 against a stub `myapp`.
 
 ```python
 # tests/test_regression.py  ->  pytest -q tests/test_regression.py
 import json, pathlib, pytest
-from myapp import answer                      # system under test: (input, context, model) -> dict
-from myapp.graders import GRADERS             # {"schema": fn, "contains": fn, "judge_ref": fn, ...}
+from myapp import answer                      # system under test: (input, model) -> output
+from myapp.graders import GRADERS             # {"schema": fn, "contains": fn, ...}
 
 CASES = [json.loads(l) for l in pathlib.Path("evals/regression.jsonl").read_text().splitlines()]
 # {case_id: pass_rate}, written by running the production config in the same CI job just before this
 BASELINE = json.loads(pathlib.Path("evals/baseline_results.json").read_text())
 K = 3                                         # samples per case
 
-@pytest.fixture(scope="session")
-def results():
-    r = {}
-    yield r
-    pathlib.Path("evals/candidate_results.json").write_text(json.dumps(r, indent=1))
-    # a separate step diffs candidate vs baseline per slice and runs McNemar on the flips
-
-def passes(case) -> int:                      # integer count avoids float edge cases like 2/3 < 1 - 1/3
-    n = 0
-    for _ in range(K):
-        out = answer(case["input"], context=case.get("context"), model=case["pinned_model"])
-        n += all(GRADERS[g["type"]](out, g) for g in case["graders"])
-    return n
-
 @pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])
-def test_no_regression(case, results):
-    n = passes(case)
-    results[case["id"]] = n / K
+def test_no_regression(case):
+    n = 0                                     # integer pass count avoids float edge cases like 2/3
+    for _ in range(K):
+        out = answer(case["input"], model=case["pinned_model"])
+        n += all(GRADERS[g["type"]](out, g) for g in case["graders"])
     if "critical" in case["tags"]:
         assert n == K, f"critical case {case['id']} failed {K - n}/{K} runs"
     else:
-        base = round(BASELINE.get(case["id"], 0.0) * K)   # baseline pass count at the same K
-        # tolerate one sample of noise; a drop larger than that is a real per-item regression
+        base = round(BASELINE.get(case["id"], 0.0) * K)    # tolerate one sample of noise
         assert n >= base - 1, f"{case['id']} regressed: {base}/{K} -> {n}/{K}"
 ```
 
 ### The diff step: flip lists and McNemar
-Pure Python, runnable. It treats a case as passing when its pass rate is 1.0, builds both flip lists
-and reports the chi-squared statistic plus the exact binomial p-value for small counts.
+Pure Python, runnable. A case passes when its pass rate is 1.0; McNemar reports the chi-squared
+statistic plus the exact binomial p-value for small counts.
 
 ```python
 from math import comb
 
-def flips(base: dict, cand: dict) -> tuple[list, list]:
-    ok = lambda r: r >= 1.0
-    up = [c for c in cand if c in base and not ok(base[c]) and ok(cand[c])]
-    down = [c for c in cand if c in base and ok(base[c]) and not ok(cand[c])]
+def flips(base, cand):                                       # a case new since base is never a flip
+    up = [c for c in cand if base.get(c, 1.0) < 1.0 <= cand[c]]     # fail -> pass
+    down = [c for c in cand if cand[c] < 1.0 <= base.get(c, 0.0)]   # pass -> fail
     return up, down
 
-def mcnemar(b: int, c: int) -> tuple[float, float]:
+def mcnemar(b, c):
     n = b + c
-    chi2 = (b - c) ** 2 / n if n else 0.0
     exact_p = min(1.0, 2 * sum(comb(n, i) for i in range(min(b, c) + 1)) / 2 ** n)
-    return round(chi2, 2), round(exact_p, 3)
+    return round((b - c) ** 2 / max(n, 1), 2), round(exact_p, 3)   # n = 0: no flips, chi2 0
 
+print(flips({"a": 1.0, "b": 0.67}, {"a": 0.33, "b": 1.0}))   # (['b'], ['a'])
 print(mcnemar(20, 14))   # (1.06, 0.392)  not significant: review the 14 regressions anyway
 print(mcnemar(23, 11))   # (4.24, 0.058)  clears 3.84, but borderline on the exact test
 print(mcnemar(6, 0))     # (6.0, 0.031)   few pairs: trust the exact p-value
@@ -313,6 +292,12 @@ Illustrative numbers. The provider's new snapshot is swapped in; the full tier h
   flakiness rate per grader type.
 - **Published resolution.** Print the minimum detectable effect (from McNemar on the expected number of
   discordant pairs) at the top of each report. Monitor reviewers citing differences below it.
+- **Write candidate results for the diff step.** Have the test session write each case's candidate pass
+  rate to a file (for example `evals/candidate_results.json`) so a separate CI step can diff it against
+  the baseline per slice and run McNemar on the flips.
+- **Check arguments, not only tool names.** A `must_call` grader should also match key arguments (the
+  order id from the input), and reference-judge graders such as "does the reply state the 30-day
+  window?" run in the nightly tier, not the smoke tier.
 
 ## Trade-offs
 - **k samples vs cost.** Running each case *k* times multiplies cost and time by *k*, but without it one

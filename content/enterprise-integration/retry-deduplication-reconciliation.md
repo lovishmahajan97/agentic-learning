@@ -274,67 +274,37 @@ flowchart TD
 ```
 
 ## Examples
-### The three mechanisms around one integration
-The stores (`versions`, `records`, `ledger`) stand in for tables committed in the same transaction as the
-effect; `client` wraps the customer-side API. Each function is safe to call twice, including `reconcile`
-itself.
+### Ledger plus upsert for one outbound write
+The dicts stand in for a ledger table and the customer's ticket system. The first call commits on the
+server but the response is lost, which is the case that duplicates tickets without a ledger.
 
 ```python
-import random, time
+ledger, tickets = {}, {}          # ledger: op_id -> result; tickets: the customer's system
 
-class ApiError(Exception):
-    def __init__(self, status, retry_after=None): self.status, self.retry_after = status, retry_after
+def upsert(external_id, body):    # a repeat with the same external id is an update, not a new ticket
+    tickets[external_id] = body
+    return "T-1"
 
-RETRYABLE = {408, 429, 500, 502, 503, 504}
+def lost_response(external_id, body):
+    upsert(external_id, body)
+    raise TimeoutError            # committed server-side, outcome unknown to us
 
-def call_with_retry(fn, max_attempts=5, base=0.5, cap=30.0):
-    for attempt in range(1, max_attempts + 1):
-        try:
-            return fn()
-        except (ApiError, TimeoutError, ConnectionError) as e:
-            status = getattr(e, "status", None)         # None: timeout/reset, outcome unknown
-            if (status is not None and status not in RETRYABLE) or attempt == max_attempts:
-                raise                                   # 4xx: wrong request, do not loop on it
-            delay = min(cap, base * 2 ** (attempt - 1)) * random.uniform(0.5, 1.5)
-            time.sleep(getattr(e, "retry_after", None) or delay)  # honour Retry-After if sent
+def write_with_ledger(op_id, payload, call=upsert):
+    if ledger.get(op_id) not in (None, "unknown"):
+        return ledger[op_id]      # retry of a completed op returns the saved result
+    ledger[op_id] = "unknown"     # claimed before the call; survives a crash mid-call
+    ledger[op_id] = call(external_id=op_id, body=payload)
+    return ledger[op_id]
 
-def apply_event(db, tenant, event):
-    """Inbound: idempotent by (tenant, record id, source version); version committed with the write."""
-    key = (tenant, event["record_id"])
-    seen = db.versions.get(key)
-    if seen is not None and event["version"] <= seen:
-        return "duplicate-or-stale"                     # redelivery or out-of-order: no-op
-    db.records[key] = event["payload"]
-    db.versions[key] = event["version"]
-    return "applied"
-
-def write_with_ledger(db, client, tenant, op_id, payload):
-    """Outbound: never issue a write the ledger does not know about."""
-    if db.ledger.get(op_id) not in (None, "unknown", "needs-replay"):
-        return db.ledger[op_id]                         # retry of a completed op returns the saved result
-    db.ledger[op_id] = "unknown"                        # claimed before the call; survives a crash mid-call
-    # Re-issuing an "unknown" op is safe only because upsert-by-external-id turns a repeat into an update.
-    # Against an insert-only API, resolve "unknown" by lookup (as reconcile does) before any re-issue.
-    remote_id = call_with_retry(lambda: client.upsert(external_id=op_id, body=payload))
-    db.ledger[op_id] = remote_id
-    return remote_id
-
-def reconcile(db, client, tenant, since):
-    """Catch what retry and dedupe cannot: events that never arrived, writes with unknown outcomes."""
-    source = {r["id"]: r["version"] for r in client.list_changed(since=since)}   # paginated pull
-    target = {rid: v for (t, rid), v in db.versions.items() if t == tenant}
-    missing = [rid for rid in source if rid not in target]
-    stale = [rid for rid, v in source.items() if rid in target and v > target[rid]]
-    for rid in missing + stale:
-        apply_event(db, tenant, client.fetch(rid))      # repairs reuse the idempotent path
-    for op_id, status in list(db.ledger.items()):
-        if status == "unknown":
-            db.ledger[op_id] = client.find_by_external_id(op_id) or "needs-replay"
-    return {"missing": len(missing), "stale": len(stale)}  # alert when this stops trending to zero
+op = "run42:create_ticket:INC1"   # run id + tool + business key
+try:
+    write_with_ledger(op, {"title": "DB down"}, call=lost_response)
+except TimeoutError:
+    print(ledger[op])             # unknown
+print(write_with_ledger(op, {"title": "DB down"}))  # T-1 (re-issue is safe: upsert)
+print(write_with_ledger(op, {"title": "DB down"}))  # T-1 (ledger hit, no call)
+print(len(tickets))               # 1
 ```
-
-Deletes are not in this sketch: `list_changed` only sees records that still exist, so a separate full-id
-sweep (or the platform's deleted-records endpoint) is what produces the "extra in target" class.
 
 ### Version dedupe vs delivery-id dedupe on a reordered feed
 A runnable check of why the key matters. Two updates to one ticket arrive out of order, then the first is
@@ -415,6 +385,14 @@ The Wednesday spike paged on-call within the hour; no user had reported a stale 
   Build the id from the run id, the tool name and the business key (incident id, order id), so a reworded
   second call hits the same ledger entry. Monitor duplicate-suppressed calls per run; a high count means
   the model is looping and needs a better tool result message.
+- **Backoff defaults for the adapter retry.** Retry only 408, 429, 500, 502, 503, 504, timeouts and resets;
+  up to 5 attempts, delay `min(30 s, 0.5 s * 2^(attempt-1))` times a 0.5-1.5 jitter, and `Retry-After`
+  wins when sent. Never loop on other 4xx (or 501).
+- **Re-issue an `unknown` write only against an upsert.** Against an insert-only API, resolve `unknown`
+  by external-id lookup in reconciliation before any re-issue; reconciliation repairs should reuse the
+  same idempotent apply path as live events.
+- **Deletes need their own sweep.** A changed-since pull only sees records that still exist, so a
+  separate full-id sweep (or the platform's deleted-records endpoint) produces the "extra in target" class.
 
 ## Trade-offs
 - **Aggressive retries vs the customer's quota.** More retries raise the chance a transient failure heals

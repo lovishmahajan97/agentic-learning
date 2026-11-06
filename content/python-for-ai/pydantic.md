@@ -310,53 +310,6 @@ flowchart TD
 ```
 
 ## Examples
-### Agent tool dispatch: validation errors become tool results
-Each tool has an argument model; the schemas go in the request, and a failed validation becomes an
-error `tool_result` (the Anthropic Messages shape, with `is_error`) so the model fixes the call on the
-next turn instead of the handler running with bad input.
-
-```python
-from typing import Any, Callable
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
-
-class GetOrder(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    order_id: str = Field(pattern=r"^ORD-\d{6}$", description="Order id like ORD-123456")
-
-class Refund(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    order_id: str = Field(pattern=r"^ORD-\d{6}$")
-    amount_cents: int = Field(gt=0, strict=True)       # money: no "1250" string coercion
-
-REGISTRY: dict[str, tuple[type[BaseModel], Callable[[Any], str]]] = {
-    "get_order": (GetOrder, lambda a: f"{a.order_id}: shipped"),
-    "refund": (Refund, lambda a: f"refunded {a.amount_cents} on {a.order_id}"),
-}
-TOOLS = [{"name": n, "input_schema": m.model_json_schema()} for n, (m, _) in REGISTRY.items()]
-
-def tool_result(block: dict[str, Any]) -> dict[str, Any]:
-    """Turn one tool_use block from the model into a tool_result block for the next turn."""
-    model, handler = REGISTRY[block["name"]]
-    try:
-        args = model.model_validate(block["input"])
-    except ValidationError as e:
-        issues = "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors())
-        return {"type": "tool_result", "tool_use_id": block["id"], "is_error": True,
-                "content": f"Invalid arguments, fix and call again: {issues}"}
-    return {"type": "tool_result", "tool_use_id": block["id"], "content": handler(args)}
-
-bad = {"id": "t1", "name": "refund", "input": {"order_id": "123456", "amount_cents": "1250", "reason": "late"}}
-print(tool_result(bad)["content"])
-# Invalid arguments, fix and call again: order_id: String should match pattern '^ORD-\d{6}$';
-#   amount_cents: Input should be a valid integer; reason: Extra inputs are not permitted
-good = {"id": "t2", "name": "refund", "input": {"order_id": "ORD-123456", "amount_cents": 1250}}
-print(tool_result(good)["content"])     # refunded 1250 on ORD-123456
-```
-
-- **All three problems in one message:** errors are collected per field, so the model can fix the call
-  in one retry rather than three.
-- **A consequential tool stays strict:** `strict=True` refuses the string amount instead of coercing it.
-
 ### Structured extraction with a repair message
 The schema is generated from the model, and the validation errors become feedback for a repair attempt.
 `extra="forbid"` makes an invented field fail loudly.
@@ -379,22 +332,15 @@ class Ticket(BaseModel):
 
 schema = Ticket.model_json_schema()      # send this as the tool/response schema
 print(schema["properties"]["severity"]["enum"])          # ['low', 'medium', 'high']
-print(schema["properties"]["affected_users"]["minimum"]) # 0
-
-def parse_or_feedback(text: str) -> Ticket | str:
-    try:
-        return Ticket.model_validate_json(text)
-    except ValidationError as e:
-        issues = "; ".join(f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors())
-        return f"Your JSON was rejected. Fix these fields and resend: {issues}"
 
 raw = '{"title": "Login broken", "severity": "critical", "affected_users": "1200", "tags": ["Auth", "auth "]}'
-print(parse_or_feedback(raw))
-# Your JSON was rejected. Fix these fields and resend: severity: Input should be 'low', 'medium' or 'high'
-t = parse_or_feedback(raw.replace("critical", "high"))
+try:
+    Ticket.model_validate_json(raw)
+except ValidationError as e:                             # send these back as repair feedback
+    print([f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors()])
+    # ["severity: Input should be 'low', 'medium' or 'high'"]
+t = Ticket.model_validate_json(raw.replace("critical", "high"))
 print(t)        # title='Login broken' severity='high' affected_users=1200 tags=['auth']
-print(type(t.affected_users))   # <class 'int'>: "1200" was coerced in lax mode
-print(t.model_dump_json())      # {"title":"Login broken","severity":"high","affected_users":1200,"tags":["auth"]}
 ```
 
 What each field did in the first call:
@@ -407,50 +353,39 @@ What each field did in the first call:
 
 - **Schema and validator agree:** because of `extra="forbid"`, the schema also carries
   `"additionalProperties": false`, so the model is told the same rule the validator enforces.
-- **The feedback string** is what an `instructor`-style retry loop sends back to the model.
+- **The feedback list** is what an `instructor`-style retry loop sends back to the model; in an agent loop
+  it becomes an error `tool_result` (`"is_error": True`) so the model fixes the call on the next turn.
 
 ### Routing tool calls with a discriminated union
-One adapter validates a list of mixed tool calls, picks the variant by `type`, and enforces a
-cross-field rule in an after-validator.
+One adapter validates a list of mixed tool calls and picks the variant by `type`.
 
 ```python
-from datetime import date
 from typing import Annotated, Literal, Union
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 class SearchCall(BaseModel):
-    model_config = ConfigDict(extra="forbid")
     type: Literal["search"]
     query: str = Field(min_length=1)
 
 class ReportCall(BaseModel):
-    model_config = ConfigDict(extra="forbid")
     type: Literal["report"]
-    start: date
-    end: date
-
-    @model_validator(mode="after")
-    def check_range(self) -> "ReportCall":
-        if self.start >= self.end:                 # cross-field: only here are both typed
-            raise ValueError("start must be before end")
-        return self
+    days: int = Field(ge=1)
 
 ToolCall = Annotated[Union[SearchCall, ReportCall], Field(discriminator="type")]
-calls = TypeAdapter(list[ToolCall])
+calls = TypeAdapter(list[ToolCall])              # build once, at import
 
-ok = calls.validate_json('[{"type": "search", "query": "kv cache"},'
-                         ' {"type": "report", "start": "2026-01-01", "end": "2026-02-01"}]')
+ok = calls.validate_json('[{"type": "search", "query": "kv cache"}, {"type": "report", "days": 7}]')
 print([type(c).__name__ for c in ok])           # ['SearchCall', 'ReportCall']
 
 try:
-    calls.validate_json('[{"type": "report", "start": "2026-03-01", "end": "2026-02-01"},'
-                        ' {"type": "delete", "id": 7}]')
+    calls.validate_json('[{"type": "report", "days": 0}, {"type": "delete", "id": 7}]')
 except ValidationError as e:
-    for err in e.errors():
-        print(err["loc"], err["type"])
-# (0, 'report') value_error
-# (1,) union_tag_invalid
+    print([(err["loc"], err["type"]) for err in e.errors()])
+    # [((0, 'report', 'days'), 'greater_than_equal'), ((1,), 'union_tag_invalid')]
 ```
+
+- **Errors name the branch:** the location includes the chosen variant (`'report'`), and an unknown tag
+  fails with `union_tag_invalid` instead of a wall of errors from trying every variant.
 
 ## Production patterns
 - **Bounded validate-and-repair loop.** On `ValidationError`, send the `loc: msg` list back to the model

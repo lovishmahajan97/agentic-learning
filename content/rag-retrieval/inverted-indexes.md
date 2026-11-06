@@ -187,30 +187,26 @@ docs = {1: "pgvector supports hnsw and ivfflat indexes",
         4: "recall measures how many true neighbors the index returns"}
 
 analyze = lambda text: re.findall(r"[a-z0-9]+", text.lower())   # shared by index and query
-postings = defaultdict(list)          # term -> [(doc_id, tf, [positions]) ...], doc ids ascending
-doc_len = {}
-for doc_id, text in sorted(docs.items()):                          # sorted => lists stay sorted
-    tokens = analyze(text); doc_len[doc_id] = len(tokens)
-    where = defaultdict(list)
-    for i, t in enumerate(tokens): where[t].append(i)
-    for t, pos in where.items(): postings[t].append((doc_id, len(pos), pos))
+postings = defaultdict(dict)          # term -> {doc_id: [positions]}; tf = len(positions)
+for doc_id, text in sorted(docs.items()):                          # sorted => doc ids stay ascending
+    for pos, t in enumerate(analyze(text)):
+        postings[t].setdefault(doc_id, []).append(pos)
 
-def intersect(a, b):                  # AND of two sorted lists: O(|a| + |b|), no hashing
+def intersect(a, b):                  # AND of two sorted id lists: O(|a| + |b|), no hashing
     i = j = 0; out = []
     while i < len(a) and j < len(b):
-        if a[i][0] == b[j][0]: out.append(a[i][0]); i += 1; j += 1
-        elif a[i][0] < b[j][0]: i += 1
+        if a[i] == b[j]: out.append(a[i]); i += 1; j += 1
+        elif a[i] < b[j]: i += 1
         else: j += 1
     return out
 
 def phrase(t1, t2):                   # positions make "hnsw graphs" differ from "graphs hnsw"
-    p1 = {d: p for d, _, p in postings[t1]}; p2 = {d: p for d, _, p in postings[t2]}
-    return [d for d in sorted(p1.keys() & p2.keys()) if any(x + 1 in p2[d] for x in p1[d])]
+    p1, p2 = postings[t1], postings[t2]
+    return [d for d in intersect(list(p1), list(p2)) if any(x + 1 in p2[d] for x in p1[d])]
 
-print(postings["hnsw"])                                    # [(1, 1, [2]), (2, 1, [0])]
-print(intersect(postings["hnsw"], postings["recall"]))     # [2]
-print(phrase("hnsw", "graphs"), phrase("graphs", "hnsw"))  # [2] []
-print({t: len(p) for t, p in postings.items() if len(p) > 1})  # df>1: {'hnsw': 2, 'ivfflat': 2, 'recall': 2}
+print(dict(postings["hnsw"]))                                    # {1: [2], 2: [0]}
+print(intersect(list(postings["hnsw"]), list(postings["recall"])))   # [2]
+print(phrase("hnsw", "graphs"), phrase("graphs", "hnsw"))        # [2] []
 ```
 
 Real engines add compression, skip pointers and segments on top, but the shape is exactly this: a

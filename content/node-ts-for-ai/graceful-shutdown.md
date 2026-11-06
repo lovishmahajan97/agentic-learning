@@ -422,44 +422,31 @@ import http from "node:http";
 import { Pool } from "pg";
 import { Worker } from "bullmq";
 import { sdk } from "./instrumentation";          // the OpenTelemetry NodeSDK instance
-import { redis } from "./redis";                  // an ioredis client
+import { redis } from "./redis";                  // an ioredis client with maxRetriesPerRequest: null
 
-let ready = true;
+let ready = true, shuttingDown = false;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const worker = new Worker("embed", processEmbed, { connection: redis });
 const server = http.createServer((req, res) => {
   if (req.url === "/ready") { res.writeHead(ready ? 200 : 503); return res.end(); }
-  if (req.url === "/live")  { res.writeHead(200); return res.end(); }
+  if (req.url === "/live") { res.writeHead(200); return res.end(); }
   handle(req, res);                                 // normal routing
-});
-server.keepAliveTimeout = 5_000;
-const workerConn = redis.duplicate({ maxRetriesPerRequest: null });   // BullMQ workers require null
-const worker = new Worker("embed", processEmbed, { connection: workerConn, concurrency: 4 });
-server.listen(8080);
+}).listen(8080);
 
-let shuttingDown = false;
 async function shutdown(signal: string, code = 0) {
-  if (shuttingDown) { console.warn("second signal, forcing exit"); process.exit(1); }
+  if (shuttingDown) process.exit(1);                // second signal: force exit
   shuttingDown = true; ready = false;               // 1. fail readiness first
-  await new Promise((r) => setTimeout(r, Number(process.env.DRAIN_DELAY_MS ?? 0)));  // keep serving while endpoints update; 0 if preStop sleeps
-  const deadline = setTimeout(() => { console.error("drain timeout"); process.exit(1); }, 20_000).unref();
+  const deadline = setTimeout(() => process.exit(1), 20_000).unref();
   console.log(`${signal}: draining`);
-  try {
-    await Promise.all([
-      new Promise<void>((resolve) => server.close(() => resolve())),  // 2. stop intake (closes idle keep-alive on Node 19+)
-      worker.close(),                                                   //    stop taking jobs, wait for active ones
-    ]);
-    await Promise.all([redis.quit(), workerConn.quit()]);              // 3. waits for pending replies
-    await pool.end();                                                   //    only after nothing can still query
-    await Promise.race([sdk.shutdown(), new Promise((r) => setTimeout(r, 3_000))]);  // 4. flush spans last, capped
-    clearTimeout(deadline);
-    process.exit(code);
-  } catch (err) {
-    console.error("shutdown error", err); process.exit(1);
-  }
+  await Promise.all([new Promise((r) => server.close(r)), worker.close()]);  // 2. stop intake, wait for active jobs
+  await redis.quit();                               // 3. waits for pending replies
+  await pool.end();                                 //    only after nothing can still query
+  await Promise.race([sdk.shutdown(), new Promise((r) => setTimeout(r, 3_000))]);  // 4. flush spans last, capped
+  clearTimeout(deadline);
+  process.exit(code);
 }
-process.on("SIGTERM", () => void shutdown("SIGTERM"));
-process.on("SIGINT",  () => void shutdown("SIGINT"));
-process.on("unhandledRejection", (e) => { console.error(e); void shutdown("unhandledRejection", 1); });
+for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => shutdown(sig).catch(() => process.exit(1)));
+process.on("unhandledRejection", (e) => { console.error(e); shutdown("unhandledRejection", 1).catch(() => process.exit(1)); });
 ```
 
 ### Agent scenario: an agent worker that yields at step boundaries
@@ -471,7 +458,6 @@ whole run.
 import { Queue, Worker } from "bullmq";
 // conn() is an ioredis factory with maxRetriesPerRequest: null; loadRun, runStep, saveStep are app code
 const stopping = new AbortController();               // shutdown began: finish the current step, then yield
-const hardStop = new AbortController();               // deadline near: cut the in-flight model call
 const steps = new Queue("agent-steps", { connection: conn() });
 
 const agentWorker = new Worker("agent-steps", async (job) => {
@@ -482,28 +468,18 @@ const agentWorker = new Worker("agent-steps", async (job) => {
       await steps.add("step", { runId }, { jobId: `run-${runId}-from-${nextStep}` });
       return { yielded: nextStep };
     }
-    try {
-      const r = await runStep(runId, nextStep, hardStop.signal);  // only the hard stop cuts a step short
-      await saveStep(runId, nextStep, r);              // checkpoint before the next step starts
-      done = r.final; nextStep++;
-    } catch (e) {
-      if (!hardStop.signal.aborted) throw e;           // a real failure: let BullMQ retry the job
-    }                                                  // cut off: loop round and yield; the step re-runs elsewhere
+    const r = await runStep(runId, nextStep);
+    await saveStep(runId, nextStep, r);                // checkpoint before the next step starts
+    done = r.final; nextStep++;
   }
   return { done: true };
 }, { connection: conn(), concurrency: 4 });
 
-export async function drainAgents(hardStopAfterMs = 15_000) {
+export async function drainAgents() {
   stopping.abort();                                    // running steps finish, then yield
-  const t = setTimeout(() => hardStop.abort(), hardStopAfterMs);   // inside the 20 s deadline
   await agentWorker.close();                           // waits for active jobs, which now return fast
-  clearTimeout(t);
 }
 ```
-
-- **Two signals, two meanings.** `stopping` lets the current step finish, so a deploy usually costs no
-  repeated work. `hardStop` fires 15 s into the drain and aborts the in-flight model call, so that step
-  re-runs on another worker, which is safe only if its tool side effects carry idempotency keys.
 
 Illustrative timeline, assuming each step takes under 10 seconds:
 
@@ -513,36 +489,6 @@ Illustrative timeline, assuming each step takes under 10 seconds:
 | ~10 s later | still running, minutes left | 4 runs checkpointed, next steps re-enqueued |
 | 25 s deadline | `process.exit(1)`, locks expire, runs replay from their last checkpoint | already exited cleanly |
 | After deploy | stall checker re-runs 4 jobs | new pods resume at steps 4, 8, 10, 13 |
-
-### Production snippet: the container and manifest side
-The code above only works if the signal reaches Node and the timings line up. Exec-form `CMD` behind
-`tini` makes Node receive SIGTERM; the manifest sets the grace period, the `preStop` sleep and separate
-probes.
-
-```dockerfile
-FROM node:22-slim
-RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["node", "dist/server.js"]
-```
-
-```yaml
-spec:
-  terminationGracePeriodSeconds: 30
-  containers:
-    - name: agent-api
-      image: registry.example.com/agent-api:1.4.2
-      lifecycle:
-        preStop:
-          exec:
-            command: ["sleep", "5"]      # covers endpoint propagation; set DRAIN_DELAY_MS to 0
-      readinessProbe:
-        httpGet: { path: /ready, port: 8080 }
-        periodSeconds: 2
-      livenessProbe:
-        httpGet: { path: /live, port: 8080 }
-        periodSeconds: 10
-```
 
 ### Worked scenario: budgeting a 30-second grace period
 How the numbers in the example fit together, measured from the moment the pod is marked terminating.
@@ -582,6 +528,15 @@ resumes cheaply.
   PodDisruptionBudget (`minAvailable` or `maxUnavailable`) limits how many replicas drain at once, so
   graceful shutdown never takes out the whole fleet. Monitor evictions blocked by the budget during
   upgrades.
+- **Hard stop near the deadline.** Give agent steps a second `AbortController` that fires about 15 s into
+  a 20 s drain and aborts the in-flight model call; that step re-runs on another worker, which is safe
+  only if its tool side effects carry idempotency keys.
+- **Container and manifest settings.** Run Node behind `tini` with exec-form
+  `CMD ["node", "dist/server.js"]`; set `terminationGracePeriodSeconds: 30`, a `preStop` of
+  `["sleep", "5"]` (then skip any in-app drain delay), and separate probes (`/ready` every 2 s, `/live`
+  every 10 s). Keep `server.keepAliveTimeout` short (5 s).
+- **BullMQ worker connections.** BullMQ workers require an ioredis connection with
+  `maxRetriesPerRequest: null`; close it with `quit()` alongside the main client on shutdown.
 
 ## Trade-offs
 - **No lost work vs rollout speed.** Draining in-flight work avoids lost requests and duplicate jobs, but

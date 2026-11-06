@@ -420,31 +420,6 @@ starting together.
 - **If you want queueing,** put an explicit `asyncio.Semaphore` or job queue in front so the wait is
   visible and bounded, rather than hiding it in the pool.
 
-### Production client for an SDK, with hooks
-One shared client carries trace headers and logs for every call the SDK makes. Hooks on an
-`AsyncClient` must be async functions.
-
-```python
-import logging, uuid, httpx
-from openai import AsyncOpenAI
-
-log = logging.getLogger("upstream")
-
-async def add_trace(request: httpx.Request) -> None:
-    request.headers["x-request-id"] = uuid.uuid4().hex
-
-async def log_response(response: httpx.Response) -> None:
-    req = response.request
-    log.info("%s %s -> %s", req.method, req.url.host, response.status_code)
-
-http = httpx.AsyncClient(
-    timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=2.0),
-    limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
-    event_hooks={"request": [add_trace], "response": [log_response]},
-)
-llm = AsyncOpenAI(http_client=http, timeout=120.0, max_retries=2)   # SDK settings win on top
-```
-
 ## Production patterns
 - **One client per upstream, owned by the app lifespan.** Create the `AsyncClient` at startup (for
   example in a FastAPI lifespan), share it across agent runs, and `await client.aclose()` on shutdown.
@@ -463,6 +438,9 @@ llm = AsyncOpenAI(http_client=http, timeout=120.0, max_retries=2)   # SDK settin
   and streaming code paths with no network.
 - **Trace every upstream call.** Add a run or trace ID header in a request hook so tool and model calls
   from one agent run can be joined in your tracing tool.
+- **Hand the SDK your shared client.** Pass it as `AsyncOpenAI(http_client=http, timeout=120.0, max_retries=2)`;
+  the SDK's own timeout and retry settings win on top of the client's. Event hooks on an `AsyncClient`
+  must be `async def` functions, for example one that sets an `x-request-id` header per request.
 
 ## Trade-offs
 - **One API for sync and async vs async discipline.** Scripts, services and tests share code, but async

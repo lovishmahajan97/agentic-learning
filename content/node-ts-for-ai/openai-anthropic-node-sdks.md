@@ -359,15 +359,17 @@ flowchart TD
 ```
 
 ## Examples
-### Two adapters behind one interface
-One narrow `ModelClient` interface with two adapters. Each streams tokens to stdout, returns the full text
-with normalised usage, relies on the SDK's retries rather than its own, and accepts an `AbortSignal` so a
-disconnected client stops generation. `isRetryable` is what an outer circuit breaker would consult, using
-typed errors instead of message text.
+### One adapter behind a narrow interface
+One narrow `ModelClient` interface with an Anthropic adapter. It streams tokens to stdout, returns the full
+text with normalised usage and the request id, relies on the SDK's retries rather than its own, and accepts
+an `AbortSignal` so a disconnected client stops generation.
+
+An OpenAI adapter implements the same interface
+with `chat.completions.create({ stream: true, stream_options: { include_usage: true } })`, concatenating
+`choices[0]?.delta?.content` and reading usage from the final chunk, whose `choices` array is empty.
 
 ```ts
 import Anthropic from "@anthropic-ai/sdk";
-import OpenAI from "openai";
 
 export interface Completion { text: string; inputTokens: number; outputTokens: number; requestId?: string }
 export interface ModelClient { complete(system: string, user: string, signal?: AbortSignal): Promise<Completion> }
@@ -377,9 +379,7 @@ export function anthropicClient(model = "claude-opus-5-5"): ModelClient {
   return {
     async complete(system, user, signal) {
       const stream = client.messages.stream(
-        { model, max_tokens: 2048, system, messages: [{ role: "user", content: user }] },
-        { signal },
-      );
+        { model, max_tokens: 2048, system, messages: [{ role: "user", content: user }] }, { signal });
       stream.on("text", (delta) => process.stdout.write(delta));
       const msg = await stream.finalMessage();                             // typed Message, after the stream
       const text = msg.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
@@ -387,32 +387,6 @@ export function anthropicClient(model = "claude-opus-5-5"): ModelClient {
                requestId: stream.request_id ?? undefined };                // from the response header
     },
   };
-}
-
-export function openaiClient(model = process.env.OPENAI_MODEL ?? "set-a-current-model-id"): ModelClient {
-  const client = new OpenAI({ maxRetries: 3, timeout: 60_000 });
-  return {
-    async complete(system, user, signal) {
-      const stream = await client.chat.completions.create(
-        { model, stream: true, stream_options: { include_usage: true },
-          messages: [{ role: "system", content: system }, { role: "user", content: user }] },
-        { signal },
-      );
-      let text = "", usage: OpenAI.CompletionUsage | undefined;
-      for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta?.content ?? "";
-        process.stdout.write(delta); text += delta;
-        if (chunk.usage) usage = chunk.usage;                               // arrives in the final chunk
-      }
-      return { text, inputTokens: usage?.prompt_tokens ?? 0, outputTokens: usage?.completion_tokens ?? 0 };
-    },
-  };
-}
-
-export function isRetryable(err: unknown): boolean {      // abort and 4xx errors are not retryable
-  if (err instanceof Anthropic.APIConnectionError || err instanceof OpenAI.APIConnectionError) return true;
-  const e = err instanceof Anthropic.APIError || err instanceof OpenAI.APIError ? err : undefined;
-  return e !== undefined && (e.status === 429 || (e.status ?? 0) >= 500);
 }
 ```
 
@@ -439,47 +413,36 @@ The one thing the adapters hide: the four objects of a tool round trip, in each 
   blocks in the same single user message.
 
 ### A budgeted agent loop on the Anthropic SDK
-The round trip above, repeated until the model finishes. Budgets are explicit, the run's `signal` reaches
-every call, tool inputs are validated with Zod before a handler runs, and a failed tool goes back to the
-model as `is_error` instead of crashing the run.
+The round trip above, repeated until the model finishes. The step budget is explicit, the run's `signal`
+reaches every call, tool inputs are validated with Zod before a handler runs, and a failed tool goes back
+to the model as `is_error` instead of crashing the run.
 
 ```ts
 import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
-import { db } from "./db";
 
 const client = new Anthropic({ maxRetries: 2, timeout: 60_000 });
-const SYSTEM = "You are a support agent. Use tools for order data; never guess.";
 const tools: Anthropic.Tool[] = [{ name: "lookup_order", description: "Fetch an order by id",
   input_schema: { type: "object", properties: { orderId: { type: "string" } }, required: ["orderId"] } }];
 const LookupOrder = z.object({ orderId: z.string().regex(/^ord_\w+$/) });
-const handlers: Record<string, (input: unknown) => Promise<string>> = {
-  lookup_order: async (input) => JSON.stringify(await db.orders.find(LookupOrder.parse(input).orderId)),
+const ORDERS: Record<string, string> = { ord_42: "shipped" };
+const runTool = (name: string, input: unknown) => {                       // throws on an unknown tool or bad id
+  if (name !== "lookup_order") throw new Error(`unknown tool ${name}`);
+  return ORDERS[LookupOrder.parse(input).orderId] ?? "not found";
 };
 
-export async function runAgent(task: string, signal: AbortSignal, maxSteps = 6, maxInputTokens = 100_000) {
+export async function runAgent(task: string, signal: AbortSignal, maxSteps = 6) {
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: task }];
-  let inputTokens = 0;
   for (let step = 1; step <= maxSteps; step++) {
     const msg = await client.messages.create(
-      { model: "claude-opus-5-5", max_tokens: 2048, system: SYSTEM, tools, messages }, { signal });
-    inputTokens += msg.usage.input_tokens + (msg.usage.cache_read_input_tokens ?? 0);  // cached reads too
+      { model: "claude-opus-5-5", max_tokens: 2048, system: "Use tools for order data.", tools, messages }, { signal });
     messages.push({ role: "assistant", content: msg.content });            // echo the turn unchanged
-    if (msg.stop_reason === "end_turn")
-      return { text: msg.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join(""), step, inputTokens };
+    if (msg.stop_reason === "end_turn") return msg.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
     if (msg.stop_reason !== "tool_use") throw new Error(`stopped: ${msg.stop_reason}`); // max_tokens, refusal...
-    if (inputTokens > maxInputTokens) throw new Error("token budget exhausted");
     const results: Anthropic.ToolResultBlockParam[] = [];
-    for (const b of msg.content) {
-      if (b.type !== "tool_use") continue;
-      try {
-        const run = handlers[b.name];
-        if (!run) throw new Error(`unknown tool ${b.name}`);
-        results.push({ type: "tool_result", tool_use_id: b.id, content: await run(b.input) });
-      } catch (e) {                                                         // message written for the model
-        results.push({ type: "tool_result", tool_use_id: b.id, is_error: true,
-                       content: e instanceof Error ? e.message : "tool failed" });
-      }
+    for (const b of msg.content.filter((x) => x.type === "tool_use")) {
+      try { results.push({ type: "tool_result", tool_use_id: b.id, content: runTool(b.name, b.input) }); }
+      catch (e) { results.push({ type: "tool_result", tool_use_id: b.id, is_error: true, content: String(e) }); }
     }
     messages.push({ role: "user", content: results });                     // all results, one user message
   }
@@ -491,7 +454,7 @@ export async function runAgent(task: string, signal: AbortSignal, maxSteps = 6, 
   the `throw`; handle the ones your configuration can produce instead of looping on them.
 
 ### Worked scenario: worst-case latency of one call
-With the adapters' settings, `timeout: 60_000` and `maxRetries: 3`, during a provider outage where every
+With the adapter's settings, `timeout: 60_000` and `maxRetries: 3`, during a provider outage where every
 attempt times out:
 
 | Quantity | Value |
@@ -507,22 +470,6 @@ attempt times out:
   pass the request's `AbortSignal` so a user who gives up also stops the chain.
 - **For agents, add a run deadline.** Per-call settings cannot bound a multi-step run; give the run its own
   wall-clock budget (an `AbortSignal` that fires at the deadline) and lower `timeout` per step.
-
-### Reading request IDs and rate-limit headers
-`.withResponse()` exposes the raw `Response`, which carries the provider's rate-limit headers.
-
-```ts
-import Anthropic from "@anthropic-ai/sdk";
-
-const client = new Anthropic();
-const { data: msg, response } = await client.messages
-  .create({ model: "claude-opus-5-5", max_tokens: 256, messages: [{ role: "user", content: "ping" }] })
-  .withResponse();
-console.log({
-  requestId: msg._request_id,                                               // quote this in support tickets
-  requestsRemaining: response.headers.get("anthropic-ratelimit-requests-remaining"),
-});
-```
 
 ## Production patterns
 - **One retry layer only.** When the call already runs inside a queue with redelivery or your own retry
@@ -545,6 +492,15 @@ console.log({
 - **Same surface on cloud platforms.** When a customer must stay inside their cloud, swap the client for
   `AzureOpenAI`, `@anthropic-ai/bedrock-sdk` or `@anthropic-ai/vertex-sdk` behind the same `ModelClient`
   interface. Monitor per-platform latency and error rates separately.
+- **Read rate-limit headers with `.withResponse()`.** `client.messages.create(...).withResponse()` returns
+  `{ data, response }`; quote `data._request_id` in support tickets and read
+  `response.headers.get("anthropic-ratelimit-requests-remaining")` to slow down before a 429.
+- **Classify retryable errors by type.** An outer circuit breaker should treat `APIConnectionError` and
+  `APIError` with status 429 or 5xx as retryable, and aborts and other 4xx as not, using `instanceof` on
+  `Anthropic.*` / `OpenAI.*` classes rather than message text.
+- **Token ceilings count cache reads.** When summing `usage` for a per-run token budget (for example
+  100,000 input tokens), add `cache_read_input_tokens` to `input_tokens`, since cached prefix tokens still
+  fill the context on every step.
 
 ## Trade-offs
 - **Built-in retries vs multiplied attempts.** Transient failures become invisible, which is what you want

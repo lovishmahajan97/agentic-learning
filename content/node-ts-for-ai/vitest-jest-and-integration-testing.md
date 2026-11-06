@@ -340,35 +340,20 @@ flowchart TD
 ```
 
 ## Examples
-### Fake model plus real SDK over msw
-A `summarize` service depends on a narrow `ModelClient` interface,
-`{ complete(prompt: string): Promise<string> }`.
-- It calls `complete`, tries to parse `{"bullets": string[]}`, and on failure calls once more with a
-  repair prompt that quotes the bad output.
-- `anthropicAdapter(client)` implements `complete` with `client.messages.create` and joins the text blocks.
-- Test one drives the repair loop with a scripted fake. Test two constructs the real Anthropic SDK and
-  intercepts the HTTP call with `msw`, so the request body and response parsing are real.
+### Real SDK over msw
+A `summarize` service depends on a narrow `ModelClient` interface, `{ complete(prompt: string): Promise<string> }`,
+and `anthropicAdapter(client)` implements `complete` with `client.messages.create`. Unit tests hand
+`summarize` a `vi.fn()` fake; this test constructs the real Anthropic SDK and intercepts the HTTP call with
+`msw`, so the request body and response parsing are real.
 - **The handler *captures* the body; the assertion runs in the test.** An `expect` thrown inside an msw
   handler becomes a 500, which surfaces as the SDK's `InternalServerError`, not the assertion message.
 
 ```ts
-import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from "vitest";
+import { it, expect, beforeAll, afterAll } from "vitest";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import Anthropic from "@anthropic-ai/sdk";
 import { summarize, anthropicAdapter } from "../src/summarize";
-
-describe("summarize (unit, injected fake)", () => {
-  it("feeds a malformed answer back once, then returns parsed bullets", async () => {
-    const complete = vi.fn()
-      .mockResolvedValueOnce("not json")
-      .mockResolvedValueOnce('{"bullets":["a","b"]}');
-    const out = await summarize("long text", { complete });
-    expect(out.bullets).toEqual(["a", "b"]);
-    expect(complete).toHaveBeenCalledTimes(2);
-    expect(complete.mock.calls[1][0]).toContain("not json");   // repair prompt quotes the bad output
-  });
-});
 
 let sent: { max_tokens: number; messages: unknown[] } | undefined;   // the exact JSON on the wire
 const server = setupServer(
@@ -382,27 +367,19 @@ const server = setupServer(
   }),
 );
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));  // any other network call fails loudly
-afterEach(() => { server.resetHandlers(); sent = undefined; });
 afterAll(() => server.close());
 
-describe("summarize (integration, real SDK over intercepted HTTP)", () => {
-  it("builds a request the API accepts and parses the response", async () => {
-    const client = new Anthropic({ apiKey: "test-key", maxRetries: 0 });
-    const out = await summarize("long text", anthropicAdapter(client));
-    expect(out.bullets).toEqual(["x"]);
-    expect(sent?.max_tokens).toBeGreaterThan(0);    // required field present in the real request
-    expect(sent?.messages).toHaveLength(1);
-  });
+it("builds a request the API accepts and parses the response", async () => {
+  const client = new Anthropic({ apiKey: "test-key", maxRetries: 0 });
+  expect((await summarize("long text", anthropicAdapter(client))).bullets).toEqual(["x"]);
+  expect(sent?.max_tokens).toBeGreaterThan(0);    // required field present in the real request
 });
 ```
 
 ### Agent loop against a scripted trajectory
 `runAgent(task, { model, tools, maxSteps })` is the code under test. `model.next(history)` returns either
-`{ toolCalls: [...] }` or `{ text }`; `tools` maps names to async handlers; after each tool round the loop
-appends a `{ toolResults }` entry to the history.
-
-The fake model is a queue of scripted turns that also records a copy of each history it was shown,
-because the loop keeps mutating the same array.
+`{ toolCalls: [...] }` or `{ text }`; after each tool round the loop appends a `{ toolResults }` entry.
+The fake records a copy of each history it was shown, because the loop keeps mutating the same array.
 
 ```ts
 import { it, expect, vi } from "vitest";
@@ -410,10 +387,7 @@ import { runAgent, type Turn } from "../src/agent";
 
 const scripted = (...turns: Turn[]) => {
   const seen: unknown[][] = [];                                   // copies: what the model saw per step
-  const next = vi.fn(async (history: unknown[]) => {
-    seen.push(structuredClone(history));
-    return turns.shift() ?? { text: "done" };
-  });
+  const next = vi.fn(async (history: unknown[]) => { seen.push(structuredClone(history)); return turns.shift() ?? { text: "done" }; });
   return { next, seen };
 };
 
@@ -431,55 +405,14 @@ it("dispatches the tool, keys the result by call id, then answers", async () => 
 
 it("stops at the step budget when the model keeps calling tools", async () => {
   const loop = { next: vi.fn(async () => ({ toolCalls: [{ id: "c", name: "search", input: {} }] })) };
-  await expect(runAgent("x", { model: loop, tools: { search: async () => [] }, maxSteps: 3 }))
-    .rejects.toThrow(/step budget/);
+  await expect(runAgent("x", { model: loop, tools: { search: async () => [] }, maxSteps: 3 })).rejects.toThrow(/step budget/);
   expect(loop.next).toHaveBeenCalledTimes(3);
 });
-
-it("feeds a tool failure back to the model instead of crashing the run", async () => {
-  const model = scripted({ toolCalls: [{ id: "c1", name: "lookup_order", input: {} }] }, { text: "Sorry" });
-  const failing = async () => { throw new Error("upstream down"); };
-  await runAgent("x", { model, tools: { lookup_order: failing }, maxSteps: 4 });
-  expect(model.seen[1].at(-1)).toMatchObject({ toolResults: [{ id: "c1", isError: true }] });
-});
 ```
 
-- **What these three tests pin down:** routing, the budget and error handling, which are exactly the
-  behaviours an eval would only show as a vague drop in task success.
-
-### Backoff under fake timers
-A self-contained retry helper that sleeps 1 s, then 2 s. Under fake timers the test runs in
-milliseconds; each `advanceTimersByTimeAsync` is awaited so the promise chain between timers settles.
-
-```ts
-import { it, expect, vi, afterEach } from "vitest";
-
-async function withRetry<T>(fn: () => Promise<T>, attempts = 3, baseMs = 1000): Promise<T> {
-  for (let n = 0; ; n++) {
-    try { return await fn(); }
-    catch (e) {
-      if (n + 1 >= attempts) throw e;
-      await new Promise((r) => setTimeout(r, baseMs * 2 ** n));   // 1000 ms, then 2000 ms
-    }
-  }
-}
-
-afterEach(() => { vi.useRealTimers(); });
-
-it("retries twice with exponential backoff and no real waiting", async () => {
-  vi.useFakeTimers();
-  const fn = vi.fn()
-    .mockRejectedValueOnce(new Error("429"))
-    .mockRejectedValueOnce(new Error("429"))
-    .mockResolvedValueOnce("ok");
-  const p = withRetry(fn);
-  await vi.advanceTimersByTimeAsync(1000);
-  expect(fn).toHaveBeenCalledTimes(2);
-  await vi.advanceTimersByTimeAsync(2000);
-  await expect(p).resolves.toBe("ok");
-  expect(fn).toHaveBeenCalledTimes(3);
-});
-```
+- **What these tests pin down:** routing and the budget; a third trajectory with a throwing tool should see
+  `isError: true` in the next history. These are exactly the behaviours an eval would only show as a vague
+  drop in task success.
 
 ### Worked scenario: restructuring a suite of twenty real-model tests
 Illustrative orders of magnitude for the Check yourself situation, not a benchmark.
@@ -514,6 +447,11 @@ Illustrative orders of magnitude for the Check yourself situation, not a benchma
 - **Production traces become scripted trajectories.** When an agent misbehaves in production, turn its
   trace (model turns and tool results) into a scripted fake plus tool stubs and add it to the unit suite,
   so the fix stays fixed. Track how many incidents gained a regression trajectory.
+- **Reset msw handlers between tests.** Call `server.resetHandlers()` (and clear captured bodies) in
+  `afterEach`, so a per-test override cannot leak into the next test.
+- **Backoff tests under fake timers.** Call `vi.useFakeTimers()` in the test, `await
+  vi.advanceTimersByTimeAsync(ms)` for each delay (1 s, then 2 s for exponential backoff) so the promise
+  chain settles between timers, and `vi.useRealTimers()` in `afterEach`.
 
 ## Trade-offs
 - **Injected fake: speed vs drift.** Fast and deterministic, but it can drift from the real client's

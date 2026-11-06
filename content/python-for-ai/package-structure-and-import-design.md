@@ -317,32 +317,21 @@ defers `torch` until the first call, so importing the package (or collecting tes
 side-effect free.
 
 ```python
-# src/myapp/
-#   domain/models.py        <- pure Pydantic models, no app imports
-#   services/agent.py       <- depends on domain + Protocols
-#   adapters/embeddings.py  <- imports torch / sentence-transformers lazily
-#   entrypoints/cli.py      <- composition root
-
-# services/agent.py
+# src/myapp/services/agent.py   (layers: entrypoints -> adapters -> services -> domain)
 from __future__ import annotations
-from typing import TYPE_CHECKING, Protocol
-from myapp.domain.models import Message
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:                      # seen by mypy/pyright, never executed at runtime
     from myapp.services.tools import ToolRegistry
 
-class LLM(Protocol):
-    def complete(self, messages: list[Message]) -> Message: ...
-
 class Agent:
-    def __init__(self, llm: LLM, tools: ToolRegistry) -> None:
-        self.llm, self.tools = llm, tools
+    def __init__(self, tools: ToolRegistry) -> None:   # an annotation only: no runtime import
+        self.tools = tools
 
-# adapters/embeddings.py
+# src/myapp/adapters/embeddings.py
 class LocalEmbedder:
     def __init__(self, model_name: str) -> None:
         self.model_name, self._model = model_name, None   # nothing heavy at import
-
     def embed(self, texts: list[str]) -> list[list[float]]:
         if self._model is None:
             from sentence_transformers import SentenceTransformer  # pays torch import on first use
@@ -356,26 +345,18 @@ class LocalEmbedder:
 Standard library only. It writes four tiny modules to a temp directory and shows both failure modes.
 
 ```python
-import sys, tempfile, textwrap, pathlib
+import sys, tempfile, pathlib
 from unittest import mock
 
 root = pathlib.Path(tempfile.mkdtemp())
-def write(name, src):
-    (root / name).write_text(textwrap.dedent(src))
-
-write("a.py", """
-    from b import helper          # runs b before X exists
-    X = 1
-""")
-write("b.py", """
-    from a import X               # a is in sys.modules but half-built
-    def helper(): return X
-""")
-write("llm.py", "def call(): return 'real network call'\n")
-write("rag.py", """
-    from llm import call          # copies the reference into rag's namespace
-    def answer(): return call()
-""")
+files = {
+    "a.py": "from b import helper\nX = 1\n",                 # runs b before X exists
+    "b.py": "from a import X\ndef helper(): return X\n",     # a is in sys.modules but half-built
+    "llm.py": "def call(): return 'real network call'\n",
+    "rag.py": "from llm import call\ndef answer(): return call()\n",   # copies the reference
+}
+for name, src in files.items():
+    (root / name).write_text(src)
 sys.path.insert(0, str(root))     # demo only: never do this in project code
 
 try:
@@ -418,12 +399,7 @@ include_external_packages = true   # required for the forbidden contract on open
 [[tool.importlinter.contracts]]
 name = "Layered architecture"
 type = "layers"
-layers = [
-    "myapp.entrypoints",
-    "myapp.adapters",
-    "myapp.services",
-    "myapp.domain",
-]
+layers = ["myapp.entrypoints", "myapp.adapters", "myapp.services", "myapp.domain"]
 
 [[tool.importlinter.contracts]]
 name = "Domain and services never import vendor SDKs"

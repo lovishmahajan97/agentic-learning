@@ -294,50 +294,11 @@ sequenceDiagram
 ```
 
 ## Examples
-### Agent scenario: MCP tools in your own tool-calling loop
-The agent connects to the ticket server below, exposes its tools to the model, executes the calls the
-model makes, and feeds results (including `isError` ones) back until the model answers.
+### Ticket server: a typed tool over stdio
+One tool whose type hints become the JSON Schema the model sees.
 
 ```python
-import asyncio, json
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from openai import AsyncOpenAI
-
-llm = AsyncOpenAI()
-
-async def run_agent(task: str, max_steps: int = 6) -> str:
-    params = StdioServerParameters(command="python", args=["server.py"])
-    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
-        await session.initialize()
-        tools = [{"type": "function", "function": {"name": t.name, "description": t.description,
-                  "parameters": t.inputSchema}} for t in (await session.list_tools()).tools]
-        messages = [{"role": "user", "content": task}]
-        for _ in range(max_steps):                         # step budget
-            msg = (await llm.chat.completions.create(
-                model="gpt-4o-mini", messages=messages, tools=tools)).choices[0].message
-            if not msg.tool_calls:
-                return msg.content
-            messages.append(msg)
-            for call in msg.tool_calls:
-                res = await session.call_tool(call.function.name, json.loads(call.function.arguments))
-                text = "".join(c.text for c in res.content if c.type == "text")
-                messages.append({"role": "tool", "tool_call_id": call.id,
-                                 "content": ("ERROR: " if res.isError else "") + text})
-        return "step budget exhausted"
-
-print(asyncio.run(run_agent("Open a high-priority ticket: VPN is down for the Berlin office.")))
-```
-
-- **The MCP schema is passed straight through** as the function's `parameters`, so the type hints on the
-  server are what constrain the model.
-- **`isError` results go back to the model,** which is the channel for recovering from a bad call.
-
-### Ticket server and stdio client
-A small ticket server and a client that calls it over stdio.
-
-```python
-# server.py
+# server.py   (pip install "mcp[cli]>=1.30,<2"; 2.x renamed FastMCP to MCPServer)
 from typing import Literal
 from mcp.server.fastmcp import FastMCP, Context
 
@@ -352,71 +313,40 @@ async def create_ticket(title: str, priority: Literal["low", "high"], ctx: Conte
     await ctx.info(f"created ticket {tid}")      # goes to the client, never to stdout
     return DB[tid]
 
-@mcp.resource("tickets://{tid}")
-def read_ticket(tid: int) -> str:
-    return str(DB.get(int(tid), "not found"))
-
 if __name__ == "__main__":
     mcp.run()                                    # stdio by default
+```
 
-# client.py
+- **The `priority` hint becomes an `enum`** in the schema, so the model sees exactly two legal values,
+  and a call with `"urgent"` is rejected before your code runs. `ctx` is absent from the schema because
+  FastMCP injects it.
+- **Inspect before any LLM is involved.** With the SDK's CLI extra installed, `mcp dev server.py` opens
+  the MCP Inspector, where you can see that schema and call the tool by hand.
+
+### Client: list and call tools, as an agent loop would
+An agent does exactly this each step: pass each tool's `inputSchema` to the model as the function
+`parameters`, then run the model's call and feed the text back (prefixed when `isError` is true).
+
+```python
 import asyncio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 async def main():
     params = StdioServerParameters(command="python", args=["server.py"])
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            print([t.name for t in (await session.list_tools()).tools])
-            res = await session.call_tool("create_ticket", {"title": "VPN down", "priority": "high"})
-            print(res.content[0].text, res.isError)
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+        await session.initialize()
+        tools = (await session.list_tools()).tools
+        print([t.name for t in tools], tools[0].inputSchema["properties"]["priority"]["enum"])
+        res = await session.call_tool("create_ticket", {"title": "VPN down", "priority": "high"})
+        print(res.isError, res.content[0].text)
+        bad = await session.call_tool("create_ticket", {"title": "x", "priority": "urgent"})
+        print(bad.isError)
 
 asyncio.run(main())
-```
-
-- **The `priority` hint becomes an `enum`** in the schema, so the model sees exactly two legal values,
-  and a call with `"urgent"` is rejected before your code runs.
-- **Generated `inputSchema` for `create_ticket`** is roughly
-  `{"type":"object","properties":{"title":{"type":"string"},"priority":{"enum":["low","high"],"type":"string"}},"required":["title","priority"]}`;
-  `ctx` is absent because FastMCP injects it.
-- **Inspect before any LLM is involved.** With the SDK's CLI extra installed, `mcp dev server.py` opens
-  the MCP Inspector, where you can see that schema and call the tool by hand.
-
-### Production shape: lifespan pool, actionable errors, stateless HTTP
-One database pool per process, errors the model can act on, and a transport that scales behind a load
-balancer when many agents share the server.
-
-```python
-import sys, logging
-from contextlib import asynccontextmanager
-import asyncpg
-from mcp.server.fastmcp import FastMCP, Context
-
-logging.basicConfig(stream=sys.stderr, level=logging.INFO)   # never stdout
-
-@asynccontextmanager
-async def lifespan(server: FastMCP):
-    pool = await asyncpg.create_pool("postgresql://app@db/tickets")
-    try:
-        yield {"pool": pool}                     # reachable from every tool's ctx
-    finally:
-        await pool.close()
-
-mcp = FastMCP("tickets", lifespan=lifespan, stateless_http=True)
-
-@mcp.tool()
-async def get_ticket(ticket_id: int, ctx: Context) -> dict:
-    """Fetch one ticket by numeric id. Use search_tickets first if you only have a title."""
-    pool = ctx.request_context.lifespan_context["pool"]
-    row = await pool.fetchrow("SELECT id, title, status FROM tickets WHERE id = $1", ticket_id)
-    if row is None:
-        raise ValueError(f"ticket {ticket_id} does not exist; call search_tickets with a title")
-    return dict(row)
-
-if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+# ['create_ticket'] ['low', 'high']
+# False {"id": 1, "title": "VPN down", "priority": "high"}   (printed as indented JSON)
+# True
 ```
 
 ### Worked scenario: "session not found" after scaling out
@@ -461,6 +391,8 @@ still falls as near-duplicate tools pile up.
   `inputSchema`) under a real `ClientSession` in CI and fail on unreviewed changes, because a renamed
   parameter or reworded docstring changes model behaviour. Put Streamable HTTP behind auth and origin
   checks, and audit-log every `tools/call` with caller identity.
+- **Cap the agent loop that drives MCP tools.** Give the model loop a step budget (6 steps is a sensible
+  start) and return `isError` results to the model as tool messages, since that is how it recovers.
 
 ## Trade-offs
 - **Every host vs a process boundary.** One MCP server makes a tool usable from every compliant host, but

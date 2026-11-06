@@ -353,61 +353,41 @@ sequenceDiagram
 ```
 
 ## Examples
-### HTTP on the wire: a raw-socket client against a fake LLM
-Stdlib only. A local server plays a provider that rate limits the first call. The client writes the
-request bytes by hand, parses the status line and headers, honours `Retry-After`, and reuses one TCP
-connection for both attempts (tested with Python 3.9.6).
+### HTTP on the wire: a raw-socket request to a fake LLM
+Stdlib only. A local server plays a provider that rate limits the call. The client writes the request
+bytes by hand and prints the raw response: status line, headers, blank line, body (tested with Python
+3.9.6 and 3.12.14).
 
 ```python
-import json, socket, threading, time
+import json, socket, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
-calls = {"n": 0}
-
-class FakeLLM(BaseHTTPRequestHandler):           # stands in for a model provider
-    protocol_version = "HTTP/1.1"                 # keep-alive: one TCP connection, many requests
+class FakeLLM(BaseHTTPRequestHandler):            # stands in for a rate-limited model provider
+    protocol_version = "HTTP/1.1"
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        calls["n"] += 1
-        if calls["n"] == 1:                       # first call: rate limited
-            status, payload, extra = 429, {"error": "rate_limited"}, {"Retry-After": "1"}
-        else:
-            status, payload, extra = 200, {"content": f"echo: {body['messages'][-1]['content']}"}, {}
-        data = json.dumps(payload).encode()
-        self.send_response(status)
-        for k, v in {"Content-Type": "application/json", "Content-Length": str(len(data)), **extra}.items():
-            self.send_header(k, v)
+        self.rfile.read(int(self.headers["Content-Length"]))
+        data = json.dumps({"error": "rate_limited"}).encode()
+        self.send_response(429)
+        self.send_header("Retry-After", "1")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers(); self.wfile.write(data)
     def log_message(self, *a): pass
-
 srv = HTTPServer(("127.0.0.1", 0), FakeLLM)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
-port = srv.server_address[1]
-
-def call(sock, prompt):
-    body = json.dumps({"model": "demo", "messages": [{"role": "user", "content": prompt}]}).encode()
-    head = (f"POST /v1/chat HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
-            f"Authorization: Bearer test-key\r\nContent-Type: application/json\r\n"
-            f"Content-Length: {len(body)}\r\n\r\n").encode()
-    sock.sendall(head + body)                    # the request is just these bytes
-    f = sock.makefile("rb")
-    status_line = f.readline().decode().strip()
-    headers = {}
-    while (line := f.readline().decode().strip()):
-        k, v = line.split(": ", 1); headers[k.lower()] = v
-    return status_line, headers, json.loads(f.read(int(headers["content-length"])))
-
-sock = socket.create_connection(("127.0.0.1", port), timeout=5)
-for attempt in range(3):
-    status, headers, data = call(sock, "hello")
-    print(attempt, status, data)
-    if status.split()[1] == "429":
-        time.sleep(float(headers.get("retry-after", "1")))   # honour the server's hint
-        continue
-    break
-# Output:
-# 0 HTTP/1.1 429 Too Many Requests {'error': 'rate_limited'}
-# 1 HTTP/1.1 200 OK {'content': 'echo: hello'}
+body = json.dumps({"model": "demo", "messages": [{"role": "user", "content": "hi"}]}).encode()
+request = (b"POST /v1/chat HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer test-key\r\n"
+           b"Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
+           % len(body)) + body
+sock = socket.create_connection(srv.server_address, timeout=5)
+sock.sendall(request)                             # a request is just these bytes
+print(sock.makefile("rb").read().decode())        # so is the response
+# Output (Server and Date values vary):
+# HTTP/1.1 429 Too Many Requests
+# Server: BaseHTTP/0.6 Python/3.9.6
+# Date: Thu, 05 Nov 2026 12:04:46 GMT
+# Retry-After: 1
+# Content-Length: 25
+#
+# {"error": "rate_limited"}
 ```
 
 ### Where the time goes: curl's phase timings
@@ -447,6 +427,8 @@ connection to a distant region the setup rows can rival it. That is the argument
   upstream.
 - **Log the request id and rate-limit headers.** Attach provider request ids and remaining-quota headers
   to the agent trace span, so a slow or failed step can be matched to the provider's side.
+- **Read each response fully before reusing a connection.** HTTP/1.1 keep-alive sends the next request
+  on the same TCP connection only after the previous body (sized by `Content-Length`) is consumed.
 
 ## Trade-offs
 - **Connection reuse vs stale connections.** Pooled connections save round trips, but a server or proxy

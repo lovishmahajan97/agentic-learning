@@ -273,21 +273,14 @@ Requires `llama-index-core` and `llama-index-llms-openai` with an OpenAI key; an
 integration works the same way.
 
 ```python
-import asyncio, os
+import asyncio
 from datetime import date
-from llama_index.core import SimpleDirectoryReader, StorageContext, VectorStoreIndex, load_index_from_storage
+from llama_index.core import SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core.agent.workflow import FunctionAgent
 from llama_index.core.tools import QueryEngineTool
 from llama_index.llms.openai import OpenAI
 
-PERSIST = "./storage"
-if os.path.exists(PERSIST):                       # reuse embeddings instead of paying again
-    index = load_index_from_storage(StorageContext.from_defaults(persist_dir=PERSIST))
-else:
-    docs = SimpleDirectoryReader("./policies").load_data()
-    index = VectorStoreIndex.from_documents(docs)
-    index.storage_context.persist(persist_dir=PERSIST)
-
+index = VectorStoreIndex.from_documents(SimpleDirectoryReader("./policies").load_data())
 policy_tool = QueryEngineTool.from_defaults(
     query_engine=index.as_query_engine(similarity_top_k=4),
     name="policy_search",
@@ -298,22 +291,18 @@ def days_between(start: str, end: str) -> int:
     """Number of days between two ISO dates (YYYY-MM-DD)."""
     return (date.fromisoformat(end) - date.fromisoformat(start)).days
 
-agent = FunctionAgent(
-    tools=[policy_tool, days_between],
-    llm=OpenAI(model="gpt-4o-mini"),
-    system_prompt="Answer only from policy_search results, name the policy, and say 'not covered' if unsure.",
-)
+agent = FunctionAgent(tools=[policy_tool, days_between], llm=OpenAI(model="gpt-4o-mini"),
+                      system_prompt="Answer only from policy_search results; say 'not covered' if unsure.")
 
 async def main():
     resp = await agent.run(user_msg="Bought 2025-03-01, asking for a refund on 2025-04-10. Eligible?")
-    print(str(resp))
+    print(resp)   # names the refund window and the 40-day gap
 
 asyncio.run(main())
 ```
 
 - **What to notice.** The agent must call `days_between` (40 days) and `policy_search`, then combine
   them. Arithmetic goes to code, not to the model.
-- **Persisting** the index means the second run embeds nothing; in production the vector store does this.
 
 ### A corrective-RAG workflow that refuses on weak evidence
 A workflow makes the "is the evidence good enough" branch explicit instead of hoping the agent decides.
@@ -373,6 +362,9 @@ class GuardedRAG(Workflow):
 - **Bound runs and costs.** Set a workflow `timeout`, cap `similarity_top_k`, use a cheaper LLM for
   synthesis than for planning, and log tokens per run. Embedding re-runs are the hidden cost; caching in
   the pipeline avoids paying for unchanged documents.
+- **Persist the index between runs.** Call `index.storage_context.persist(persist_dir=...)` once and load
+  it with `load_index_from_storage(StorageContext.from_defaults(persist_dir=...))`, or use a persistent
+  vector store, so a restart embeds nothing.
 
 ## Trade-offs
 - **Fast retrieval scaffolding vs abstraction depth.** You get working RAG in 20 lines, but defaults

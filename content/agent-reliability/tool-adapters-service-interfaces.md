@@ -373,45 +373,32 @@ from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
 import httpx
 
+PROJECT_IDS = {"billing": 10432, "platform": 1, "support": 2}      # vendor IDs stay in the adapter
+
 class CreateTicketArgs(BaseModel):
     title: str = Field(max_length=120)
-    body: str
-    priority: Literal["low", "normal", "high"] = "normal"
     project: Literal["billing", "platform", "support"]     # enum for the model, ID for the vendor
 
-class TicketAdapter:
-    def __init__(self, client: httpx.Client, project_ids: dict[str, int], vault, web_base: str):
-        self.client, self.project_ids, self.vault = client, project_ids, vault
-        self.web_base = web_base.rstrip("/")                 # UI host, not the API base_url
-
-    def create_ticket(self, raw_args: dict, *, user: str, idempotency_key: str) -> dict:
-        try:
-            a = CreateTicketArgs.model_validate(raw_args)                  # 1. validate before side effects
-        except ValidationError as e:     # same args will fail again: the model must fix them
-            return {"ok": False, "error": "invalid_arguments", "retryable": False,
-                    "detail": [f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors()]}
-        payload = {"summary": a.title, "description": a.body,            # 3. translate to vendor shape
-                   "priority_code": {"low": 3, "normal": 2, "high": 1}[a.priority],
-                   "project_id": self.project_ids[a.project]}
-        headers = {"Authorization": f"Bearer {self.vault.token_for(user, 'tickets', ttl_s=300)}",  # 4.
-                   "Idempotency-Key": idempotency_key}                     # 5. retry cannot double-create
-        try:
-            r = self.client.post("/v2/tickets", json=payload, headers=headers, timeout=10.0)
-        except httpx.TimeoutException:
-            return {"ok": False, "error": "upstream_timeout", "retryable": True}
-        except httpx.TransportError:                       # DNS, refused, reset: never raise to the loop
-            return {"ok": False, "error": "upstream_error", "retryable": True}
-        if r.status_code == 429:                  # Retry-After may be seconds or an HTTP date
-            ra = r.headers.get("Retry-After", "")
-            return {"ok": False, "error": "rate_limited", "retryable": True,
-                    "retry_after_s": int(ra) if ra.isdigit() else 5}
-        if r.status_code >= 400:                                          # 6. one error vocabulary
-            err = {401: "denied", 403: "denied", 404: "not_found"}.get(r.status_code, "upstream_error")
-            return {"ok": False, "error": err, "retryable": r.status_code >= 500,
-                    "http_status": r.status_code}       # raw vendor body goes to the trace, not the model
-        d = r.json()                                                       # 7. project the response
-        return {"ok": True, "ticket_id": d["id"], "status": d["status"],
-                "url": f"{self.web_base}/tickets/{d['id']}"}
+def create_ticket(client: httpx.Client, raw_args: dict, *, idempotency_key: str) -> dict:
+    try:
+        a = CreateTicketArgs.model_validate(raw_args)              # validate before side effects
+    except ValidationError as e:                                   # the model must fix the args
+        return {"ok": False, "error": "invalid_arguments", "retryable": False,
+                "detail": [x["loc"][0] for x in e.errors()]}
+    payload = {"summary": a.title, "project_id": PROJECT_IDS[a.project]}   # translate to vendor shape
+    try:
+        r = client.post("/v2/tickets", json=payload, timeout=10.0,
+                        headers={"Idempotency-Key": idempotency_key})   # retry cannot double-create
+    except httpx.TimeoutException:                                  # never raise to the loop
+        return {"ok": False, "error": "upstream_timeout", "retryable": True}
+    if r.status_code == 429:
+        return {"ok": False, "error": "rate_limited", "retryable": True,
+                "retry_after_s": int(r.headers.get("Retry-After", "5"))}
+    if r.status_code >= 400:                                        # one error vocabulary
+        err = {401: "denied", 403: "denied", 404: "not_found"}.get(r.status_code, "upstream_error")
+        return {"ok": False, "error": err, "retryable": r.status_code >= 500}
+    d = r.json()                                                    # project the response
+    return {"ok": True, "ticket_id": d["id"], "status": d["status"]}
 ```
 
 ### Contract test against a fake vendor
@@ -421,35 +408,27 @@ touching production. The handler plays back a big vendor response and a rate lim
 ```python
 import httpx
 
-class FakeVault:
-    def token_for(self, user, tool, ttl_s):
-        return "test-token"
-
 def vendor(request: httpx.Request) -> httpx.Response:
     if request.headers["Idempotency-Key"] == "run-1:step-3":
         return httpx.Response(201, json={"id": 88, "status": "open", "custom_fields": ["..."] * 40})
     return httpx.Response(429, headers={"Retry-After": "7"})
 
 client = httpx.Client(transport=httpx.MockTransport(vendor), base_url="https://api.vendor.example")
-ad = TicketAdapter(client, {"billing": 10432, "platform": 1, "support": 2}, FakeVault(),
-                   web_base="https://tickets.example/")
-args = {"title": "Refund stuck", "body": "Order o-1", "project": "billing"}
+args = {"title": "Refund stuck", "project": "billing"}
 
-assert ad.create_ticket(args, user="u1", idempotency_key="run-1:step-3") == {
-    "ok": True, "ticket_id": 88, "status": "open", "url": "https://tickets.example/tickets/88"}
-assert ad.create_ticket(args, user="u1", idempotency_key="other")["retry_after_s"] == 7
-assert ad.create_ticket({"title": "x", "body": "y", "project": "sales"},
-                        user="u1", idempotency_key="k")["error"] == "invalid_arguments"
+print(create_ticket(client, args, idempotency_key="run-1:step-3"))  # {'ok': True, 'ticket_id': 88, 'status': 'open'}
+print(create_ticket(client, args, idempotency_key="other"))  # {... 'rate_limited' ..., 'retry_after_s': 7}
+print(create_ticket(client, {"title": "x"}, idempotency_key="k"))  # {... 'detail': ['project']}
 ```
 
 ### Worked mapping: what the model sees for each vendor outcome
 | Vendor outcome | Adapter result | What the runtime or model does next |
 |---|---|---|
-| 201 with a 40-field body | `ok: true` with 4 fields | Uses `ticket_id` in the next step |
+| 201 with a 40-field body | `ok: true` with 3 fields | Uses `ticket_id` in the next step |
 | Missing `project` in arguments | `invalid_arguments`, `retryable: false`, field named | Model fixes the argument, no network call made |
 | 429, `Retry-After: 7` | `rate_limited`, `retry_after_s: 7` | Runtime waits, model does not burn a turn |
 | 403 | `denied`, `retryable: false` | Model re-plans or asks the user |
-| 502 HTML page | `upstream_error`, `retryable: true`, `http_status: 502` | Bounded retry; raw page goes to the trace only |
+| 502 HTML page | `upstream_error`, `retryable: true` | Bounded retry; raw page goes to the trace only |
 | Timeout after 10 s | `upstream_timeout`, `retryable: true` | Retry with the same idempotency key, so no duplicate |
 
 ## Production patterns
@@ -472,6 +451,10 @@ assert ad.create_ticket({"title": "x", "body": "y", "project": "sales"},
 - **Blob offload for big results.** When: a response would exceed a few thousand tokens. How: write the
   full payload to object storage, return a reference, a summary and a cursor. Monitor: fraction of
   responses truncated or offloaded per tool.
+- **Credentials and transport errors in the adapter.** Inject a per-user, per-tool vault token with a short
+  TTL (for example 300 s) at call time; map DNS, refused and reset errors (`httpx.TransportError`) to
+  `upstream_error` too; parse `Retry-After` as either seconds or an HTTP date; log the raw vendor body and
+  HTTP status to the trace, never to the model.
 
 ## Trade-offs
 - **Adapter per tool vs generic HTTP tool.** An adapter is code to write and maintain, but it is the only

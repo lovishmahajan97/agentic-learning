@@ -465,21 +465,17 @@ providers with deterministic and rubric assertions.
 
 ```python
 # test_support_bot.py — run with: deepeval test run test_support_bot.py
-# imports and signatures checked against deepeval 4.3.3, 2026-11 (needs Python 3.10+). SingleTurnParams
-# replaces LLMTestCaseParams, which now only emits a DeprecationWarning. Judge metrics need a model API key.
+# checked against deepeval 4.3.3, 2026-11 (Python 3.10+); SingleTurnParams replaces the deprecated
+# LLMTestCaseParams. Judge metrics need a model API key.
 import pytest
 from deepeval import assert_test
 from deepeval.metrics import FaithfulnessMetric, GEval
 from deepeval.test_case import LLMTestCase, SingleTurnParams
 from my_app import answer_with_context      # returns (answer: str, retrieved_chunks: list[str])
 
-handoff = GEval(
-    name="AccountDataHandoff",
-    criteria="If the input asks for account-specific data (invoices, usage, balances), the output must "
-             "offer a handoff to a person or a self-service link instead of stating a figure.",
-    evaluation_params=[SingleTurnParams.INPUT, SingleTurnParams.ACTUAL_OUTPUT],
-    threshold=0.8,
-)
+handoff = GEval(name="AccountDataHandoff", threshold=0.8,
+                criteria="For account-specific data (invoices, balances), offer a handoff, never a figure.",
+                evaluation_params=[SingleTurnParams.INPUT, SingleTurnParams.ACTUAL_OUTPUT])
 
 @pytest.mark.parametrize("question", ["How do I enable SCIM?", "What was my invoice total last month?"])
 def test_answer(question):
@@ -489,8 +485,7 @@ def test_answer(question):
 ```
 
 ```yaml
-# promptfooconfig.yaml — run with: npx promptfoo eval && npx promptfoo view
-# `promptfoo validate` accepts this config (checked with promptfoo 0.125.1, 2026-11)
+# promptfooconfig.yaml — npx promptfoo eval && npx promptfoo view (validated with promptfoo 0.125.1, 2026-11)
 prompts: [file://prompts/support_v7.txt, file://prompts/support_v8.txt]
 providers: [openai:chat:MODEL_A, anthropic:messages:MODEL_B]   # substitute current model ids
 tests:
@@ -513,20 +508,13 @@ tests:
 # judge, so set OPENAI_API_KEY (a placeholder works for this path) or pass model=.
 from deepeval.metrics import ToolCorrectnessMetric
 from deepeval.test_case import LLMTestCase, ToolCall
-
-def tool_case(question, answer, called):
-    return LLMTestCase(input=question, actual_output=answer,
+for answer, called in [("It was $412.00.", ["get_account"]), ("It was $380.00.", [])]:  # 2nd skips the tool
+    case = LLMTestCase(input="Last invoice total?", actual_output=answer,
                        tools_called=[ToolCall(name=n) for n in called],
                        expected_tools=[ToolCall(name="get_account")])
-
-good = tool_case("What was my last invoice total?", "It was $412.00.", ["get_account"])
-skipped = tool_case("What was my last invoice total?", "It was $380.00.", [])   # invented figure
-for case in (good, skipped):
     metric = ToolCorrectnessMetric(threshold=1.0, async_mode=False)
     metric.measure(case)
-    print(metric.score, metric.success)
-# 1.0 True
-# 0.0 False
+    print(metric.score, metric.success)     # 1.0 True, then 0.0 False
 ```
 
 - **What it adds over your own check:** the score and a `reason` in DeepEval's report, and options such
@@ -540,9 +528,8 @@ A LangGraph agent evaluated on a LangSmith dataset with two of your own scorers:
 on the trajectory. The target runs the full loop per item and returns the tool calls it made.
 
 ```python
-# assumes langsmith 0.2+ (evaluators may take outputs/reference_outputs and return a bool; the evaluate
-# signature, incl. num_repetitions, checked against langsmith 0.14.12), LANGSMITH_API_KEY and tracing
-# env vars set, and a dataset "support-agent-v3" that already exists
+# langsmith 0.2+ (evaluate signature, incl. num_repetitions, checked against langsmith 0.14.12); needs
+# LANGSMITH_API_KEY, tracing env vars and an existing dataset "support-agent-v3"
 from langsmith.evaluation import evaluate
 from my_agent import agent          # compiled graph, e.g. langchain.agents.create_agent(model, tools)
 
@@ -556,7 +543,7 @@ def resolved(outputs: dict, reference_outputs: dict) -> bool:
 
 def right_tools(outputs: dict, reference_outputs: dict) -> bool:
     used = set(outputs["tools"])
-    return set(reference_outputs["required_tools"]) <= used and not (used & {"issue_refund"})
+    return set(reference_outputs["required_tools"]) <= used and "issue_refund" not in used
 
 evaluate(target, data="support-agent-v3", evaluators=[resolved, right_tools],
          experiment_prefix="planner-prompt-v8", num_repetitions=3)   # k samples per item
@@ -579,6 +566,8 @@ quality and a trajectory judge) at one call each.
 
 - **The agent, not the judge, dominates here,** unlike single-call features, so cheaper tiers come from a
   smaller smoke subset of tasks per PR, not only from dropping judges.
+- **For a single-call feature the judge dominates:** 500 rows × 3 judge metrics × 2 calls × 3 samples is
+  9,000 judge calls per run, so judges run nightly and deterministic checks per commit.
 
 ### What the numbers mean underneath
 | Tool | Calculation | Result |
@@ -596,23 +585,8 @@ quality and a trajectory judge) at one call each.
   faithfulness would be 1.0 and the test would pass.
 - **What catches it:** the Promptfoo `contains: SCIM` and the rubric assertion. The general lesson: pair
   every context-relative metric with a check against the task itself.
-
-### Budgeting judge spend before you wire the gate
-Pure Python: estimate calls per run and see why the faithfulness ratio favours short answers.
-
-```python
-def judge_calls(rows, judge_metrics, calls_per_metric, samples):
-    return rows * judge_metrics * calls_per_metric * samples
-
-def faithfulness(supported, extracted):
-    return supported / extracted
-
-print(judge_calls(500, 3, 2, 3))         # 9000 per run: nightly, not per commit
-print(judge_calls(500, 0, 2, 3))         # 0: deterministic checks only, cheap enough per commit
-print(faithfulness(1, 1))                # 1.0  terse answer, one supported claim
-print(faithfulness(9, 10))               # 0.9  thorough answer with one unsupported aside
-print(faithfulness(3, 4))                # 0.75 the SCIM case above
-```
+- **The ratio favours short answers:** one supported claim out of one scores 1.0, nine out of ten
+  scores 0.9.
 
 ## Production patterns
 - **Pin the judge and the library.** Whenever a model-graded metric gates CI, set the grading model

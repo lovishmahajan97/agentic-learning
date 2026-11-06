@@ -327,52 +327,35 @@ flowchart TD
 ## Examples
 ### Agent scenario: run, step and tool context on every line
 The loop binds `run_id` for the whole run and `step` and `tool` per iteration with structlog's
-`bound_contextvars` context manager, so the provider client's and httpx's logs inherit them too.
+`bound_contextvars` context manager, so every event inside, including the provider client's and httpx's
+logs, inherits them.
 
 ```python
-import hashlib, json, time, structlog
+# pip install structlog
+import structlog
 
+structlog.configure(processors=[
+    structlog.contextvars.merge_contextvars,        # copies bound fields onto every event
+    structlog.processors.add_log_level,
+    structlog.processors.JSONRenderer(),
+])
 log = structlog.get_logger()
 
-def arg_shape(args: dict) -> dict:
-    blob = json.dumps(args, sort_keys=True).encode()
-    return {"arg_keys": sorted(args), "arg_hash": hashlib.sha256(blob).hexdigest()[:12]}
-
-async def run_agent(run_id: str, messages: list, llm, tools, max_steps: int = 20):
-    totals = {"prompt_tokens": 0, "completion_tokens": 0}
+def run_agent(run_id: str, tool_calls: list[str]) -> None:
     with structlog.contextvars.bound_contextvars(run_id=run_id):
-        for step in range(1, max_steps + 1):
-            with structlog.contextvars.bound_contextvars(step=step):
-                t0 = time.perf_counter()
-                reply = await llm.complete(messages, tools=tools.schemas())
-                totals["prompt_tokens"] += reply.usage.prompt_tokens
-                totals["completion_tokens"] += reply.usage.completion_tokens
-                log.info("llm_call_finished", model=reply.model, finish_reason=reply.finish_reason,
-                         prompt_tokens=reply.usage.prompt_tokens,
-                         completion_tokens=reply.usage.completion_tokens,
-                         latency_ms=round((time.perf_counter() - t0) * 1000),
-                         tool_calls=len(reply.tool_calls))
-                if not reply.tool_calls:
-                    log.info("agent_run_finished", stop_reason="done", steps=step, **totals)
-                    return reply.text
-                messages.append(reply.message)
-                for call in reply.tool_calls:
-                    with structlog.contextvars.bound_contextvars(tool=call.name):
-                        t1, outcome = time.perf_counter(), "ok"
-                        try:
-                            result = await tools.call(call.name, call.arguments)
-                        except Exception as e:
-                            outcome, result = "error", f"error: {type(e).__name__}"
-                        log.info("tool_call_finished", outcome=outcome, result_chars=len(str(result)),
-                                 latency_ms=round((time.perf_counter() - t1) * 1000),
-                                 **arg_shape(call.arguments))
-                        messages.append({"role": "tool", "tool_call_id": call.id, "content": str(result)})
-        log.warning("agent_run_finished", stop_reason="max_steps", steps=max_steps, **totals)
+        for step, tool in enumerate(tool_calls, start=1):
+            with structlog.contextvars.bound_contextvars(step=step, tool=tool):
+                log.info("tool_call_finished", outcome="ok", latency_ms=120)
+        log.info("agent_run_finished", stop_reason="done", steps=len(tool_calls))
+
+run_agent("r1", ["search_orders"])
+# {"outcome": "ok", "latency_ms": 120, "event": "tool_call_finished", "run_id": "r1", "step": 1, "tool": "search_orders", "level": "info"}
+# {"stop_reason": "done", "steps": 1, "event": "agent_run_finished", "run_id": "r1", "level": "info"}
+# (the order of the bound run_id, step and tool fields can vary from run to run)
 ```
 
-- **`llm` and `tools` are your own interfaces;** the fields and binding pattern are the point.
-- **Arguments are logged as keys plus a hash,** so you can see the model repeating an identical call
-  without copying customer data into logs.
+- **In a real loop,** log tool arguments as their keys plus a short hash, so you can see the model
+  repeating an identical call without copying customer data into logs.
 
 ### Worked scenario: finding a looping agent from logs alone
 Illustrative numbers from one day of `agent_run_finished` and `tool_call_finished` events.
@@ -388,65 +371,12 @@ Illustrative numbers from one day of `agent_run_finished` and `tool_call_finishe
   repeated-identical-call guard in the loop.
 - **Verify** with the same queries the next day: `max_steps` share and tokens per run should both fall.
 
-### JSON logs, request context and one event per LLM call
-```python
-import time, uuid, logging, structlog
-from fastapi import FastAPI, Request
-
-structlog.configure(processors=[
-    structlog.contextvars.merge_contextvars,
-    structlog.processors.add_log_level,
-    structlog.processors.TimeStamper(fmt="iso"),
-    structlog.processors.format_exc_info,
-    structlog.processors.JSONRenderer(),
-])
-log = structlog.get_logger()
-app = FastAPI()
-
-@app.middleware("http")
-async def bind_request_context(request: Request, call_next):
-    structlog.contextvars.clear_contextvars()
-    rid = request.headers.get("x-request-id") or uuid.uuid4().hex
-    structlog.contextvars.bind_contextvars(request_id=rid,
-                                           tenant=request.headers.get("x-tenant", "unknown"))
-    start, status = time.perf_counter(), 500     # 500 is what the client gets if call_next raises
-    try:
-        response = await call_next(request)
-        status = response.status_code
-        response.headers["x-request-id"] = rid
-        return response
-    except Exception:
-        log.exception("request_failed")            # traceback as a structured field
-        raise
-    finally:
-        route = request.scope.get("route")         # set by the router during call_next
-        log.info("request_finished", status=status, route=getattr(route, "path", "unmatched"),
-                 duration_ms=round((time.perf_counter() - start) * 1000))
-
-@app.post("/v1/chat")
-async def chat(body: dict):
-    usage = {"prompt_tokens": 812, "completion_tokens": 240}       # from the provider response
-    log.info("llm_call_finished", model="model-a", prompt_version="support-v14",
-             finish_reason="stop", latency_ms=2310, **usage,      # measured around the real call
-             prompt_chars=sum(len(m.get("content", "")) for m in body.get("messages", [])))
-    return {"content": "..."}
-```
-
-- **One request yields lines like**
-  `{"request_id": "9f2c...", "tenant": "acme", "model": "model-a", "prompt_tokens": 812, "event": "llm_call_finished", ...}`.
-- **Cost per tenant is a one-liner:** group `llm_call_finished` by `tenant` and sum tokens in any log
-  platform.
-- **The `try/finally` matters.** Without it, a handler that raises skips `request_finished`, so the
-  requests you most need (the 500s) are exactly the ones missing from the logs.
-- **Streaming caveat.** For a `StreamingResponse`, `request_finished` fires when headers are sent, so log
-  stream completion and token counts from inside the generator instead.
-
 ### One pipeline for stdlib, Uvicorn and a redaction safety net
-Library and Uvicorn error logs go through the same processors, and any field with a sensitive name is
-masked before rendering.
+Library and Uvicorn logs go through the same processors, and any field with a sensitive name is masked
+before rendering.
 
 ```python
-import logging, os, structlog
+import logging, structlog
 
 SENSITIVE = {"prompt", "messages", "completion", "api_key", "authorization"}
 
@@ -455,31 +385,30 @@ def redact(logger, method_name, event_dict):
         event_dict[key] = "[redacted]"
     return event_dict
 
-shared = [structlog.contextvars.merge_contextvars,
-          structlog.stdlib.add_log_level,
-          structlog.processors.TimeStamper(fmt="iso")]
-
+shared = [structlog.contextvars.merge_contextvars, structlog.stdlib.add_log_level]
 structlog.configure(processors=shared + [structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
                     logger_factory=structlog.stdlib.LoggerFactory())
 
-renderer = (structlog.dev.ConsoleRenderer() if os.getenv("LOG_FORMAT") == "console"
-            else structlog.processors.JSONRenderer())
-formatter = structlog.stdlib.ProcessorFormatter(
-    foreign_pre_chain=shared,                       # for httpx, SQLAlchemy, Uvicorn records
-    processors=[structlog.stdlib.ProcessorFormatter.remove_processors_meta,
-                redact, structlog.processors.format_exc_info, renderer])
-
 handler = logging.StreamHandler()
-handler.setFormatter(formatter)
+handler.setFormatter(structlog.stdlib.ProcessorFormatter(
+    foreign_pre_chain=shared,                       # for httpx, SQLAlchemy, Uvicorn records
+    processors=[structlog.stdlib.ProcessorFormatter.remove_processors_meta, redact,
+                structlog.processors.format_exc_info, structlog.processors.JSONRenderer()]))
 root = logging.getLogger()
 root.handlers = [handler]
 root.setLevel(logging.INFO)                         # setLevel, not .level =, so cached levels reset
 for name in ("uvicorn", "uvicorn.error"):           # Uvicorn ships its own handlers; reroute them
     logging.getLogger(name).handlers = []
     logging.getLogger(name).propagate = True
+
+structlog.get_logger().info("llm_call_finished", prompt="secret", prompt_tokens=812)
+logging.getLogger("httpx").info("HTTP Request: POST /v1/chat")
+# {"prompt": "[redacted]", "prompt_tokens": 812, "event": "llm_call_finished", "level": "info"}
+# {"event": "HTTP Request: POST /v1/chat", "level": "info"}
 ```
 
-- **Run with `--no-access-log`** so the middleware's `request_finished` replaces Uvicorn's text access line.
+- **Run with `--no-access-log`** so a middleware `request_finished` event replaces Uvicorn's text access
+  line.
 - **Mind the order.** Uvicorn applies its own logging config before it imports your app, so running this at
   import time under the CLI wins. If you call `uvicorn.run(...)` after configuring, pass `log_config=None`
   or Uvicorn reinstalls its own plain-text handlers on its loggers.
@@ -505,6 +434,14 @@ for name in ("uvicorn", "uvicorn.error"):           # Uvicorn ships its own hand
   event-loop lag under log bursts, and the share of lines with a `trace_id`.
 - **Context across the queue.** Put `request_id`, `run_id` and tenant in every job payload and call
   `bind_contextvars` first thing in the worker. Monitor: worker log lines with no `request_id` or `run_id`.
+- **Request context in middleware.** At the start of each request call `clear_contextvars()`, then
+  `bind_contextvars(request_id=..., tenant=...)` (reuse an incoming `x-request-id` and echo it on the
+  response), and emit `request_finished` with status, route and duration from a `finally`, so the
+  requests that raise (the 500s) are logged too. Group `llm_call_finished` by `tenant` for cost per
+  tenant. For a `StreamingResponse`, middleware finishes when headers are sent, so log stream completion
+  and token counts from inside the generator.
+- **Timestamps on every line.** Add `structlog.processors.TimeStamper(fmt="iso")` to the shared
+  processors so app and library lines carry the same ISO timestamp.
 
 ## Trade-offs
 - **Queryable JSON vs terminal readability.** JSON lines are trivially queryable but harder to read raw;

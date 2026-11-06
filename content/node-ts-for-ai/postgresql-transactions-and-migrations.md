@@ -436,13 +436,9 @@ flowchart TD
 ```
 
 ## Examples
-### Transaction helper and idempotent step recorder
-A `withTransaction` helper on raw `pg` that pins one client, releases it on every path and retries
-transient aborts, plus a step recorder that is idempotent (unique step id) and charges the budget with
-an atomic predicate update so no explicit row lock is needed.
-
-The SQL file shows an expand step with a concurrent index, which must run outside the tool's
-transaction.
+### Transaction helper on one pinned client
+A `withTransaction` helper on raw `pg` that pins one client, rolls back on any error, releases the client
+on every path and retries only transient aborts (serialization failures and deadlocks).
 
 ```ts
 import { Pool, PoolClient } from "pg";
@@ -451,22 +447,27 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
 export async function withTransaction<T>(fn: (tx: PoolClient) => Promise<T>, retries = 3): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     const client = await pool.connect();                // one connection for the whole transaction
-    let broken = false;
     try {
-      await client.query("BEGIN");                      // add "ISOLATION LEVEL SERIALIZABLE" if you rely on it
+      await client.query("BEGIN");
       const result = await fn(client);
       await client.query("COMMIT");
       return result;
     } catch (err: any) {
-      await client.query("ROLLBACK").catch(() => { broken = true; });   // socket gone: do not reuse
+      await client.query("ROLLBACK").catch(() => {});
       const transient = err.code === "40001" || err.code === "40P01";   // serialization failure / deadlock
       if (!transient || attempt >= retries) throw err;
     } finally {
-      client.release(broken);                           // always release; `true` destroys a broken client
+      client.release();                                 // always release, or connect() eventually hangs
     }
   }
 }
+```
 
+### Idempotent step recorder
+The step insert is idempotent on a unique step id, and the budget is charged with an atomic predicate
+update, so no explicit row lock is needed; the outbox row commits with both.
+
+```ts
 export async function recordStep(tenant: string, runId: string, stepId: string, tokens: number, content: string) {
   return withTransaction(async (tx) => {
     const inserted = await tx.query(                    // idempotent: a redelivered job hits the unique key
@@ -480,13 +481,6 @@ export async function recordStep(tenant: string, runId: string, stepId: string, 
     return "recorded";
   });
 }
-```
-
-```sql
--- 0007_add_embedding.sql  (expand step; tool configured NOT to wrap this file in a transaction)
-SET lock_timeout = '5s';
-ALTER TABLE documents ADD COLUMN embedding vector(1536);        -- nullable: metadata-only change
-CREATE INDEX CONCURRENTLY documents_embedding_hnsw ON documents USING hnsw (embedding vector_cosine_ops);
 ```
 
 ### Worked scenario: three ways to charge 1,000 tokens twice
@@ -564,6 +558,12 @@ ALTER TABLE messages DROP CONSTRAINT messages_tenant_nn;
 - **Post-build index check.** After any `CREATE INDEX CONCURRENTLY`, query
   `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid` and drop or rebuild what it returns,
   because a failed concurrent build leaves an INVALID index that still slows writes.
+- **Destroy clients whose `ROLLBACK` fails.** If the rollback itself errors (the socket is gone), call
+  `client.release(true)` so the pool destroys the connection instead of handing it to the next caller.
+- **Expand step for embeddings.** Add the vector column nullable (`ALTER TABLE documents ADD COLUMN
+  embedding vector(1536)`, metadata-only) and build the HNSW index with `CREATE INDEX CONCURRENTLY ...
+  USING hnsw (embedding vector_cosine_ops)` in a file the tool does not wrap in a transaction, after
+  `SET lock_timeout = '5s'`. Use `BEGIN ISOLATION LEVEL SERIALIZABLE` in the helper only if you rely on it.
 
 ## Trade-offs
 - **Atomicity vs pool capacity.** Pinning a client per transaction holds a pooled connection for its

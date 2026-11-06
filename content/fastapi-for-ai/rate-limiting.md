@@ -341,31 +341,23 @@ import hashlib, time
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
-from slowapi.util import get_remote_address
 import redis.asyncio as redis
-
 def caller(request: Request) -> str:            # key by credential, not IP
-    # production: key on the *validated* principal; a raw header lets random keys mint new buckets
-    key = request.headers.get("x-api-key")
-    return hashlib.sha256(key.encode()).hexdigest()[:16] if key else get_remote_address(request)
+    return hashlib.sha256(request.headers.get("x-api-key", "").encode()).hexdigest()[:16]
 
-limiter = Limiter(key_func=caller, storage_uri="redis://redis:6379",
-                  default_limits=["600/hour"], headers_enabled=True)   # emit Retry-After
+limiter = Limiter(key_func=caller, storage_uri="redis://redis:6379", headers_enabled=True)  # Retry-After
 app = FastAPI()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(SlowAPIMiddleware)            # applies default_limits
 r = redis.Redis(host="redis")
-TPM = 40_000                                      # tokens per minute per caller
 
 async def token_budget(request: Request) -> int:
     body = await request.json()                   # cached; the endpoint still parses it
     est = len(str(body.get("messages", ""))) // 4 + body.get("max_tokens", 512)  # rough estimate
     key = f"tpm:{caller(request)}:{int(time.time() // 60)}"
     used = await r.incrby(key, est)
-    await r.expire(key, 120)
-    if used > TPM:
+    await r.expire(key, 120)                      # before the check, so rejected keys expire too
+    if used > 40_000:                             # tokens per minute per caller
         await r.decrby(key, est)                  # release the rejected reservation
         raise HTTPException(429, "token budget exceeded",
                             headers={"Retry-After": str(60 - int(time.time()) % 60)})
@@ -373,10 +365,8 @@ async def token_budget(request: Request) -> int:
 
 @app.post("/v1/chat")
 @limiter.limit("30/minute")
-async def chat(request: Request, response: Response, body: dict,
-               est: int = Depends(token_budget)):
-    # after the call: await r.incrby(key, actual_tokens - est) to reconcile
-    return {"reply": "..."}
+async def chat(request: Request, response: Response, body: dict, est: int = Depends(token_budget)):
+    return {"reply": "..."}                       # then INCRBY actual_tokens - est to reconcile
 ```
 
 | Caller | Traffic in one minute window | Outcome |
@@ -391,37 +381,9 @@ async def chat(request: Request, response: Response, body: dict,
   both checks as dependencies in a fixed order.
 
 ### Agent run: admission limit plus a per-step token budget
-Run admission uses slowapi; every model step inside the loop reserves tokens on the same Redis. `llm`
-and `estimate_tokens` are your own functions; `r` and `caller` are from the example above.
-
-```python
-TENANT_TPM = 200_000
-
-async def reserve(tenant: str, est: int) -> bool:
-    key = f"tpm:{tenant}:{int(time.time() // 60)}"
-    used = await r.incrby(key, est)
-    await r.expire(key, 120)
-    if used > TENANT_TPM:
-        await r.decrby(key, est)                       # release: this step will not run
-        return False
-    return True
-
-@app.post("/v1/agent/runs")
-@limiter.limit("5/minute")                             # runs, not model calls
-async def start_run(request: Request, response: Response, body: dict):
-    tenant, messages = caller(request), body["messages"]
-    for step in range(12):
-        est = estimate_tokens(messages) + 1024         # prompt so far plus max_tokens for this step
-        if not await reserve(tenant, est):
-            return {"status": "paused", "reason": "token budget", "step": step}
-        reply, usage = await llm(messages, max_tokens=1024)
-        await r.incrby(f"tpm:{tenant}:{int(time.time() // 60)}", usage["total"] - est)  # reconcile
-        messages.append(reply)
-        if not reply.get("tool_calls"):
-            return {"status": "done", "answer": reply["content"]}
-        # ... run tools, append results ...
-    return {"status": "stopped", "reason": "step cap"}
-```
+Run admission is slowapi at `5/minute` (runs, not model calls); inside the loop every model step
+reserves `prompt + max_tokens` on the same Redis key before calling the model, and pauses the run if
+the reservation would exceed a 200k tenant TPM.
 
 Illustrative numbers: the transcript grows, so each step reserves more than the last.
 
@@ -454,20 +416,13 @@ class TokenBucket:
             return True
         return False
 
-def sliding_estimate(prev: int, cur: int, elapsed: float, window: float = 60) -> float:
-    return prev * (1 - elapsed / window) + cur
-
-# A tenant gets 40,000 tokens per minute with bursts up to 40,000.
 tpm = TokenBucket(b=40_000, r=40_000 / 60)
-calls = [(0, 15_000), (1, 15_000), (2, 15_000), (20, 15_000)]   # (second, estimated tokens)
-for t, cost in calls:
-    print(t, cost, tpm.allow(t, cost), round(tpm.tokens))
-# 0 15000 True 25000
-# 1 15000 True 10667
-# 2 15000 False 11333      third burst call rejected: only ~11k left
-# 20 15000 True 8333       18 s of refill (~12k) let it through
-
-print(sliding_estimate(prev=90, cur=30, elapsed=20))   # 90.0, the lesson's worked number
+for t in (0, 1, 2, 20):                                          # seconds; each call costs 15k tokens
+    print(t, tpm.allow(t, 15_000), round(tpm.tokens))
+# 0 True 25000
+# 1 True 10667
+# 2 False 11333      third burst call rejected: only ~11k left
+# 20 True 8333       18 s of refill (~12k) let it through
 ```
 
 In production the bucket state lives in Redis and is updated atomically (a Lua script), for the same
@@ -494,6 +449,12 @@ reason counters do: every worker must see one value.
   concurrent runs per tenant at the route, and reserve tokens before each model step inside the loop, so
   a long run pauses at the step that would overspend. Monitor tokens per run (p50, p95) and runs paused by
   budget, alongside nginx `limit_req` or WAF rejects at the edge for per-IP floods.
+- **Global defaults need the middleware.** `Limiter(default_limits=["600/hour"])` only applies once
+  `app.add_middleware(SlowAPIMiddleware)` is installed; per-route `@limiter.limit` works without it.
+- **Reconcile in-loop reservations** with `INCRBY usage_total - estimate` after every model step, so short
+  replies hand budget back.
+- **Sliding-window estimate:** `prev * (1 - elapsed / window) + cur` smooths a fixed window's boundary
+  burst, for example 90 previous, 30 current, 20 s in gives 90.
 
 ## Trade-offs
 - **In-memory vs Redis storage.** In-memory needs no infrastructure and adds no latency, but is only

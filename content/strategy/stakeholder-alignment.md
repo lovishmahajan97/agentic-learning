@@ -248,11 +248,11 @@ The outcome:
   screen.
 
 ### Checking the operating point and the rollback trigger in code
-The table, the fair baseline and the noise check as one script, plus a question the one-pager should
-answer: how often would the 4% trigger fire from noise alone if the true error stayed at 3.2%?
+The table as a check against the three goals, plus a question the one-pager should answer: how often
+would the 4% trigger fire from noise alone if the true error stayed at 3.2%?
 
 ```python
-from math import comb, sqrt
+from math import comb
 
 rows = [  # threshold, share auto-routed, error on auto-routed, blended cost per claim
     (0.70, 0.78, 0.065, 1.20),
@@ -264,11 +264,6 @@ for t, share, err, cost in rows:
     ok = share >= MIN_AUTO and err <= MAX_ERR and cost < MAX_COST
     print(f"threshold {t:.2f}: auto {share:.0%} err {err:.1%} ${cost:.2f} ->", "candidate" if ok else "fails")
 
-share, err, n_auto = 0.61, 0.032, 610
-human_easy, human_hard = 0.035, 0.048                # humans on the same 610 claims, and on the other 390
-print(f"fair baseline {share * human_easy + (1 - share) * human_hard:.1%}, "
-      f"with model {share * err + (1 - share) * human_hard:.1%}")
-print(f"~{err * n_auto:.0f} errors, upper 95% bound {err + 1.96 * sqrt(err * (1 - err) / n_auto):.1%}")
 
 def false_alarm(n, p_true=0.032, trigger=0.04):      # P(observed rate > trigger) from noise alone
     k = int(trigger * n)
@@ -279,8 +274,6 @@ for n in (50, 300, 1000):
 # threshold 0.70: auto 78% err 6.5% $1.20 -> fails
 # threshold 0.85: auto 61% err 3.2% $1.75 -> candidate
 # threshold 0.95: auto 38% err 1.1% $2.30 -> fails
-# fair baseline 4.0%, with model 3.8%
-# ~20 errors, upper 95% bound 4.6%
 # audit sample   50: false rollback chance 21%
 # audit sample  300: false rollback chance 17%
 # audit sample 1000: false rollback chance 7%

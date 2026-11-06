@@ -236,10 +236,10 @@ flowchart TD
 ## Examples
 ### Gateway-side recorder with a burn-rate review
 A minimal gateway-side recorder and a daily review that forecasts on burn rate. Prices are placeholders;
-in a real system they are loaded from the provider's current price list and versioned.
+in a real system they are loaded from the provider's current price list and versioned. The traffic is
+illustrative: a retrieval change has doubled the context that `search` sends.
 
 ```python
-import time, uuid
 from collections import defaultdict
 
 PRICES = {  # USD per 1M tokens, illustrative; "in" = uncached input tokens
@@ -248,32 +248,22 @@ PRICES = {  # USD per 1M tokens, illustrative; "in" = uncached input tokens
 }
 EVENTS = []
 
-def record_call(model, usage, *, tenant, feature, env, prompt_version):
-    p = PRICES[model]
-    cost = (usage["in"] * p["in"] + usage["out"] * p["out"] + usage["cached_in"] * p["cached_in"]) / 1e6
-    event = {"ts": time.time(), "id": str(uuid.uuid4()), "model": model, **usage, "cost_usd": cost,
-             "tenant": tenant, "feature": feature, "env": env, "prompt_version": prompt_version,
-             "price_version": "2026-10"}   # store the price used so history stays reproducible
-    EVENTS.append(event)
-    return event
+def record_call(model, usage, **tags):         # tags: tenant, feature, env, prompt_version
+    EVENTS.append({"model": model, **usage, **tags, "price_version": "2026-10",  # reproducible history
+                   "cost_usd": sum(usage[k] * PRICES[model][k] for k in usage) / 1e6})
 
 def daily_review(events, budgets_usd, day_of_month, days_in_month=30):
     spend = defaultdict(float)
-    for e in events:
-        spend[e["feature"]] += e["cost_usd"]
+    for e in events: spend[e["feature"]] += e["cost_usd"]
     for feature, budget in budgets_usd.items():
-        mtd = spend[feature]
-        forecast = mtd / day_of_month * days_in_month        # burn-rate forecast, not a threshold
+        forecast = spend[feature] / day_of_month * days_in_month   # burn-rate forecast, not a threshold
         flag = "OVER-FORECAST" if forecast > budget else "ok"
-        print(f"{feature:<10} mtd=${mtd:8.2f}  forecast=${forecast:8.2f}  budget=${budget:6.0f}  {flag}")
+        print(f"{feature:<10} mtd=${spend[feature]:8.2f}  forecast=${forecast:8.2f}  budget=${budget:6.0f}  {flag}")
 
-# Illustrative traffic after a retrieval change doubled the context sent by 'search'
 for _ in range(250_000):
-    record_call("small-model", {"in": 2400, "out": 150, "cached_in": 800},
-                tenant="acme", feature="search", env="prod", prompt_version="v12")
+    record_call("small-model", {"in": 2400, "out": 150, "cached_in": 800}, feature="search", prompt_version="v12")
 for _ in range(50_000):
-    record_call("large-model", {"in": 1200, "out": 300, "cached_in": 0},
-                tenant="acme", feature="summarize", env="prod", prompt_version="v3")
+    record_call("large-model", {"in": 1200, "out": 300, "cached_in": 0}, feature="summarize", prompt_version="v3")
 daily_review(EVENTS, {"search": 300, "summarize": 1500}, day_of_month=10)
 # search     mtd=$  115.50  forecast=$  346.50  budget=$   300  OVER-FORECAST
 # summarize  mtd=$  405.00  forecast=$ 1215.00  budget=$  1500  ok
@@ -297,26 +287,21 @@ a stuck loop. Prices are illustrative.
 ```python
 PRICE = {"in": 3.00, "out": 15.00, "cached_in": 0.30}   # USD per 1M tokens, illustrative
 
-class BudgetExceeded(Exception):
-    pass
+class BudgetExceeded(Exception): pass
 
 class RunMeter:
     """One per agent run: tags every step with run_id and enforces step and spend limits."""
-    def __init__(self, run_id, tenant, feature, max_steps=15, max_usd=0.50):
-        self.run_id, self.tenant, self.feature = run_id, tenant, feature
-        self.max_steps, self.max_usd = max_steps, max_usd
+    def __init__(self, run_id, max_steps=15, max_usd=0.50):
+        self.run_id, self.max_steps, self.max_usd = run_id, max_steps, max_usd
         self.events, self.spent = [], 0.0
-
     def record_step(self, usage):
-        cost = sum(usage[k] * PRICE[k] for k in PRICE) / 1e6
-        self.spent += cost
-        self.events.append({"run_id": self.run_id, "tenant": self.tenant, "feature": self.feature,
-                            "step": len(self.events) + 1, **usage, "cost_usd": cost})
+        self.spent += (cost := sum(usage[k] * PRICE[k] for k in PRICE) / 1e6)
+        self.events.append({"run_id": self.run_id, "step": len(self.events) + 1, **usage, "cost_usd": cost})
         if len(self.events) >= self.max_steps or self.spent >= self.max_usd:
             raise BudgetExceeded(f"{self.run_id}: {len(self.events)} steps, ${self.spent:.2f}")
 
 # A stuck loop: the agent retries a failing tool; the transcript (~1.5k tokens a step) is re-sent uncached
-meter = RunMeter("run-42", tenant="acme", feature="support-agent")
+meter = RunMeter("run-42")
 try:
     for step in range(100):
         meter.record_step({"in": 1_500 * (step + 1), "cached_in": 6_000, "out": 300})
@@ -342,12 +327,10 @@ Illustrative: search costs $10 a day until `v12` ships on day eight, then $25 a 
 
 ```python
 def forecasts(daily, days_in_month=30, trailing=3):
-    day = len(daily)
-    mtd = sum(daily)
+    day, mtd = len(daily), sum(daily)
     avg_forecast = mtd / day * days_in_month                     # month-to-date average
     recent = sum(daily[-trailing:]) / trailing                    # trailing-days rate
-    recent_forecast = mtd + recent * (days_in_month - day)
-    return mtd, avg_forecast, recent_forecast
+    return mtd, avg_forecast, mtd + recent * (days_in_month - day)
 
 daily = [10.0] * 7 + [25.0] * 3          # day 10, step change on day 8
 mtd, avg_f, recent_f = forecasts(daily)

@@ -198,28 +198,30 @@ flowchart TD
 ```python
 MAX_STEPS = 6
 
-def agentic_rag(question: str, user, call_model, tools: dict) -> dict:
-    evidence: dict[str, str] = {}               # source_id -> snippet
+def agentic_rag(question, user, call_model, tools):
+    evidence = {}                                        # source_id -> snippet
     messages = [{"role": "user", "content": question}]
     for step in range(MAX_STEPS):
         reply = call_model(messages, tool_specs=list(tools))
         messages.append({"role": "assistant", **reply})  # the model must see its own turn
         if reply["type"] == "answer":
-            cited = set(reply["citations"])
-            unknown = cited - evidence.keys()
-            if unknown:                          # cited something never retrieved
-                messages.append({"role": "user",
-                                 "content": f"Citations {sorted(unknown)} were not retrieved. Fix them."})
-                continue
-            return {"answer": reply["text"], "citations": sorted(cited), "steps": step + 1}
-        name, args = reply["tool"], reply["args"]
-        results = tools[name](user=user, **args)  # tool layer applies the user's ACL filters
-        for r in results:
-            evidence[r["id"]] = r["text"][:800]
-        messages.append({"role": "tool", "name": name, "call_id": reply.get("id"),
-                         "content": [{"id": r["id"], "text": r["text"][:800]} for r in results]})
-    return {"answer": None, "citations": [], "steps": MAX_STEPS,
-            "note": "budget exhausted", "evidence_ids": sorted(evidence)}
+            unknown = set(reply["citations"]) - evidence.keys()
+            if not unknown:
+                return {"answer": reply["text"], "citations": sorted(reply["citations"]), "steps": step + 1}
+            messages.append({"role": "user",
+                             "content": f"Citations {sorted(unknown)} were not retrieved. Fix them."})
+            continue
+        results = tools[reply["tool"]](user=user, **reply["args"])   # tool layer applies the user's ACL
+        snippets = [{"id": r["id"], "text": r["text"][:800]} for r in results]   # prune before appending
+        evidence.update({s["id"]: s["text"] for s in snippets})
+        messages.append({"role": "tool", "call_id": reply.get("id"), "content": snippets})
+    return {"answer": None, "citations": [], "note": "budget exhausted", "evidence_ids": sorted(evidence)}
+
+replies = iter([{"type": "tool", "tool": "search_docs", "args": {"query": "vendor SLA"}, "id": "c1"},
+                {"type": "answer", "text": "99.9% uptime [contract-4]", "citations": ["contract-4"]}])
+search_docs = lambda user, query: [{"id": "contract-4", "text": "Vendor guarantees 99.9% uptime."}]
+print(agentic_rag("Vendor SLA?", "u-42", lambda m, tool_specs: next(replies), {"search_docs": search_docs}))
+# {'answer': '99.9% uptime [contract-4]', 'citations': ['contract-4'], 'steps': 2}
 ```
 
 ### Worked trace: the vendor SLA question
@@ -234,7 +236,7 @@ A fixed pipeline would have run only the first query.
 
 ### The same loop in LangGraph
 A sketch of the prebuilt pattern: an agent node, a `ToolNode` and `tools_condition` routing back and forth.
-`chat_model`, `acl_search` and `run_readonly_sql` stand for your model and your ACL-aware backends.
+`chat_model` and `acl_search` stand for your model and your ACL-aware backend.
 
 ```python
 from langchain_core.runnables import RunnableConfig
@@ -246,28 +248,16 @@ from langgraph.prebuilt import ToolNode, tools_condition
 @tool
 def search_docs(query: str, config: RunnableConfig) -> list[dict]:
     """Search internal documents. Keep product codes, vendor names and dates verbatim."""
-    user = config["configurable"]["user_id"]          # injected by the runtime, not chosen by the model
-    return acl_search(query, user=user, k=5)          # returns [{"id": ..., "text": ...}], trimmed
+    return acl_search(query, user=config["configurable"]["user_id"], k=5)   # runtime injects the user
 
-@tool
-def sql_query(sql: str, config: RunnableConfig) -> list[dict]:
-    """Read-only SQL over the incidents warehouse, for counts, sums and date ranges."""
-    return run_readonly_sql(sql, user=config["configurable"]["user_id"])
-
-tools = [search_docs, sql_query]
-llm = chat_model.bind_tools(tools)
-
-def agent(state: MessagesState):
-    return {"messages": [llm.invoke(state["messages"])]}
-
+llm = chat_model.bind_tools([search_docs])
 g = StateGraph(MessagesState)
-g.add_node("agent", agent)
-g.add_node("tools", ToolNode(tools))
+g.add_node("agent", lambda state: {"messages": [llm.invoke(state["messages"])]})
+g.add_node("tools", ToolNode([search_docs]))
 g.add_edge(START, "agent")
 g.add_conditional_edges("agent", tools_condition)     # tool call -> "tools", otherwise end
 g.add_edge("tools", "agent")
 app = g.compile()
-
 try:
     out = app.invoke({"messages": [("user", question)]},
                      config={"recursion_limit": 12, "configurable": {"user_id": "u-42"}})
@@ -284,22 +274,16 @@ except GraphRecursionError:
 Runnable; token counts are illustrative.
 
 ```python
-def input_tokens(n_steps, base, per_step):
-    """Total input tokens when step i re-sends the base prompt plus i steps of earlier results."""
+def input_tokens(n_steps, base, per_step):          # step i re-sends the base plus i earlier results
     return sum(base + i * per_step for i in range(n_steps))
 
-def is_novel(results, evidence):
-    """Stop signal: did this step return any source id not already in evidence?"""
+def is_novel(results, evidence):                     # stop signal: any source id not already seen?
     return any(r["id"] not in evidence for r in results)
 
-b = 2_000                                         # system prompt, tool specs, question (illustrative)
-for n in (2, 4, 6, 8):
-    raw = input_tokens(n, b, per_step=3_000)      # append ~3k tokens of raw chunks every step
-    pruned = input_tokens(n, b, per_step=400)     # keep ~400 tokens of relevant snippets per step
+for n in (2, 4, 6, 8):                               # base 2k tokens; raw ~3k vs pruned ~400 per step
+    raw, pruned = input_tokens(n, 2_000, 3_000), input_tokens(n, 2_000, 400)
     print(f"{n} steps: raw {raw:>7,}  pruned {pruned:>6,}  ratio {raw / pruned:.1f}x")
-
-evidence = {"memo-17": "...", "contract-4": "..."}
-print(is_novel([{"id": "memo-17"}, {"id": "contract-4"}], evidence))   # False -> force an answer
+print(is_novel([{"id": "memo-17"}], {"memo-17": "..."}))   # False -> force an answer
 ```
 
 | Steps | Raw history (input tokens) | Pruned evidence | Ratio |

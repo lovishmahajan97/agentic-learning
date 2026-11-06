@@ -318,15 +318,11 @@ flowchart TD
 ```
 
 ## Examples
-### Ordering rules, a lag monitor and cooperative CPU work
-The ordering rules and a lag monitor in one script. Run it as CommonJS (for example compile with `tsc` to
-`module: commonjs`, or run with `tsx` in a package without `"type": "module"`); as an ES module lines 3 and
-4 swap, for the reason given above.
+### Ordering rules
+Run it as CommonJS (for example compile with `tsc` to `module: commonjs`, or run with `tsx` in a package
+without `"type": "module"`); as an ES module the nextTick and promise lines swap, for the reason given above.
 
 ```ts
-import { monitorEventLoopDelay } from "node:perf_hooks";
-import { setImmediate as yieldToLoop } from "node:timers/promises";
-
 console.log("1 sync");
 setTimeout(() => console.log("5 timeout (timers phase)"), 0);
 setImmediate(() => console.log("6 immediate (check phase)"));
@@ -335,19 +331,15 @@ process.nextTick(() => console.log("3 nextTick (drained before promises)"));
 console.log("2 sync");
 // CommonJS: 1,2,3,4 then 5,6 (5/6 may swap from the main module; never from an I/O callback).
 // ESM top level: 1,2,4,3 then 5,6, because module evaluation itself runs inside a promise job.
+```
 
-// Event-loop lag: sample the histogram and alert when p99 is high.
-const h = monitorEventLoopDelay({ resolution: 10 });
-h.enable();
-setInterval(() => {
-  console.log(`loop lag p99 ${(h.percentile(99) / 1e6).toFixed(1)} ms`);
-  h.reset();
-}, 5_000).unref();
+### Cooperative CPU work
+A CPU-heavy scoring loop that yields to I/O every 500 vectors, so streams to other clients keep flowing.
+At 1536 dims, 500 vectors is ~768k multiply-adds per slice; 100k vectors = 200 slices.
 
-// A CPU-heavy scoring loop made cooperative: yield to I/O every 500 vectors so
-// streaming responses to other clients keep flowing while this request computes.
-// At 1536 dims, 500 vectors is ~768k multiply-adds per slice: measure it, it is
-// the worst-case stall every other client sees. 100k vectors = 200 slices.
+```ts
+import { setImmediate as yieldToLoop } from "node:timers/promises";
+
 async function topK(query: Float32Array, vectors: Float32Array[], k: number) {
   const scores: Array<[number, number]> = [];
   for (let i = 0; i < vectors.length; i++) {
@@ -358,7 +350,8 @@ async function topK(query: Float32Array, vectors: Float32Array[], k: number) {
   }
   return scores.sort((a, b) => b[0] - a[0]).slice(0, k);
 }
-void topK;
+const vecs = Array.from({ length: 2000 }, (_, i) => new Float32Array([i, 1]));
+console.log(await topK(new Float32Array([1, 0]), vecs, 2));   // [ [ 1999, 1999 ], [ 1998, 1998 ] ]
 ```
 
 ### Seeing a stall: a timer that fires late
@@ -427,6 +420,8 @@ A gateway holds 2,000 SSE streams. One route parses tool results of up to 20 MB 
   `fs` and `dns.lookup` calls queuing behind each other.
 - **Ban sync APIs in hot paths.** Lint or review away `fs.readFileSync`, `child_process.execSync` and sync
   `zlib` outside startup code, since their small stalls multiply across every in-flight request.
+- **Measure the slice size.** The work between two yields is the worst-case stall every other client sees,
+  so time one slice (for example 500 vectors at 1536 dims) rather than guessing.
 
 ## Trade-offs
 - **Cheap concurrency vs no CPU parallelism.** One thread with non-blocking I/O is very cheap for I/O-bound

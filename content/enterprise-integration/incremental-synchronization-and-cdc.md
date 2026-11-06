@@ -230,21 +230,19 @@ def sync_once(conn, state: dict, index, page: int = 500) -> None:
     cursor = (state["high_water"] - OVERLAP, "")              # overlap; "" sorts first for text ids
     while True:
         rows = conn.execute(
-            """SELECT id, updated_at, deleted_at, title, body, acl FROM documents
+            """SELECT id, updated_at, deleted_at, body, acl FROM documents
                WHERE (updated_at, id) > (%s, %s) AND updated_at <= %s
-               ORDER BY updated_at, id LIMIT %s""",
-            (*cursor, hi, page)).fetchall()
-        for doc_id, updated_at, deleted_at, title, body, acl in rows:
+               ORDER BY updated_at, id LIMIT %s""", (*cursor, hi, page)).fetchall()
+        for doc_id, updated_at, deleted_at, body, acl in rows:
             if deleted_at is not None:
                 index.delete(doc_id)                          # soft delete makes deletes visible
                 continue
             digest = hashlib.sha256(body.encode()).hexdigest()
             if index.content_hash(doc_id) == digest:
-                index.update_metadata(doc_id, title=title, acl=acl)  # no re-embedding needed
+                index.update_metadata(doc_id, acl=acl)        # no re-embedding needed
             else:
-                index.upsert(doc_id, title=title, body=body, acl=acl, content_hash=digest)
-        if len(rows) < page:
-            break
+                index.upsert(doc_id, body=body, acl=acl, content_hash=digest)
+        if len(rows) < page: break
         cursor = (rows[-1][1], rows[-1][0])                   # keyset: last (updated_at, id)
     state["high_water"] = hi                                  # persist only after a full pass
 ```
@@ -266,58 +264,48 @@ and never writes the unchanged-TOAST placeholder into the index.
 PLACEHOLDER = "__debezium_unavailable_value"   # Debezium's default placeholder for unchanged TOAST
 
 def apply_change(index: dict, ev: dict) -> str:
-    """Apply one Debezium-style change event idempotently, guarded by log position (LSN)."""
-    op, lsn = ev["op"], ev["source"]["lsn"]
-    key = (ev["after"] or ev["before"])["id"]          # default replica identity: before = key only
+    key, lsn = (ev["after"] or ev["before"])["id"], ev["source"]["lsn"]  # before = key only by default
     current = index.get(key)
     if current and current["lsn"] >= lsn:
-        return "skip: replayed or older event"
-    if op == "d":
+        return "skip"                                   # replayed or older event
+    if ev["op"] == "d":
         index[key] = {"row": None, "lsn": lsn}          # tombstone keeps the LSN guard working
-        return "delete chunks and embeddings"
-    row = dict(ev["after"])
-    for col, val in row.items():
-        if val == PLACEHOLDER:                          # column untouched by this update
-            if not (current and current["row"] and col in current["row"]):
-                return "re-fetch row from source"       # never saw the value: do not write the marker
-            row[col] = current["row"][col]
-    index[key] = {"row": row, "lsn": lsn}
+        return "delete"
+    old = (current or {}).get("row") or {}
+    if any(v == PLACEHOLDER and c not in old for c, v in ev["after"].items()):
+        return "re-fetch row from source"               # never saw the value: do not write the marker
+    index[key] = {"lsn": lsn, "row": {c: old[c] if v == PLACEHOLDER else v   # keep untouched column
+                                      for c, v in ev["after"].items()}}
     return "upsert"
 
+def event(op, lsn, **cols): return {"op": op, "source": {"lsn": lsn}, "after": {"id": 7, **cols}}
+
 idx = {}
-print(apply_change(idx, {"op": "r", "before": None, "source": {"lsn": 100},
-                         "after": {"id": 7, "status": "open", "body": "long text"}}))   # upsert
-print(apply_change(idx, {"op": "u", "before": {"id": 7}, "source": {"lsn": 140},
-                         "after": {"id": 7, "status": "closed", "body": PLACEHOLDER}}))  # upsert
-print(idx[7]["row"]["body"])                                                          # long text
-print(apply_change(idx, {"op": "u", "before": {"id": 7}, "source": {"lsn": 120},
-                         "after": {"id": 7, "status": "open", "body": "old"}}))         # skip
+print(apply_change(idx, event("r", 100, body="long text")), apply_change(idx, event("u", 140, body=PLACEHOLDER)))
+print(idx[7]["row"]["body"], apply_change(idx, event("u", 120, body="old")))   # upsert upsert / long text skip
 ```
 
 ### A freshness-aware retrieval tool for the agent
-Runnable standard library: each hit carries its age, and the tool tells the agent to use a live lookup
-when a volatile field is staler than its tolerance.
+Runnable standard library: the result carries the index lag, and the tool tells the agent to use a live
+lookup when a volatile field is staler than its tolerance.
 
 ```python
 import time
 
 SYNC_STATE = {"tickets": {"high_water": time.time() - 900}}      # last full pass 15 minutes ago
 TOLERANCE_S = {"status": 300, "body": 86_400}                     # status must be < 5 min old
-INDEX = [{"id": "T-12", "status": "open", "body": "VPN drops hourly", "source_updated_at": time.time() - 3600}]
 
 def search_tickets(query: str, field_needed: str = "body") -> dict:
     lag = time.time() - SYNC_STATE["tickets"]["high_water"]
-    hits = [h for h in INDEX if query.lower() in h["body"].lower()]
-    advice = None
-    if lag > TOLERANCE_S.get(field_needed, 3600):
-        advice = f"index is {lag/60:.0f} min behind; call get_ticket_live for current {field_needed}"
-    return {"hits": hits, "index_lag_s": round(lag), "advice": advice}
+    advice = (f"index is {lag/60:.0f} min behind; call get_ticket_live for current {field_needed}"
+              if lag > TOLERANCE_S[field_needed] else None)
+    return {"hits": [], "index_lag_s": round(lag), "advice": advice}   # hits come from the index search
 
-print(search_tickets("vpn")["advice"])                   # None: body tolerates a day of lag
+print(search_tickets("vpn")["advice"])                          # None: body tolerates a day of lag
 print(search_tickets("vpn", field_needed="status")["advice"])   # index is 15 min behind; call get_ticket_live ...
 ```
 
-- **The model decides with facts, not guesses:** lag and age are in the tool result, so the agent can
+- **The model decides with facts, not guesses:** the index lag is in the tool result, so the agent can
   caveat an answer or make the live call.
 
 ### Worked incident: a stalled replication slot
@@ -361,6 +349,9 @@ changes are status or assignee updates).
   it changes. Monitor the re-embed ratio; near 1 on a metadata-heavy source means the gate is missing.
 - **Periodic key and hash reconciliation.** Weekly, compare primary keys and content hashes between source
   and index, and repair drift. Monitor drift counts; non-zero trends point at a lost-delete or cursor bug.
+- **Re-fetch when a TOAST placeholder has no stored value.** If an update carries
+  `__debezium_unavailable_value` for a column you never stored, re-read the row from the source instead of
+  writing the marker or a null into the index.
 
 ## Trade-offs
 - **Watermarks: no infrastructure vs trust.** They depend on a trustworthy `updated_at` and soft deletes.

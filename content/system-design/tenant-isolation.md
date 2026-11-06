@@ -242,105 +242,66 @@ class Run:
 
 SEARCH_TICKETS_SCHEMA = {     # what the model sees: no tenant, no credentials
     "name": "search_tickets",
-    "description": "Search this customer's support tickets.",
-    "input_schema": {"type": "object",
-                     "properties": {"query": {"type": "string"}},
+    "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
                      "required": ["query"]},
 }
 
 async def search_tickets(run: Run, args: dict) -> str:
+    if set(args) - {"query"}:
+        raise ValueError("unexpected tool arguments")              # reject smuggled fields
     token = await secrets.get(f"tenants/{run.tenant_id}/crm")      # per-tenant secret path
     results = await crm_client.search(args["query"], token=token)  # token never enters the prompt
     return "\n".join(r.title for r in results[:10])
-
-async def dispatch(run: Run, call) -> str:
-    if set(call.args) - {"query"}:
-        raise ValueError("unexpected tool arguments")              # reject smuggled fields
-    return await search_tickets(run, call.args)
 ```
 
 ### PostgreSQL row-level security on a pooled table with embeddings
-- **Transaction-local setting.** If the app forgets to set it, `current_setting(..., true)` returns NULL
-  on a fresh connection but an empty string on a connection that used the setting before (the
-  placeholder persists for the session). The policy wraps it in `NULLIF`, so either way the predicate is
-  NULL and the query returns no rows.
-- **Fails closed.** The failure mode is "empty", not "leak". The same policy belongs on agent memory and
-  checkpoint tables.
-- **Vector queries inherit it.** The policy predicate filters the scan, so a forgotten filter in the
-  vector query still cannot cross tenants. With HNSW or IVFFlat the filter may leave fewer than k rows:
-  a recall problem, not an isolation problem.
+If the app forgets the setting, `current_setting(..., true)` returns NULL or, on a reused connection, an
+empty string; `NULLIF` makes both NULL, so the query returns no rows (fails closed). The policy filters
+the vector scan too, so a forgotten filter still cannot cross tenants.
 
 ```sql
 CREATE TABLE documents (
-    id         bigserial PRIMARY KEY,
-    tenant_id  uuid NOT NULL,
-    body       text NOT NULL,
-    embedding  vector(1536)          -- pgvector
+    id bigserial PRIMARY KEY, tenant_id uuid NOT NULL,
+    body text NOT NULL, embedding vector(1536)            -- pgvector
 );
-
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
-ALTER TABLE documents FORCE ROW LEVEL SECURITY;   -- owner is not exempt (migrations, admin scripts)
-
-CREATE POLICY tenant_rows ON documents
-    USING      (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)   -- reads
-    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);  -- inserts/updates
-
--- The application connects as a role with no BYPASSRLS and no ownership of the table.
-CREATE ROLE app_rw LOGIN NOBYPASSRLS;
+ALTER TABLE documents FORCE ROW LEVEL SECURITY;           -- owner is not exempt
+CREATE POLICY tenant_rows ON documents                    -- USING also checks writes when no WITH CHECK
+    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
+CREATE ROLE app_rw LOGIN NOBYPASSRLS;                     -- the app role: not owner, no BYPASSRLS
 GRANT SELECT, INSERT, UPDATE, DELETE ON documents TO app_rw;
 
--- Per request, inside one transaction (safe with transaction-mode pooling):
-BEGIN;
+BEGIN;                                                    -- per request, safe with transaction pooling
 SET LOCAL app.tenant_id = '2b6f1c1e-6c0a-4f7e-9d7e-1b8c3b2d9a10';
-SELECT id, body
-FROM   documents
-ORDER  BY embedding <=> $1      -- cosine distance to the query embedding
-LIMIT  8;                        -- policy filters the scan, so the 8 rows are within-tenant
+SELECT id, body FROM documents ORDER BY embedding <=> $1 LIMIT 8;   -- 8 within-tenant rows
 COMMIT;
--- Same SELECT with no SET LOCAL: the predicate is NULL, so 0 rows come back (fails closed).
--- INSERT naming another tenant_id: ERROR: new row violates row-level security policy for table "documents"
+-- No SET LOCAL: 0 rows. INSERT for another tenant: ERROR: new row violates row-level security policy
 ```
 
 ### Runnable: a cross-tenant canary probe
-Plant one unique marker per tenant, ask as every other tenant, and fail on any marker that appears. The
-toy store shows the probe catching a search that drops the tenant pre-filter.
+Plant one unique marker per tenant, ask as every other tenant, and fail on any marker that appears.
 
 ```python
 import uuid
 
-class ToyStore:
-    def __init__(self):
-        self.rows = []                                   # (tenant_id, text)
-    def add(self, tenant_id, text):
-        self.rows.append((tenant_id, text))
-    def search(self, tenant_id, query, k=8, enforce=True):
-        words = query.lower().split()
-        return [text for tid, text in self.rows
-                if (not enforce or tid == tenant_id)     # the hard pre-filter
-                and any(w in text.lower() for w in words)][:k]
-
-def plant_canaries(store, tenants):
-    markers = {t: f"CANARY-{uuid.uuid4().hex[:12]}" for t in tenants}
-    for t, m in markers.items():
-        store.add(t, f"internal codename is {m}")
-    return markers
-
-def find_leaks(search, tenants, markers, questions):
-    leaks = []
-    for asker in tenants:
-        for q in questions:
-            seen = " ".join(search(asker, q))            # in production, also scan the answer
-            leaks += [(asker, owner) for owner, m in markers.items()
-                      if owner != asker and m in seen]
-    return leaks
+rows = []                                                 # (tenant_id, text)
+def search(tenant_id, query, enforce=True):
+    return [text for tid, text in rows
+            if (not enforce or tid == tenant_id)          # the hard pre-filter
+            and query in text]
 
 tenants = ["acme", "globex", "initech"]
-store = ToyStore()
-markers = plant_canaries(store, tenants)
-qs = ["what is our internal codename"]
-print("enforced:", find_leaks(store.search, tenants, markers, qs))
-unfiltered = lambda t, q: store.search(t, q, enforce=False)
-print("unfiltered:", len(find_leaks(unfiltered, tenants, markers, qs)), "leaks")
+markers = {t: f"CANARY-{uuid.uuid4().hex[:12]}" for t in tenants}
+for t, m in markers.items():
+    rows.append((t, f"internal codename is {m}"))         # one planted marker per tenant
+
+def find_leaks(search):
+    return [(asker, owner) for asker in tenants           # in production, also scan the answer
+            for owner, m in markers.items()
+            if owner != asker and m in " ".join(search(asker, "codename"))]
+
+print("enforced:", find_leaks(search))
+print("unfiltered:", len(find_leaks(lambda t, q: search(t, q, enforce=False))), "leaks")
 # enforced: []
 # unfiltered: 6 leaks   (3 askers x 2 other tenants)
 ```
@@ -353,15 +314,6 @@ print("unfiltered:", len(find_leaks(unfiltered, tenants, markers, qs)), "leaks")
 | Cached answer reused for a look-alike question | Tenant in the cache key | Canary probe scans answers |
 | Tool token visible in a trace | Token injected into adapter only | Trace access gated by tenant, redaction |
 | Generated code reads a shared volume | Fresh sandbox per run | No network path to other tenants' storage |
-
-### Worked incident: session-level SET behind a transaction pooler
-| Step | What happened |
-|---|---|
-| Change | A helper switched from `SET LOCAL` to a session-level `SET` "to save a round trip" |
-| Pooling | The pooler runs in transaction mode, so request 2 got request 1's connection |
-| Symptom | Intermittent, unreproducible reports of a user seeing another tenant's document titles |
-| Why tests missed it | Tests used one connection per test, so the setting never outlived a request |
-| Fix | Back to `SET LOCAL` inside the request transaction, plus a check that fails a query run with no tenant setting |
 
 ## Production patterns
 - **Mandatory tenant argument in the retrieval client.** Use for every vector store and memory store.
@@ -384,6 +336,10 @@ print("unfiltered:", len(find_leaks(unfiltered, tenants, markers, qs)), "leaks")
 - **Per-tenant secret paths.** Use for agent connectors. Store each tenant's tokens under a path keyed by
   tenant ID in the secrets manager, grant the runtime read access per run, and redact tokens from traces.
   Monitor secret reads whose tenant differs from the run's tenant.
+- **SET LOCAL, never session SET, behind a transaction pooler.** A session-level `SET` outlives the
+  request, so the next request on that pooled connection inherits another tenant; tests with one
+  connection per test miss it. With HNSW or IVFFlat the RLS filter can return fewer than k rows: a recall
+  problem, not an isolation problem.
 
 ## Trade-offs
 - **Database-enforced policies: catch app mistakes vs explicit privileged paths.** They add a per-query

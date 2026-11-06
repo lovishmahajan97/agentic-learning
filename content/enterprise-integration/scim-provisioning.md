@@ -208,50 +208,36 @@ flowchart TD
 ```
 
 ## Examples
-### Deactivation-aware `PATCH /scim/v2/Users/{id}` in FastAPI
-Handles the common deactivation shapes and does the security-relevant work, not just a column update.
+### Deactivation-aware user PATCH
+Runnable standard library. It accepts both deactivation shapes IdPs send and treats deactivation as a
+security event with side effects, not just a column update.
 
 ```python
-from fastapi import FastAPI, Header, HTTPException
-
-app = FastAPI()
-
 def as_bool(v):  # some IdPs send "False" as a string
     return v if isinstance(v, bool) else str(v).lower() == "true"
 
-@app.patch("/scim/v2/Users/{user_id}")
-async def patch_user(user_id: str, body: dict, authorization: str = Header(...)):
-    tenant = await tenant_for_scim_token(authorization.removeprefix("Bearer "))  # tenant from token
-    user = await db.get_user(tenant.id, user_id)
-    if user is None:
-        raise HTTPException(404, detail="User not found")
-    if "urn:ietf:params:scim:api:messages:2.0:PatchOp" not in body.get("schemas", []):
-        raise HTTPException(400, detail="Expected PatchOp")
+def patch_user(user: dict, body: dict, revoked: list) -> dict:
     changes = {}
     for op in body.get("Operations", []):
         kind, path, value = op["op"].lower(), op.get("path"), op.get("value")
         if kind == "replace" and path is None and isinstance(value, dict):
             changes.update(value)                      # {"op":"replace","value":{"active":false}}
         elif kind in ("replace", "add") and path:
-            changes[path] = value                      # {"op":"replace","path":"active","value":false}
+            changes[path] = value                      # {"op":"replace","path":"active","value":"False"}
     if "active" in changes:
         changes["active"] = as_bool(changes["active"])
-        if user.active and not changes["active"]:      # idempotent: only act on the transition
-            await sessions.revoke_all(tenant.id, user_id)
-            await api_tokens.revoke_all(tenant.id, user_id)
-            await agent_jobs.pause_for_user(tenant.id, user_id)
-            await acl_cache.invalidate_principal(tenant.id, user_id)
-    user = await db.update_user(tenant.id, user_id, changes)
-    await audit.log(tenant.id, "scim.patch_user", user_id, raw=body)
-    return to_scim_user(user)                          # full resource, 200
+        if user["active"] and not changes["active"]:   # idempotent: only act on the transition
+            revoked += ["sessions", "api_tokens", "agent_jobs", "tool_oauth_tokens", "acl_cache"]
+    return user | changes
+
+user, revoked = {"id": "u1", "active": True}, []
+user = patch_user(user, {"Operations": [{"op": "Replace", "value": {"active": False}}]}, revoked)
+user = patch_user(user, {"Operations": [{"op": "replace", "path": "active", "value": "False"}]}, revoked)
+print(user["active"], len(revoked))  # False 5: the second shape is a replay, nothing revoked twice
 ```
 
-- **Still to handle in a real implementation:** filtered paths such as `emails[type eq "work"].value`,
-  `remove` operations (ignored above) and group membership patches. The point here is that deactivation is
-  a security event with side effects.
-- **Add the agent's stored tool tokens to the transition block.** The handler revokes sessions and API
-  tokens and pauses jobs; the deactivation list above also requires revoking the OAuth refresh tokens the
-  agent holds for downstream tools, or a paused job's credentials stay live.
+- **The revoke list includes the agent's stored tool tokens.** Revoking sessions and API tokens while a
+  paused job's downstream OAuth refresh tokens stay live leaves the leaver's agent credentials usable.
 
 ### The agent loop's side of deactivation
 Runnable standard library: the agent runtime re-checks the principal before every tool step, so a run that
@@ -260,23 +246,16 @@ started before the SCIM event stops at its next step instead of finishing.
 ```python
 ACTIVE = {("acme", "u1"): True}            # updated by the SCIM handler
 
-class UserDeactivated(Exception):
-    pass
-
-def run_agent(tenant: str, user_id: str, planned_steps: list[str]) -> list[str]:
-    done = []
+def run_agent(tenant: str, user_id: str, planned_steps: list[str]) -> str:
     for i, step in enumerate(planned_steps):
         if not ACTIVE.get((tenant, user_id), False):         # checked before EVERY tool call
-            raise UserDeactivated(f"stopped before step {i}: {step}")
-        done.append(f"ran {step}")
+            return f"stopped before step {i}: {step}"
         if i == 1:
             ACTIVE[("acme", "u1")] = False                   # SCIM active=false arrives mid-run
-    return done
+    return "finished"
 
-try:
-    run_agent("acme", "u1", ["search_kb", "read_ticket", "send_email", "close_ticket"])
-except UserDeactivated as e:
-    print(e)                                                 # stopped before step 2: send_email
+print(run_agent("acme", "u1", ["search_kb", "read_ticket", "send_email", "close_ticket"]))
+# stopped before step 2: send_email
 ```
 
 - **Why per step:** a long research or batch agent can run for minutes or hours; checking only at start
@@ -294,22 +273,17 @@ REMOVE_FILTER = re.compile(r'^members\[value eq "([^"]+)"\]$')
 def apply_group_patch(members: set, body: dict) -> tuple:
     """Apply a SCIM Group PatchOp; return (new_members, added, removed) for ACL invalidation."""
     out = set(members)
-    for op in body.get("Operations", []):
-        kind, path, value = op["op"].lower(), op.get("path"), op.get("value") or []
+    for op in body["Operations"]:
+        kind, path = op["op"].lower(), op.get("path", "")
         if kind == "add" and path == "members":
-            out |= {m["value"] for m in value}               # re-adding is a no-op: idempotent
-        elif kind == "remove" and path == "members":
-            out -= {m["value"] for m in value}               # some IdPs list removals in value
-        elif kind == "remove" and path and (m := REMOVE_FILTER.match(path)):
+            out |= {m["value"] for m in op["value"]}         # re-adding is a no-op: idempotent
+        elif kind == "remove" and (m := REMOVE_FILTER.match(path)):
             out.discard(m.group(1))                          # removing a non-member is a no-op
-        elif kind == "replace" and path == "members":
-            out = {m["value"] for m in value}                # legal, but a full rewrite each time
         else:
             raise ValueError(f"unsupported group operation: {op}")
     return out, out - members, members - out
 
-body = {"schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-        "Operations": [{"op": "Add", "path": "members", "value": [{"value": "u3"}]},
+body = {"Operations": [{"op": "Add", "path": "members", "value": [{"value": "u3"}]},
                        {"op": "remove", "path": 'members[value eq "u1"]'}]}
 new, added, removed = apply_group_patch({"u1", "u2"}, body)
 print(sorted(new), added, removed)       # ['u2', 'u3'] {'u3'} {'u1'}
@@ -345,6 +319,12 @@ print(apply_group_patch(new, body)[1:])  # (set(), set()): replay changes nothin
 - **Orphan and drift report.** Weekly, list accounts with no SCIM link (created only by JIT) and active users
   not seen in the IdP feed. Monitor both counts per tenant; a rising number means the join key or the push
   scope is wrong.
+- **SCIM endpoint contract.** Resolve the tenant from the bearer token, never from the request; return 404
+  for an unknown user and 400 when `schemas` lacks `urn:ietf:params:scim:api:messages:2.0:PatchOp`; audit-log
+  the raw body; respond 200 with the full resource.
+- **Patch shapes to cover beyond the basics.** Filtered paths such as `emails[type eq "work"].value`, user
+  `remove` operations, group removals listed in `value` under `path: "members"`, and `replace` of the full
+  member list (legal, but diff it against the stored list before invalidating caches).
 
 ## Trade-offs
 - **Near-real-time sync vs per-IdP quirks.** SCIM gives lifecycle sync with a standard you build once, but

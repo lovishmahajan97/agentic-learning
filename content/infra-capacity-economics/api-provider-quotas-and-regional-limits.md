@@ -251,61 +251,31 @@ sequenceDiagram
 
 ## Examples
 ### Gateway limiter that budgets like the provider
-Budgets tokens the way the provider does (reserving `max_tokens`), routes across a pool of deployments,
-honours `Retry-After`, and refuses to retry into an overloaded pool. Deployment names and quotas are
-placeholders.
+A token bucket at 85% of quota that charges each request its prompt plus `max_tokens`, the way providers
+that reserve output do at admission.
 
 ```python
-import time, random, threading
+import time
 
 class TokenBucket:
-    def __init__(self, per_minute: int, share: float = 0.85):
-        self.cap = per_minute * share; self.tokens = self.cap; self.t = time.time(); self.lock = threading.Lock()
-    def take(self, n: int) -> bool:
-        with self.lock:
-            now = time.time(); self.tokens = min(self.cap, self.tokens + (now - self.t) * self.cap / 60); self.t = now
-            if self.tokens >= n: self.tokens -= n; return True
-            return False
-    def give(self, n: int):                      # refund a reservation that was never sent
-        with self.lock: self.tokens = min(self.cap, self.tokens + n)
+    def __init__(self, per_minute, share=0.85):    # 85%: a margin for estimation drift
+        self.cap = self.tokens = per_minute * share
+        self.t = time.monotonic()
+    def take(self, n):
+        now = time.monotonic()
+        self.tokens = min(self.cap, self.tokens + (now - self.t) * self.cap / 60)
+        self.t = now
+        if self.tokens < n: return False            # wait in our queue, not at the provider
+        self.tokens -= n
+        return True
 
-class Deployment:
-    def __init__(self, name, tpm, rpm):
-        self.name, self.tpm, self.rpm, self.open_until = name, TokenBucket(tpm), TokenBucket(rpm), 0.0
-
-pool = [Deployment("eu-west-a", tpm=300_000, rpm=1_800), Deployment("eu-west-b", tpm=150_000, rpm=900)]
-
-def pick(need: int):
-    for d in random.sample(pool, len(pool)):   # random order spreads load; budget only the one used
-        if d.open_until > time.time() or not d.rpm.take(1): continue
-        if d.tpm.take(need): return d
-        d.rpm.give(1)                          # token budget short: return the request slot
-    return None
-
-def call(send, prompt_tokens, max_tokens, attempts=4):
-    need = prompt_tokens + max_tokens          # count max_tokens, as the provider does at admission
-    for attempt in range(attempts):
-        d = pick(need)
-        if d is None:
-            time.sleep(min(2 ** attempt, 8) * random.uniform(0.5, 1.5)); continue   # wait in our queue
-        status, headers, body = send(d.name)
-        if status == 200: return body
-        if status == 429:                      # our estimate drifted or the pool is busy: back off
-            time.sleep(float(headers.get("retry-after", 2 ** attempt)) * random.uniform(1.0, 1.5))
-        elif status in (503, 529):             # overloaded: trip this deployment for a while
-            d.open_until = time.time() + 30
-        else:
-            raise RuntimeError(f"{d.name}: {status}")
-    raise RuntimeError("quota exhausted: shed or defer this request")
+tpm = TokenBucket(400_000)                          # 340k admitted per minute
+need = 1_000 + 4_000                                # prompt + max_tokens, as the provider counts it
+print(sum(tpm.take(need) for _ in range(100)))      # 68 of a 100-request burst admitted
 ```
 
-- **Admission matches the provider's check:** it admits only when both the request budget and the token
-  budget of the chosen deployment have room.
-- **It debits only the deployment actually used;** debiting every candidate would silently burn the
-  others' budgets.
-- **85% of quota** keeps a margin for estimation drift.
-- **A production version would also refund** the unused part of `max_tokens` when the response reports
-  its real usage, if the provider does the same.
+- **Admission matches the provider's check;** a real gateway keeps one such bucket for TPM and one for RPM
+  per deployment and admits only when both have room.
 
 ### Which limit binds? A ceiling calculator
 Plug in your quotas to see the request ceiling, and notice that fixing one limit exposes the next.
@@ -343,46 +313,37 @@ provider reserves `max_tokens` at admission.
 - **Compare with chat:** the same 400k TPM served 222 one-shot requests per minute in the calculator above.
 
 ### An agent loop that pauses on quota instead of failing
-The run keeps its transcript and the results of tools already executed, so a resume never repeats a side
-effect. `send` returns status, headers and the parsed reply; `save` persists the run.
+The run keeps the results of tools already executed by call id, so a resume never repeats a side effect.
+`send` returns status, headers and the parsed reply; `save` persists the run.
 
 ```python
 import time, random
-from dataclasses import dataclass, field
 
 class Throttled(Exception): pass
 
-@dataclass
-class Run:
-    messages: list
-    tool_results: dict = field(default_factory=dict)   # tool_call_id -> result, survives a pause
-    done: bool = False
-
-def model_step(send, messages, max_tokens, attempts=3):
+def model_step(send, messages, attempts=3):
     for attempt in range(attempts):
-        status, headers, reply = send(messages, max_tokens)
+        status, headers, reply = send(messages)
         if status == 200: return reply
-        if status == 429:
-            time.sleep(float(headers.get("retry-after", 2 ** attempt)) * random.uniform(1.0, 1.5))
-        elif status in (503, 529): break          # overloaded: retrying here cannot create capacity
-        else: raise RuntimeError(status)
+        if status in (503, 529): break               # overloaded: retrying cannot create capacity
+        if status != 429: raise RuntimeError(status) # a bad request is a bug, not a quota
+        time.sleep(float(headers.get("retry-after", 2 ** attempt)) * random.uniform(1.0, 1.5))
     raise Throttled()
 
-def drive(run: Run, send, tools: dict, save, max_tokens=800, max_steps=20) -> str:
+def drive(run, send, tools, save, max_steps=20):
     for _ in range(max_steps):
-        try:
-            reply = model_step(send, run.messages, max_tokens)
-        except Throttled:
-            save(run); return "paused"            # a scheduler resumes it when budget returns
-        run.messages.append(reply["message"])
-        if not reply["tool_calls"]:
-            run.done = True; save(run); return "done"
+        try: reply = model_step(send, run["messages"])
+        except Throttled: save(run); return "paused"  # a scheduler resumes it when budget returns
+        run["messages"].append(reply["message"])
+        if not reply["tool_calls"]: return "done"
         for call in reply["tool_calls"]:
-            if call["id"] not in run.tool_results:          # never re-run a finished tool
-                run.tool_results[call["id"]] = tools[call["name"]](**call["args"])
-            run.messages.append({"role": "tool", "tool_call_id": call["id"],
-                                 "content": str(run.tool_results[call["id"]])})
-    save(run); return "step budget exhausted"
+            if call["id"] not in run["results"]:     # never re-run a finished tool
+                run["results"][call["id"]] = tools[call["name"]](**call["args"])
+            run["messages"].append({"role": "tool", "tool_call_id": call["id"],
+                                    "content": str(run["results"][call["id"]])})
+    return "step budget exhausted"
+
+print(drive({"messages": [], "results": {}}, lambda m: (529, {}, None), {}, lambda r: None))  # paused
 ```
 
 - **Turn off the SDK's own retries** when wrapping it like this, or the two retry layers multiply into the
@@ -415,6 +376,9 @@ def drive(run: Run, send, tools: dict, save, max_tokens=800, max_steps=20) -> st
 - **Quota register in the runbook.** One table of quota, current peak and increase lead time per model per
   region, reviewed before each launch. Monitor peak demand as a share of quota and file increases well
   before it nears the self-limit.
+- **Debit only the deployment you send to.** When routing across a pool, reserve budget on the chosen
+  deployment only, return its request slot if its token budget is short, and refund the unused part of
+  `max_tokens` when the response reports real usage, if the provider does the same.
 
 ## Trade-offs
 - **Pausing runs vs finishing them late.** Checkpointing on throttle protects tools from repeated side

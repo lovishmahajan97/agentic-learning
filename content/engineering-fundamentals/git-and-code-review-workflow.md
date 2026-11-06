@@ -295,49 +295,40 @@ flowchart TD
 ```
 
 ## Examples
-### Branch, bisect a bad AI "cleanup", revert it, and autosquash a fixup
+### Bisect a bad AI "cleanup" and revert it
 Runs end to end in a throwaway repository. An assistant's "Simplify sort" commit silently inverts a
-ranking; `git bisect run` finds it among five commits, `git revert` undoes it without rewriting
-history, and a `fixup!` commit is folded into its target non-interactively (tested with git 2.56).
+ranking; `git bisect run` finds it among four commits and `git revert` undoes it without rewriting
+history (tested with git 2.56).
 
 ```bash
 set -e
 export GIT_CONFIG_GLOBAL=/dev/null                   # ignore personal config for a clean demo
 export GIT_AUTHOR_NAME=demo GIT_AUTHOR_EMAIL=demo@example.com GIT_COMMITTER_NAME=demo GIT_COMMITTER_EMAIL=demo@example.com
-rm -rf /tmp/efund/repo
-mkdir -p /tmp/efund/repo                             # separate lines: set -e ignores failures inside &&
-cd /tmp/efund/repo                                   # chains, so a failed mkdir would leave you in the cwd
+rm -rf /tmp/efund/repo; mkdir -p /tmp/efund/repo; cd /tmp/efund/repo   # not &&: set -e ignores && chains
 git init -q -b main
 printf 'def top_k(scores, k):\n    return sorted(scores, reverse=True)[:k]\n' > rank.py
 printf 'from rank import top_k\nassert top_k([0.2, 0.9, 0.5], 2) == [0.9, 0.5]\n' > check.py
 git add . && git commit -qm "Add top_k ranking with check"
-
-git switch -qc feat/rerank                            # one branch per change
-for i in 1 2 3; do echo "note $i" > note$i.md; git add .; git commit -qm "Add note $i"; done
+git switch -qc feat/rerank                           # one branch per change
+for i in 1 2; do echo "note $i" > note$i.md; git add .; git commit -qm "Add note $i"; done
 sed -i.bak 's/reverse=True/reverse=False/' rank.py && rm rank.py.bak   # the AI-suggested "cleanup"
 git commit -qam "Simplify sort"
-echo "note 4" > note4.md; git add .; git commit -qm "Add note 4"
-
-git bisect start HEAD main >/dev/null                        # bad, then good
+echo "note 3" > note3.md; git add .; git commit -qm "Add note 3"
+git bisect start HEAD main >/dev/null                # bad, then good
 git bisect run python3 check.py >/dev/null 2>&1
-git log -1 --format="first bad: %h %s" refs/bisect/bad
+git log -1 --format="first bad: %s" refs/bisect/bad
 git bisect reset >/dev/null 2>&1
-
-git revert --no-edit HEAD~1 >/dev/null                 # undo the bad commit with a new commit
+git revert --no-edit HEAD~1 >/dev/null               # undo with a new commit; history is kept
 python3 check.py && echo "check passes after revert"
-echo "typo fixed" >> note1.md
-git commit -qam "fixup! Add note 1"                    # fold a fix into an earlier commit
-GIT_SEQUENCE_EDITOR=: git rebase -qi --autosquash main # non-interactive autosquash
-git log --oneline main..HEAD
-# Output (ids differ per run):
-# first bad: 46c3be3 Simplify sort
+git log --format=%s main..HEAD
+# Output:
+# first bad: Simplify sort
 # check passes after revert
-# ebf5444 Revert "Simplify sort"
-# 9bde7f2 Add note 4
-# be20f34 Simplify sort
-# c17626e Add note 3
-# 1585f5c Add note 2
-# 1f0ce8f Add note 1          (now contains the fixup; no separate fixup commit remains)
+# Revert "Simplify sort"
+# Add note 3
+# Simplify sort
+# Add note 2
+# Add note 1
 ```
 
 - **Why the check script matters:** bisect is only as good as the command it runs. Exit 0 means good,

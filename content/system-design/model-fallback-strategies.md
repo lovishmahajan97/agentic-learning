@@ -222,13 +222,10 @@ flowchart TD
 ```
 
 ## Examples
-### Resuming an agent run on a fallback without replaying tools
-Each step is checkpointed after it completes; tools take an idempotency key derived from the logical
-action (run, step, call index, tool), so a failover that re-runs a step returns the stored result instead
-of acting twice.
-
-The key leaves out the arguments on purpose: a fallback model redoing the step may phrase the same
-action's arguments differently. `complete` is the ladder below; `store` is any durable key-value store.
+### Replaying a step on a fallback without repeating its tool calls
+Tools take an idempotency key derived from the logical action (run, step, call index, tool), so a failover
+that re-runs a step returns the stored result instead of acting twice. The key leaves out the arguments on
+purpose: a fallback model redoing the step may phrase the same action's arguments differently.
 
 ```python
 import hashlib, json
@@ -237,31 +234,19 @@ def idem_key(run_id, step, call_index, tool):
     raw = json.dumps([run_id, step, call_index, tool])   # the action, not its wording
     return hashlib.sha256(raw.encode()).hexdigest()
 
-async def run_tool_once(store, key, tool_fn, args):
-    if (prior := await store.get(f"tool:{key}")) is not None:
-        return prior                                   # already executed: never send the email twice
-    result = await tool_fn(**args, idempotency_key=key)  # pass the key to APIs that accept one
-    await store.set(f"tool:{key}", result)
+def run_tool_once(store, key, tool_fn, args):
+    if (prior := store.get(f"tool:{key}")) is not None:
+        return prior                                     # already executed: never send the email twice
+    result = tool_fn(**args)                             # also pass the key to APIs that accept one
+    store[f"tool:{key}"] = result
     return result
 
-async def run_agent(store, run_id, task, tools, tool_schemas, max_steps=20):
-    state = (await store.get(f"ckpt:{run_id}")                                   # resume point
-             or {"step": 0, "messages": [{"role": "user", "content": task}]})
-    while state["step"] < max_steps:
-        resp = await complete(state["messages"], tools=tool_schemas, deadline=10.0)  # walks the ladder
-        msg = resp["message"]
-        state["messages"].append(msg)
-        if not msg.get("tool_calls"):
-            return msg["content"]
-        for i, tc in enumerate(msg["tool_calls"]):
-            name = tc["function"]["name"]
-            args = json.loads(tc["function"]["arguments"])   # validate against the schema here too
-            key = idem_key(run_id, state["step"], i, name)
-            out = await run_tool_once(store, key, tools[name], args)
-            state["messages"].append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(out)})
-        state["step"] += 1
-        await store.set(f"ckpt:{run_id}", state)            # checkpoint after the step, not before
-    raise RuntimeError("step cap reached")
+store, sent = {}, []
+send_email = lambda to, body: sent.append(to) or "sent"
+key = idem_key("run-1", 3, 0, "send_email")
+run_tool_once(store, key, send_email, {"to": "a@x.com", "body": "Hi"})      # primary, step 3
+run_tool_once(store, key, send_email, {"to": "a@x.com", "body": "Hello"})   # fallback redoes step 3
+print(len(sent))                                         # 1
 ```
 
 - **LangGraph users get the checkpoint half from a checkpointer** keyed by thread id; the idempotency half
@@ -276,114 +261,72 @@ Illustrative: each step costs ~$0.05 and ~4 s; steps 3 and 6 send customer email
 | Retry the step on the dead primary | Waits out timeouts until the run deadline | Run fails, user sees an error |
 | Checkpoint per step plus idempotency keys | Step 7 re-runs on the fallback rung | One extra call (~$0.05, ~4 s); no duplicate emails |
 
-### Fallback ladder with breakers and a shared deadline
-Per-target circuit breakers (closed, open, half-open with a single probe), error classification and one
-deadline. `call_model`, `ModelError` (with an HTTP `status`) and `ServiceDegraded` are the adapter types
-your client layer provides; the point is the control flow.
+### A circuit breaker per target
+Closed, then open after 5 failures, then one probe per 60 s cooldown: the defaults the incident below uses.
 
 ```python
-import asyncio, random, time
+import time
 
-class Breaker:                       # closed -> open (after N failures in window) -> half-open (one probe)
-    def __init__(self, fails=5, window=30, cooldown=60):
-        self.fails, self.window, self.cooldown = fails, window, cooldown
-        self.errors, self.open_until, self.probing = [], 0.0, False
+class Breaker:
+    def __init__(self, fails=5, cooldown=60): self.fails, self.cooldown, self.n, self.open_until = fails, cooldown, 0, 0.0
     def allow(self):
-        now = time.time()
-        if now < self.open_until: return False          # open: skip this target without waiting
-        if self.open_until and self.probing: return False   # half-open: one probe is already in flight
-        if self.open_until: self.probing = True         # cooldown over: let exactly one probe through
+        if time.time() < self.open_until: return False  # open: skip this target without waiting
+        if self.open_until: self.open_until = time.time() + self.cooldown   # half-open: this call is the probe
         return True
     def record(self, ok):
-        now = time.time()
-        if self.probing:                                # half-open: the probe alone decides
-            self.probing = False
-            self.open_until, self.errors = (0.0, []) if ok else (now + self.cooldown, [])
-            return
-        self.errors = [t for t in self.errors if now - t < self.window] + ([] if ok else [now])
-        if len(self.errors) >= self.fails:
-            self.open_until, self.errors = now + self.cooldown, []
+        self.n = 0 if ok else self.n + 1
+        if ok: self.open_until = 0.0                    # a success closes it
+        elif self.open_until or self.n >= self.fails: self.open_until, self.n = time.time() + self.cooldown, 0
+```
 
-FAILOVER_ON = {408, 429, 500, 502, 503, 504}   # target-side failures; same-target retries live in call_model
+### Fallback ladder with breakers and a shared deadline
+Error classification, one breaker per rung and one deadline. `call_model`, `ModelError` (with an HTTP
+`status`) and `ServiceDegraded` are the adapter types your client layer provides; the point is the control
+flow.
+
+```python
+import asyncio, time
+
+FAILOVER_ON = {408, 429, 500, 502, 503, 504}            # target-side failures
 LADDER = [("primary-us", 3.0), ("primary-eu", 3.0), ("vendor-b-equivalent", 6.0)]   # (target, timeout s)
 breakers = {t: Breaker() for t, _ in LADDER}
 
-async def complete(messages, tools=None, deadline=10.0):
-    start, last_err = time.time(), None
+async def complete(messages, deadline=10.0):
+    start = time.time()
     for depth, (target, timeout) in enumerate(LADDER):
         remaining = deadline - (time.time() - start)
         if remaining <= 0 or not breakers[target].allow():
             continue                                    # out of budget, or breaker open: skip this rung
         try:
-            resp = await asyncio.wait_for(call_model(target, messages, tools),
-                                          timeout=min(timeout, remaining))
+            resp = await asyncio.wait_for(call_model(target, messages), min(timeout, remaining))
             breakers[target].record(ok=True)
             return {"served_by": target, "fallback_depth": depth, **resp}
         except ModelError as e:
-            if e.status not in FAILOVER_ON:             # 400/401/policy: the request is bad, not the target,
-                breakers[target].record(ok=True)        # so it must not trip the breaker...
-                raise                                   # ...and it would fail identically on every rung
-            breakers[target].record(ok=False); last_err = e
-            await asyncio.sleep(random.uniform(0, 0.2))  # jitter before the next rung
+            if e.status not in FAILOVER_ON: raise       # 400/401/policy: would fail alike on every rung
+            breakers[target].record(ok=False)
         except asyncio.TimeoutError:
-            breakers[target].record(ok=False); last_err = "timeout"
-    raise ServiceDegraded(last_err)                     # hand off to the graceful-degradation layer
+            breakers[target].record(ok=False)
+    raise ServiceDegraded("all rungs failed")           # hand off to the graceful-degradation layer
 ```
 
 - **`served_by` and `fallback_depth` go into metrics and traces;** the alert on fallback depth greater than
   zero tells you the primary is unhealthy before customers do.
-- **Client errors are recorded as healthy,** because a burst of malformed requests from one buggy caller
-  must not open the breaker and push everyone else's traffic to a worse rung.
+- **Client errors re-raise without counting as failures,** because a burst of malformed requests from one
+  buggy caller must not open the breaker and push everyone else's traffic to a worse rung.
 - **The per-rung timeouts (3 s, 3 s, 6 s) sum to more than the 10 s deadline,** so the third rung gets only
   what is left: if both primaries time out, it has just under 4 s of its 6 s. A rung that cannot finish in
   that time is better skipped (`remaining <= 0` is the crude version of that check).
-- **Release the half-open probe slot on every exit path** in a production breaker, including cancellation
-  when the client disconnects, or a target can stay skipped indefinitely.
 
 ### Availability when rungs share a cause
-Pure Python: how much of the 99.9975% survives when some failures are shared.
+Two rungs that each fail 0.5% of the time give 99.9975% only if their failures are independent. When a
+share of each rung's failures comes from a shared cause (same region, same upstream, same bad prompt):
 
-```python
-def both_fail(p_each, common_share):
-    """P(both rungs fail) when a share of each rung's failures comes from a shared cause."""
-    q = p_each * common_share                     # shared-cause outage: takes down both rungs
-    r = (p_each - q) / (1 - q)                    # independent failures, so each rung still fails p_each
-    return q + (1 - q) * r * r
-
-for share in (0.0, 0.1, 0.5, 1.0):
-    print(f"shared cause {share:>4.0%}: availability {1 - both_fail(0.005, share):.4%}")
-# 0%: 99.9975%   10%: 99.9480%   50%: 99.7494%   100%: 99.5000% (the second rung bought nothing)
-```
-
-### Hedged request
-Start the primary; if it has not answered by the hedge delay (set it near your p95), start the secondary
-and take the first success.
-
-```python
-import asyncio
-
-async def hedged(call, primary, secondary, hedge_after):
-    """Start primary; if no answer by hedge_after seconds, also start secondary. First success wins."""
-    tasks = {asyncio.create_task(call(primary))}
-    done, _ = await asyncio.wait(tasks, timeout=hedge_after)
-    if not done:                                         # slow tail: send the hedge
-        tasks.add(asyncio.create_task(call(secondary)))  # (a fast error is the ladder's job, not this)
-    errors = []
-    while tasks:
-        done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for t in done:
-            if t.exception() is None:
-                for p in tasks: p.cancel()               # stop the loser
-                return t.result()
-            errors.append(t.exception())
-    raise errors[-1]
-
-async def fake(target):                                  # demo: primary stalls, secondary is quick
-    await asyncio.sleep(2.0 if target == "primary" else 0.3)
-    return f"answer from {target}"
-
-print(asyncio.run(hedged(fake, "primary", "secondary", hedge_after=0.8)))   # answer from secondary, ~1.1 s
-```
+| Shared cause | Availability |
+|---|---|
+| 0% | 99.9975% |
+| 10% | 99.9480% |
+| 50% | 99.7494% |
+| 100% | 99.5000%: the second rung bought nothing |
 
 ### Worked incident: a 40-minute primary outage
 Illustrative traffic of 50 requests per second, `primary-us` hard down, breaker defaults from the ladder
@@ -420,6 +363,17 @@ code (5 failures, 60 s cooldown).
 - **Propagate the deadline.** Pass the absolute deadline from the edge to every service (a request header
   or context value), and compute each rung's timeout as `min(rung_timeout, remaining)`. Monitor rungs
   skipped for lack of budget and end-to-end p99 against the deadline.
+- **Production breaker details.** Count failures over a sliding window (for example 30 s) rather than in a
+  row, allow exactly one in-flight half-open probe, and release the probe slot on every exit path,
+  including cancellation when the client disconnects, or a target can stay skipped indefinitely. Add a
+  small random jitter (for example up to 200 ms) before moving to the next rung, and keep same-target
+  retries inside the client call, not in the ladder.
+- **Checkpoint after the step, not before, with a step cap.** Write the run checkpoint only once a step's
+  model call and tool results are in (cap runs at about 20 steps), and validate tool-call arguments against
+  the schema on every rung, since a fallback model may emit different arguments.
+- **Hedge slow tails, not errors.** For a hedged request, start the secondary only if the primary has not
+  answered by a delay near your p95, take the first success and cancel the loser; a fast error is the
+  ladder's job, not the hedge's.
 
 ## Trade-offs
 - **Availability vs output consistency.** Consistency falls as the ladder descends to other vendors. For

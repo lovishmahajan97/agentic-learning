@@ -168,25 +168,17 @@ flowchart TD
   changing the retriever or the embedding model.
 
 ## Examples
-### Agent context builder: trimmed results, edge order, goal restated last
-Each step's context ends with the task and the agent's current plan, so the recency window holds what the
-next decision depends on. `position_sweep` measures how much middle your model tolerates.
+### Agent context builder: edge order, goal restated last
+Search results are reranked and cut upstream, then edge-ordered; each step's context ends with the task
+and the agent's current plan, so the recency window holds what the next decision depends on.
 
 ```python
-import random
-
 def reorder_for_edges(ranked):
     """rank1 first, rank2 last, rank3 second, rank4 second-to-last ... best evidence at both ends."""
     front, back = [], []
     for i, doc in enumerate(ranked):
         (front if i % 2 == 0 else back).append(doc)
     return front + back[::-1]
-
-print(reorder_for_edges([1, 2, 3, 4, 5, 6, 7]))        # [1, 3, 5, 7, 6, 4, 2]
-
-def format_search_result(ranked_chunks, k=6):
-    docs = reorder_for_edges(ranked_chunks[:k])        # reranked upstream; cut, then edge order
-    return "\n\n".join(f'<doc id="{c["id"]}" source="{c["source"]}">\n{c["text"]}\n</doc>' for c in docs)
 
 def build_step_context(task, notes, recent_turns, plan):
     return [
@@ -197,7 +189,19 @@ def build_step_context(task, notes, recent_turns, plan):
                                     "Quote the evidence you rely on, then choose the next action."},
     ]
 
-def position_sweep(llm, build_prompt, gold, distractors, question, grader, k=20, trials=30):
+print(reorder_for_edges([1, 2, 3, 4, 5, 6, 7]))        # [1, 3, 5, 7, 6, 4, 2]
+ctx = build_step_context("Find the refund window", "- policy v3 found", [], "check EU addendum")
+print(ctx[-1]["content"].splitlines()[0])             # Reminder - task: Find the refund window
+```
+
+### Position sweep: how much middle your model tolerates
+`position_sweep` places the gold chunk at every position among k-1 distractors. The simulated model has
+a U-curve; swap in your model and a grader.
+
+```python
+import random
+
+def position_sweep(llm, gold, distractors, k=20, trials=300):
     """Accuracy as a function of where the gold chunk sits among k-1 distractors."""
     acc = {}
     for pos in range(k):
@@ -205,20 +209,18 @@ def position_sweep(llm, build_prompt, gold, distractors, question, grader, k=20,
         for _ in range(trials):
             ctx = random.sample(distractors, k - 1)
             ctx.insert(pos, gold)
-            correct += grader(llm(build_prompt(ctx, question)))   # grader returns 1 or 0
+            correct += llm(ctx)                       # 1 if the graded answer is right, else 0
         acc[pos] = correct / trials
     return acc
-# Illustrative shape for a 20-chunk context: ~0.9 at position 0, ~0.65 around position 10, ~0.8 at 19.
-# Run it per question type and per model; the trough depth is what tells you how much k you can afford.
 
-def simulated_llm(ctx):                                 # stand-in with a U-curve; swap in your model
+def simulated_llm(ctx):                               # stand-in with a U-curve; swap in model + grader
     pos = ctx.index("GOLD")
     return random.random() < (0.9 - 0.025 * pos if pos <= 10 else 0.65 + 0.0167 * (pos - 10))
 
 random.seed(0)
-acc = position_sweep(simulated_llm, lambda ctx, q: ctx, "GOLD", [f"d{i}" for i in range(100)], "q",
-                     grader=int, trials=300)
-print({p: round(acc[p], 2) for p in (0, 10, 19)})       # seed 0: {0: 0.89, 10: 0.65, 19: 0.83}
+acc = position_sweep(simulated_llm, "GOLD", [f"d{i}" for i in range(100)])
+print({p: round(acc[p], 2) for p in (0, 10, 19)})       # {0: 0.89, 10: 0.65, 19: 0.83}
+# Run it per question type and per model; the trough depth tells you how much k you can afford.
 ```
 
 ### Worked numbers: rerank, cut, reorder

@@ -228,12 +228,9 @@ Pure Python, no downloads: embedding-table parameters, and raw float32 index mem
 different dimensions (index structures add overhead on top).
 
 ```python
-def table_params(vocab, d_model):
-    return vocab * d_model
-
-for name, v, d in [("GPT-2 small", 50_257, 768), ("Llama-2-7B", 32_000, 4_096),
-                   ("Llama 3", 128_256, 4_096)]:
-    print(f"{name:12s} {table_params(v, d) / 1e6:6.1f}M embedding params")
+for name, vocab, d_model in [("GPT-2 small", 50_257, 768), ("Llama-2-7B", 32_000, 4_096),
+                             ("Llama 3", 128_256, 4_096)]:
+    print(f"{name:12s} {vocab * d_model / 1e6:6.1f}M embedding params")   # one row per token
 
 def index_gb(n_vectors, dim, bytes_per_el=4):          # float32 vectors, no index overhead
     return n_vectors * dim * bytes_per_el / 1e9
@@ -261,32 +258,27 @@ from sentence_transformers import SentenceTransformer
 
 MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"     # stored with every vector
 st = SentenceTransformer(MODEL_ID)
+embed = lambda texts: st.encode(texts, normalize_embeddings=True)   # unit length: dot = cosine
 
 docs = ["Reset a password from Settings > Security.",
         "Refunds are issued within 5 business days.",
         "Error AX-4471 means the license server is unreachable."]
-doc_vecs = st.encode(docs, normalize_embeddings=True)
+doc_vecs = embed(docs)
 
 def search_docs(query: str, k: int = 3, min_score: float = 0.3) -> dict:
     """Tool the agent calls. Returns scores too, so traces show retrieval quality."""
-    q = st.encode([query], normalize_embeddings=True)[0]
-    scores = doc_vecs @ q                                # cosine, vectors are unit length
-    top = np.argsort(-scores)[:k]
+    scores = doc_vecs @ embed([query])[0]
     hits = [{"text": docs[i], "score": round(float(scores[i]), 3)}
-            for i in top if scores[i] >= min_score]
+            for i in np.argsort(-scores)[:k] if scores[i] >= min_score]
     return {"model": MODEL_ID, "hits": hits or "no relevant documents found"}
 
 tools = {"search_docs": "Search the product help center for how-to and policy answers.",
          "create_ticket": "Open a support ticket for a human agent.",
          "get_invoice": "Fetch an invoice by id for the signed-in customer."}
-tool_vecs = st.encode(list(tools.values()), normalize_embeddings=True)
-
-def shortlist_tools(user_msg: str, n: int = 2) -> list[str]:
-    s = tool_vecs @ st.encode([user_msg], normalize_embeddings=True)[0]
-    return [list(tools)[i] for i in np.argsort(-s)[:n]]  # only these schemas go in the prompt
-
-print(shortlist_tools("I was charged twice, where is my invoice?"))
+s = embed(list(tools.values())) @ embed(["I was charged twice, where is my invoice?"])[0]
+print([list(tools)[i] for i in np.argsort(-s)[:2]])     # only these schemas go in the prompt
 print(search_docs("how long does a refund take"))
+# ['get_invoice', 'create_ticket'], then one hit: the refunds doc at score ~0.80
 ```
 
 ### Worked scenario: retrieved text is a context-budget line item

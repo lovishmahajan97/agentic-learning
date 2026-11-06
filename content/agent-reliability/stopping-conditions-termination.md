@@ -352,23 +352,18 @@ nudges exactly once when the model ends its turn without submitting.
   Trade-offs); only then does budget exhaustion produce a `partial` built from the wrap-up turn.
 - **Walk one run through it:** step 6 submits with 2 of 40 tests red and is rejected with the failure
   names; step 9 submits all green and ends `succeeded/verified`. Had step 9 been the last allowed step
-  with tests red, it would end `partial/budget_exhausted`, counted as not done. The scripted runs at
-  the bottom run these paths.
+  with tests red, it would end `partial/budget_exhausted`, counted as not done. The scripted runs
+  below replay both paths.
 - **Wire in the fail-closed map.** As written, `decide()` checks raw Claude values only, so a `refusal`
   with no tool calls falls through to `None` and the run idles until the budget fires. In real code, pass
   the stop reason through `normalise()` (next example) and return `failed` on `refused` or `unknown`.
 
 ```python
-from dataclasses import dataclass
-
-@dataclass
-class Outcome:
-    status: str                      # succeeded | partial | aborted | failed
-    reason: str
-    result: dict | None = None
+from collections import namedtuple
+Outcome = namedtuple("Outcome", "status reason result", defaults=[None])
 
 def decide(state, resp, verify) -> Outcome | None:
-    """Return an Outcome to stop, or None to continue. Order matters."""
+    """Return an Outcome (succeeded|partial|aborted|failed) to stop, or None. Order matters."""
     if state.cancelled:
         return Outcome("aborted", "user_cancelled")
     if resp.stop_reason == "max_tokens":
@@ -377,53 +372,47 @@ def decide(state, resp, verify) -> Outcome | None:
     ok, detail = verify(submit.args) if submit else (False, "")   # independent check
     if ok:                                           # verified success wins even on the last step
         return Outcome("succeeded", "verified", submit.args)
-    if state.steps >= state.max_steps or state.tokens >= state.max_tokens:
+    if state.steps >= state.max_steps:               # or any other budget (tokens, seconds)
         return Outcome("partial", "budget_exhausted", state.wrap_up())  # no-tools summary call
-    if submit:
-        # every tool call needs a matching result, or the next API request is rejected
+    if submit:   # every tool call needs a matching result, or the next API request is rejected
         state.push_tool_result(submit, f"rejected: {detail}. Keep working.")
-        return None
-    if resp.stop_reason == "end_turn":               # stopped talking, did not submit
+    elif resp.stop_reason == "end_turn":             # stopped talking, did not submit
         if state.nudged:
             return Outcome("failed", "ended_without_submit")
         state.nudged = True
         state.push_user("Call submit_result when finished, or continue working.")
     return None
+```
 
-def run(state, model, tools, verify):
-    while True:
-        resp = model(state.messages)
-        state.account(resp)                          # steps, tokens from usage
-        out = decide(state, resp, verify)
-        if out:
-            return out
-        for call in resp.tool_calls:
-            if call.name != "submit_result":     # a rejected submit already got its result
-                state.push_tool_result(call, tools[call.name](**call.args))
+Paste below `decide()` and run with plain Python 3.10+; the fake model submits a scripted red-test count.
 
-# --- runnable check with a scripted fake model (Python 3.10+, no dependencies) ---
+```python
 from types import SimpleNamespace as NS
+
+def run(state, model, verify):
+    while True:
+        state.steps += 1                             # real code: also charge tokens from usage
+        if out := decide(state, model(state.messages), verify):
+            return out
+        # real code: dispatch the other tool calls (a rejected submit already got its result)
 
 class State:
     def __init__(self, max_steps=12):
-        self.messages, self.steps, self.tokens = [], 0, 0
-        self.max_steps, self.max_tokens = max_steps, 100_000
+        self.messages, self.steps, self.max_steps = [], 0, max_steps
         self.cancelled = self.nudged = False
-    def account(self, resp): self.steps += 1; self.tokens += resp.tokens
-    def push_tool_result(self, call, out): self.messages.append(("tool", call.name, out))
+    def push_tool_result(self, call, out): self.messages.append((call.name, out))
     def push_user(self, text): self.messages.append(("user", text))
     def wrap_up(self): return {"summary": "done / remaining / blocked"}
 
-def scripted(*failing):                   # each step submits with this many red tests
-    resps = iter(NS(stop_reason="tool_use", tokens=900,
-                    tool_calls=[NS(name="submit_result", args={"failing": f})]) for f in failing)
-    return lambda messages: next(resps)
+def script(*resps):                                  # fake model: one response per step
+    it = iter(resps)
+    return lambda messages: next(it)
 
+sub = lambda failing: NS(stop_reason="tool_use",
+                         tool_calls=[NS(name="submit_result", args={"failing": failing})])
 verify = lambda a: (a["failing"] == 0, f"{a['failing']} tests failing")
-print(run(State(), scripted(2, 0), {}, verify))           # succeeded / verified
-print(run(State(max_steps=1), scripted(2), {}, verify))   # partial / budget_exhausted
-cut = lambda m: NS(stop_reason="max_tokens", tokens=4096, tool_calls=[])
-print(run(State(), cut, {}, verify))                       # failed / output_truncated
+print(run(State(), script(sub(2), sub(0)), verify))      # succeeded / verified
+print(run(State(max_steps=1), script(sub(2)), verify))   # partial / budget_exhausted
 ```
 
 ### Fail-closed mapping of provider stop reasons
@@ -432,19 +421,16 @@ stops the run instead of being read as "finished".
 
 ```python
 STOP_MAP = {
-    # Anthropic stop_reason
-    "tool_use": "tools", "end_turn": "ended", "stop_sequence": "ended",
+    "tool_use": "tools", "end_turn": "ended", "stop_sequence": "ended",      # Anthropic stop_reason
     "max_tokens": "truncated", "pause_turn": "resend", "refusal": "refused",
-    # OpenAI Chat Completions finish_reason
-    "tool_calls": "tools", "stop": "ended", "length": "truncated",
+    "tool_calls": "tools", "stop": "ended", "length": "truncated",           # OpenAI finish_reason
     "content_filter": "refused",
 }
 
 def normalise(raw: str | None) -> str:
     return STOP_MAP.get(raw or "", "unknown")    # unknown -> caller treats as failed
 
-assert normalise("length") == "truncated"
-assert normalise("some_future_value") == "unknown"
+print(normalise("length"), normalise("some_future_value"))   # truncated unknown
 ```
 
 ### Worked scenario: what a labelled outcome reveals

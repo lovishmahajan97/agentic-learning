@@ -249,7 +249,7 @@ The first call returns every item; later calls with the saved `deltaLink` return
 deleted items carry a `deleted` facet, which is how the connector removes them from the agent's index.
 
 ```python
-import time, requests
+import requests
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 
@@ -258,12 +258,7 @@ def sync_drive(token: str, drive_id: str, saved_delta: str | None, index) -> str
     url = saved_delta or f"{GRAPH}/drives/{drive_id}/root/delta"
     headers = {"Authorization": f"Bearer {token}"}
     while True:
-        r = requests.get(url, headers=headers, timeout=30)
-        if r.status_code == 429:                       # throttled: honour the server's hint
-            time.sleep(int(r.headers.get("Retry-After", "10")))
-            continue
-        r.raise_for_status()
-        page = r.json()
+        page = requests.get(url, headers=headers, timeout=30).json()
         for item in page["value"]:
             key = f"sharepoint:{drive_id}:{item['id']}"
             if "deleted" in item:
@@ -271,14 +266,11 @@ def sync_drive(token: str, drive_id: str, saved_delta: str | None, index) -> str
             elif "file" in item:
                 perms = requests.get(f"{GRAPH}/drives/{drive_id}/items/{item['id']}/permissions",
                                      headers=headers, timeout=30).json()["value"]
-                index.upsert(key, {
-                    "title": item["name"],
-                    "url": item["webUrl"],
-                    "modified": item["lastModifiedDateTime"],
-                    # sharing links carry a "link" facet with a scope instead of a named principal
-                    "acl": [p.get("grantedToV2") or p.get("grantedToIdentitiesV2")
-                            or {"link": p.get("link", {}).get("scope")} for p in perms],
-                })                                     # content download + parsing happens downstream
+                # sharing links carry a "link" facet with a scope instead of a named principal
+                acl = [p.get("grantedToV2") or p.get("grantedToIdentitiesV2")
+                       or {"link": p.get("link", {}).get("scope")} for p in perms]
+                index.upsert(key, {"title": item["name"], "url": item["webUrl"], "acl": acl,
+                                   "modified": item["lastModifiedDateTime"]})
         if "@odata.nextLink" in page:
             url = page["@odata.nextLink"]              # more pages in this round
         else:
@@ -288,7 +280,7 @@ def sync_drive(token: str, drive_id: str, saved_delta: str | None, index) -> str
 What the code commits to:
 - **One permissions call per changed file.** Fine for incremental runs, expensive for a 2-million-file
   initial crawl, which is where batching and a separate permission-sync job come in. The permissions call
-  also needs the same 429 handling as the delta call, omitted here for length.
+  and the delta call both need 429 handling, omitted here for length.
 - **Ordering makes it crash-safe.** The `deltaLink` is persisted only after the last page is processed, so
   a crash mid-round replays the round from the previous token. Upserts and deletes are idempotent by key,
   so replaying them is harmless.
@@ -380,6 +372,8 @@ lookups for the session, and alerting when the agent's share of the org's API us
 - **Reconcile deletions periodically.** Even with tombstones, list all live IDs per container on a slow
   schedule (weekly, say) and delete index entries the source no longer has. Monitor items deleted by
   reconciliation; a non-zero trend means the delta path is missing deletes.
+- **Default wait when `Retry-After` is absent.** On a 429 without the header, sleep a fixed default
+  (10 s is a reasonable start) and retry the same URL; check `raise_for_status()` on every other response.
 
 ## Trade-offs
 - **Copy-and-index vs federated live search.** Your own index gives the agent fast, rankable retrieval but

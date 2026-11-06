@@ -226,7 +226,7 @@ from zoneinfo import ZoneInfo
 
 MAPPING = {  # versioned config for tenant "acme", source "legacy_helpdesk"
     "version": "acme-helpdesk-v3",
-    "fields": {"TicketNo": "source_id", "Subj": "title", "Opened": "opened_at", "Stat": "status"},
+    "fields": {"TicketNo": "source_id", "Opened": "opened_at", "Stat": "status"},
     "tz": "Europe/Berlin",                       # source writes naive local time
     "status_crosswalk": {"N": "open", "W": "pending", "K": "pending", "E": "resolved", "Z": "closed"},
 }
@@ -234,24 +234,19 @@ MAPPING = {  # versioned config for tenant "acme", source "legacy_helpdesk"
 class Unmapped(Exception): pass                     # caller sends the record to quarantine
 
 def map_ticket(src: dict, m=MAPPING) -> dict:
-    out = {"source_system": "legacy_helpdesk", "mapping_version": m["version"]}
-    out.update({m["fields"][k]: v for k, v in src.items() if k in m["fields"]})
-    ext = {k: v for k, v in src.items() if k not in m["fields"]}   # lossless: nothing is dropped
-    missing = {"source_id", "opened_at", "status"} - out.keys()
-    if missing:
-        raise Unmapped(f"missing {missing} in {src.get('TicketNo')!r}")
+    out = {m["fields"][k]: v for k, v in src.items() if k in m["fields"]}
+    out["extensions"] = {k: v for k, v in src.items() if k not in m["fields"]}   # lossless
     local = datetime.strptime(out["opened_at"], "%d.%m.%Y %H:%M").replace(tzinfo=ZoneInfo(m["tz"]))
     out["opened_at"] = local.astimezone(timezone.utc).isoformat()
     code = out["status"]
     if code not in m["status_crosswalk"]:
         raise Unmapped(f"status={code!r} for ticket {out['source_id']}")
     out["status"], out["source_status"] = m["status_crosswalk"][code], code   # keep original for write-back
-    out["extensions"] = ext
+    out["mapping_version"] = m["version"]
     return out
 
-print(map_ticket({"TicketNo": "T-1042", "Subj": "VPN drops", "Opened": "03.11.2025 09:15",
-                  "Stat": "W", "Kostenstelle": "4711"}))
-# opened_at becomes 2025-11-03T08:15:00+00:00 (CET is UTC+1 in November); "Kostenstelle" is kept in extensions.
+print(map_ticket({"TicketNo": "T-1042", "Opened": "03.11.2025 09:15", "Stat": "W", "Kostenstelle": "4711"}))
+# opened_at 2025-11-03T08:15:00+00:00 (CET is UTC+1 in November); Kostenstelle kept in extensions
 ```
 
 - **The crosswalk is a human decision.** It maps two source codes, `W` and `K`, to one canonical
@@ -295,20 +290,16 @@ writes back through `to_source` from the fixture above. `client` stands for the 
 UPDATE_STATUS_TOOL = {
     "name": "update_ticket_status",
     "description": "Set a ticket's status. Use only the listed values.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"ticket_id": {"type": "string"},
-                       "status": {"type": "string", "enum": ["open", "pending", "resolved", "closed"]}},
-        "required": ["ticket_id", "status"],
-    },
+    "input_schema": {"type": "object", "required": ["ticket_id", "status"], "properties": {
+        "ticket_id": {"type": "string"},
+        "status": {"type": "string", "enum": ["open", "pending", "resolved", "closed"]}}},
 }
 
 def run_update_status(args: dict, canonical_store: dict, client) -> dict:
     if args["status"] not in REVERSE:                       # validate before any write
         return {"error": f"status must be one of {sorted(REVERSE)}"}
     rec = dict(canonical_store[args["ticket_id"]], status=args["status"])
-    code = to_source(rec)                                    # exact round trip when meaning unchanged
-    client.patch(args["ticket_id"], {"Stat": code})
+    client.patch(args["ticket_id"], {"Stat": to_source(rec)})   # exact round trip when meaning unchanged
     return {"ticket_id": args["ticket_id"], "status": args["status"]}   # canonical result to the model
 ```
 
@@ -340,6 +331,8 @@ With one source and one consumer both columns are 1 versus 2, which is why mappi
 - **Canonical enums in tool schemas.** Use for every agent tool that takes a categorical argument. Declare
   the canonical values as an enum in the tool's input schema and validate in the adapter before mapping
   back. Monitor rejected tool arguments per tool; a rise means the model or the prompt drifted.
+- **Required-field check before mapping.** Quarantine any record missing a required canonical field
+  (for tickets: `source_id`, `opened_at`, `status`) with its source id, rather than mapping a partial record.
 
 ## Trade-offs
 - **N + M vs upfront modelling.** A canonical schema turns N × M translations into roughly N + M, but

@@ -169,8 +169,8 @@ flowchart TD
 
 ## Examples
 ### Fan-out with parallel retrieval and merged evidence
-`llm` and `retrieve` are stubs for any provider and vector store; `retrieve` returns `(chunk_id, text)`
-pairs.
+`llm` and `retrieve` are stubs for any provider and vector store; the sync retriever runs in threads so
+the sub-questions are searched in parallel.
 
 ```python
 import asyncio, json
@@ -180,40 +180,21 @@ If this question has multiple independent parts, split it into 2-4 standalone su
 Each sub-question must repeat any shared constraint (region, plan, date). If the question is
 atomic, return it unchanged. Return JSON: {{"sub_questions": [...]}}"""
 
-async def retrieve_async(q, k):
-    return await asyncio.to_thread(retrieve, q, k)   # wrap a sync retriever
-
-async def decomposed_search(question, k_each=4):
-    try:
-        subs = [s for s in json.loads(llm(PLAN.format(q=question)))["sub_questions"]
-                if isinstance(s, str)][:4] or [question]
-    except (ValueError, KeyError, TypeError):
-        subs = [question]                             # planner failed: treat as atomic
-    results = await asyncio.gather(*(retrieve_async(s, k_each) for s in subs))
+async def decomposed_search(question, k_each=4):      # llm(str) -> str; retrieve(q, k) -> [(chunk_id, text)]
+    subs = json.loads(llm(PLAN.format(q=question)))["sub_questions"][:4] or [question]  # cap fan-out at 4
+    results = await asyncio.gather(*(asyncio.to_thread(retrieve, s, k_each) for s in subs))  # parallel
     evidence = {}                                     # chunk id -> text and every sub that found it
     for sub, hits in zip(subs, results):
         for cid, text in hits:                        # dedupe, but keep all facet tags
             evidence.setdefault(cid, {"text": text, "subs": []})["subs"].append(sub)
     return subs, evidence
 
-ANSWER = """Original question: {q}
-Sub-questions:
-{subs}
-Evidence (each chunk is tagged with the sub-question that retrieved it):
-{ev}
-Answer the original question. Cite chunk ids. If a sub-question has no supporting chunk,
-say so instead of guessing."""
-
-async def answer(question):
-    subs, evidence = await decomposed_search(question)
-    ev = "\n".join(f"[{cid}] ({'; '.join(e['subs'])}) {e['text']}" for cid, e in evidence.items())
-    # list every sub-question, so one whose chunks are absent or irrelevant is still visible
-    return llm(ANSWER.format(q=question, subs="\n".join(subs), ev=ev))
-
-print(asyncio.run(answer(
-    "Compare the refund windows of the Standard and Enterprise plans for EU customers.")))
-# planner output, illustrative: ["What is the refund window of the Standard plan for EU customers?",
-#                                "What is the refund window of the Enterprise plan for EU customers?"]
+subs, evidence = asyncio.run(decomposed_search(
+    "Compare the refund windows of the Standard and Enterprise plans for EU customers."))
+# subs, illustrative: ["What is the refund window of the Standard plan for EU customers?",
+#                      "What is the refund window of the Enterprise plan for EU customers?"]
+# The answer prompt then gets the original question, every sub-question and the tagged evidence,
+# and must say "no supporting chunk" for a sub-question instead of guessing.
 ```
 
 ### Runnable: budget split, facet tags and empty facets
@@ -232,11 +213,9 @@ def merge(subs, results, budget=8):
     return k_each, evidence, empty
 
 subs = ["Standard refund window, EU", "Enterprise refund window, EU", "Pro refund window, EU"]
-results = [
-    [("std-refund", "..."), ("plan-compare", "..."), ("std-faq", "...")],
-    [("plan-compare", "..."), ("ent-msa", "...")],
-    [],
-]
+results = [[("std-refund", "..."), ("plan-compare", "..."), ("std-faq", "...")],
+           [("plan-compare", "..."), ("ent-msa", "...")],
+           []]
 k_each, ev, empty = merge(subs, results)
 print(k_each)                                   # 2: budget 8 shared by 3 facets
 for cid, e in ev.items():
@@ -267,17 +246,12 @@ MAX_SEARCHES_PER_STEP = 4
 async def execute_search_calls(tool_calls, budget_chunks=8):
     run, skip = tool_calls[:MAX_SEARCHES_PER_STEP], tool_calls[MAX_SEARCHES_PER_STEP:]
     k_each = max(1, budget_chunks // max(1, len(run)))        # 8 chunks over 3 calls -> 2 each
-    hits = await asyncio.gather(*(asyncio.to_thread(retrieve, c["input"]["query"], k_each)
-                                  for c in run))
-    results = []
-    for call, found in zip(run, hits):
-        content = ({"status": "ok", "passages": [{"id": i, "text": t} for i, t in found]} if found
-                   else {"status": "no_evidence"})            # the agent must say so, not guess
-        results.append({"tool_call_id": call["id"], "content": content})
-    for call in skip:                                          # never drop a call silently
-        results.append({"tool_call_id": call["id"],
-                        "content": {"status": "skipped", "reason": "max 4 searches per step"}})
-    return results
+    hits = await asyncio.gather(*(asyncio.to_thread(retrieve, c["input"]["query"], k_each) for c in run))
+    results = [{"tool_call_id": c["id"], "content": {"status": "ok", "passages": found} if found
+                else {"status": "no_evidence"}}               # the agent must say so, not guess
+               for c, found in zip(run, hits)]
+    return results + [{"tool_call_id": c["id"], "content": {"status": "skipped",
+                       "reason": "max 4 searches per step"}} for c in skip]  # never drop a call silently
 ```
 
 | Design for a 3-facet comparison | Model calls | Searches | Sequential round trips |
@@ -306,6 +280,8 @@ async def execute_search_calls(tool_calls, budget_chunks=8):
 - **Evaluate on a compound slice.** Keep a golden slice of comparison and multi-facet questions and track
   per-sub-question recall, final accuracy and (for agents) the number of steps taken on it separately from
   the rest. Monitor its p95 latency, which tracks the slowest branch.
+- **Fall back to atomic on a bad plan.** If the planner returns invalid JSON or non-string sub-questions,
+  search the original question once instead of failing the request.
 
 ## Trade-offs
 - **Facet recall vs call count.** n sub-questions mean n retrievals (and n extra generations if answered

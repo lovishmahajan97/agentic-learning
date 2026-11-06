@@ -347,49 +347,36 @@ flowchart TD
 ### Instrumenting a streaming call with `prometheus_client`
 - **Bounded label sets:** `outcome` maps to a handful of values; nothing per-user or per-conversation
   becomes a label.
-- **TTFT buckets include 2 s** because that is the SLO threshold.
-- **The closing comment** is the burn-rate alert from above, written in PromQL against these series.
+- **TTFT buckets include 2 s** because that is the SLO threshold, so the good-event ratio is an exact count.
+- **The closing comment** is the SLO's bad ratio in PromQL against these series.
 
 ```python
 import time
-from prometheus_client import Counter, Histogram, Gauge, start_http_server
+from prometheus_client import Counter, Histogram
 
 REQS = Counter("llm_requests_total", "Model calls", ["model", "route", "outcome"])
 TOKENS = Counter("llm_tokens_total", "Tokens used", ["model", "route", "direction"])
-LATENCY = Histogram("llm_latency_seconds", "Total call latency", ["model", "route"],
-                    buckets=(0.25, 0.5, 1, 2, 4, 8, 16, 30))
 TTFT = Histogram("llm_ttft_seconds", "Time to first token", ["model", "route"],
                  buckets=(0.1, 0.25, 0.5, 1, 2, 4))
-PARSE_FAIL = Counter("llm_parse_failures_total", "Structured output failed", ["route"])
-INFLIGHT = Gauge("llm_inflight", "Concurrent model calls", ["model"])
 
-def monitored_call(model, route, call):
-    """call() yields (chunk, usage); usage is None until the final chunk."""
-    INFLIGHT.labels(model).inc(); t0 = time.perf_counter(); outcome = "ok"
+def monitored_call(model, route, call):        # call() yields (chunk, usage); usage set on the last
+    t0, outcome, text, usage = time.perf_counter(), "ok", [], None
     try:
-        text, usage, first = [], None, None
         for chunk, u in call():
-            if first is None:
-                first = time.perf_counter(); TTFT.labels(model, route).observe(first - t0)
+            if not text:
+                TTFT.labels(model, route).observe(time.perf_counter() - t0)
             text.append(chunk); usage = u or usage
-        TOKENS.labels(model, route, "input").inc(usage["input_tokens"])
-        TOKENS.labels(model, route, "output").inc(usage["output_tokens"])
+        for direction in ("input", "output"):
+            TOKENS.labels(model, route, direction).inc(usage[f"{direction}_tokens"])
         return "".join(text)
-    except TimeoutError:
-        outcome = "timeout"; raise
     except Exception as e:                      # map provider errors to a bounded set
-        outcome = "rate_limited" if "429" in str(e) else "error"; raise
+        outcome = "timeout" if isinstance(e, TimeoutError) else "error"; raise
     finally:
-        LATENCY.labels(model, route).observe(time.perf_counter() - t0)
         REQS.labels(model, route, outcome).inc()
-        INFLIGHT.labels(model).dec()
 
-start_http_server(9000)   # exposes /metrics for Prometheus to scrape
-# SLO: 99% of chat calls get a first token within 2 s. Bad ratio over a window w:
-#   1 - sum(rate(llm_ttft_seconds_bucket{route="chat",le="2.0"}[w]))
-#     / sum(rate(llm_ttft_seconds_count{route="chat"}[w]))
-# Page if bad_ratio / 0.01 > 14.4 for w=1h AND w=5m; ticket if > 1 for w=3d.
-# Failed calls never record TTFT, so a separate success-rate SLO on REQS covers them.
+fake = lambda: iter([("Hel", None), ("lo", {"input_tokens": 12, "output_tokens": 2})])
+print(monitored_call("example-model", "chat", fake))   # Hello
+# bad ratio over w: 1 - sum(rate(llm_ttft_seconds_bucket{le="2.0"}[w])) / sum(rate(llm_ttft_seconds_count[w]))
 ```
 
 ### Runnable: the burn-rate decision in plain Python
@@ -397,28 +384,22 @@ The same multiwindow logic, so you can check the arithmetic for any target. The 
 why the 5-minute window matters: the last hour was bad, but it has already stopped, so nobody is paged.
 
 ```python
-SLO = 0.99                      # 99% of turns get a first token within 2 s
-BUDGET = 1 - SLO                # 1% of turns may be slow
+BUDGET = 1 - 0.99               # SLO: 99% of turns get a first token within 2 s
 PERIOD_H = 30 * 24              # 720 hours
 
 def burn_rate(bad_ratio):
     return bad_ratio / BUDGET
 
-def budget_spent(bad_ratio, hours):
-    return burn_rate(bad_ratio) * hours / PERIOD_H
-
 def decide(bad_1h, bad_5m, bad_3d):
     if burn_rate(bad_1h) > 14.4 and burn_rate(bad_5m) > 14.4:
         return "page"
-    if burn_rate(bad_3d) > 1:
-        return "ticket"
-    return "ok"
+    return "ticket" if burn_rate(bad_3d) > 1 else "ok"
 
 cases = {"brownout": (0.15, 0.15, 0.01), "creep": (0.02, 0.02, 0.02),
          "recovered": (0.15, 0.003, 0.009), "healthy": (0.004, 0.004, 0.004)}
 for name, (h1, m5, d3) in cases.items():
     print(f"{name:<9} burn_1h={burn_rate(h1):5.1f}  {decide(h1, m5, d3)}")
-print(f"brownout 1h spends {budget_spent(0.15, 1):.1%} of budget")
+print(f"brownout 1h spends {burn_rate(0.15) / PERIOD_H:.1%} of budget")
 print(f"creep exhausts budget in {PERIOD_H / burn_rate(0.02) / 24:.0f} days")
 # brownout page, creep ticket, recovered ok, healthy ok; 2.1% of budget; 15 days
 ```
@@ -431,29 +412,26 @@ print(f"creep exhausts budget in {PERIOD_H / burn_rate(0.02) / 24:.0f} days")
 
 ### Agent run metrics alongside the call metrics
 Run-level series for the agent loop, using the same bounded-label rule. `stop_reason` and `tool` are
-small enums; nothing per-run becomes a label.
+small enums; nothing per-run becomes a label. The closing PromQL is the share of runs that give up per
+agent; alert on its burn against a task-success SLO.
 
 ```python
-from prometheus_client import Counter, Histogram
+from prometheus_client import REGISTRY, Counter, Histogram
 
 RUNS = Counter("agent_runs_total", "Agent runs", ["agent", "stop_reason"])
-STEPS = Histogram("agent_steps", "Loop iterations per run", ["agent"],
-                  buckets=(1, 2, 3, 5, 8, 13, 20))
+STEPS = Histogram("agent_steps", "Loop iterations per run", ["agent"], buckets=(1, 2, 3, 5, 8, 13, 20))
 TOOL_CALLS = Counter("agent_tool_calls_total", "Tool calls", ["agent", "tool", "outcome"])
-RUN_SECONDS = Histogram("agent_run_seconds", "Run duration", ["agent"],
-                        buckets=(1, 2, 5, 10, 20, 30, 60, 120))
 
-def record_run(agent, stop_reason, steps, seconds, tool_results):
-    """tool_results: list of (tool_name, ok) from the run."""
+def record_run(agent, stop_reason, steps, tool_results):   # tool_results: [(tool_name, ok), ...]
     RUNS.labels(agent, stop_reason).inc()
     STEPS.labels(agent).observe(steps)
-    RUN_SECONDS.labels(agent).observe(seconds)
     for tool, ok in tool_results:
         TOOL_CALLS.labels(agent, tool, "ok" if ok else "error").inc()
 
-# Share of runs that give up, per agent (alert on its burn against a task-success SLO):
-#   sum by (agent) (rate(agent_runs_total{stop_reason=~"step_budget|loop_detected"}[1h]))
-#     / sum by (agent) (rate(agent_runs_total[1h]))
+record_run("support", "step_budget", 8, [("search_kb", True), ("search_kb", False)])
+print(REGISTRY.get_sample_value("agent_runs_total", {"agent": "support", "stop_reason": "step_budget"}))  # 1.0
+# give-up share: sum by (agent) (rate(agent_runs_total{stop_reason=~"step_budget|loop_detected"}[1h]))
+#   / sum by (agent) (rate(agent_runs_total[1h]))
 ```
 
 ### Worked scenario: a prompt change that doubled agent steps
@@ -492,6 +470,11 @@ A support agent's dashboard the day after `prompt_version` v14 replaced v13 (ill
   SLO burn.
 - **Raise judge sampling after deploys.** Score a higher share of traces for the first day of a new prompt
   version, then return to the baseline. Monitor judge pass rate per prompt version with a rolling-day SLO.
+- **Alongside TTFT, record the rest of the call.** A total-latency histogram (buckets up to 30 s), an
+  in-flight gauge per model, a parse-failure counter per route, `outcome="rate_limited"` for 429s, and a
+  run-duration histogram for agents (buckets up to 120 s); expose them with `start_http_server` for scraping.
+- **Pair the TTFT SLO with a success-rate SLO.** Failed calls never record TTFT, so a success-rate SLO on
+  `llm_requests_total` by `outcome` covers them.
 
 ## Trade-offs
 - **Label dimensions vs series count.** More labels make every chart sliceable, but series multiply with

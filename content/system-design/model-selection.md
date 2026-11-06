@@ -274,20 +274,18 @@ def evaluate(c: Candidate, golden, score, runs=3):
             s.append(score(text, ex["expected"]))
             cost.append((n_in * c.price_in + n_out * c.price_out) / 1e6)
         per_example.append(statistics.mean(s))   # repeats of one example are not independent samples
-    n = len(per_example)                          # the CI is over examples, not over example x run
-    mean = statistics.mean(per_example)
-    half_width = 1.96 * statistics.pstdev(per_example) / n ** 0.5   # rough 95% CI
-    p95 = sorted(lat)[int(0.95 * (len(lat) - 1))]
-    return {"model": c.name, "quality": mean, "lower": mean - half_width,
-            "p95_s": p95, "cost_per_1k": 1000 * statistics.mean(cost)}
+    mean = statistics.mean(per_example)          # so the CI is over examples, not example x run
+    half_width = 1.96 * statistics.pstdev(per_example) / len(per_example) ** 0.5   # rough 95% CI
+    return {"model": c.name, "lower": mean - half_width,
+            "p95_s": sorted(lat)[int(0.95 * (len(lat) - 1))], "cost_per_1k": 1000 * statistics.mean(cost)}
 
 def select(results, bar, max_p95):
     eligible = [r for r in results if r["lower"] >= bar and r["p95_s"] <= max_p95]
     return min(eligible, key=lambda r: r["cost_per_1k"]) if eligible else None
-
-# results = [evaluate(c, agent_tasks, task_succeeded) for c in candidates]
-# print(select(results, bar=0.80, max_p95=30.0))   # run-level bar and end-to-end p95 for an agent
 ```
+
+For an agent, call `select([evaluate(c, agent_tasks, task_succeeded) for c in candidates], bar=0.80,
+max_p95=30.0)`: a run-level bar and an end-to-end p95.
 
 If `select` returns `None`, no candidate clears the bar within budget. The next moves, in roughly that
 order of cost: prompt and tool-description work, retrieval improvements, a cascade or role split, or

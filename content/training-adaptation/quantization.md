@@ -214,33 +214,24 @@ import numpy as np
 rng = np.random.default_rng(0)
 W = rng.normal(0, 0.02, size=(4096, 4096)).astype(np.float32)   # [out, in]
 W[:, 7] *= 40                                                   # one outlier input channel
+X = rng.normal(size=(512, 4096)).astype(np.float32)             # calibration activations
 
 def quant_sym(x, bits, axis=None):
     """Symmetric round-to-nearest with one scale per slice along `axis` (None = per-tensor)."""
     qmax = 2 ** (bits - 1) - 1
     s = np.max(np.abs(x), axis=axis, keepdims=True) / qmax
-    q = np.clip(np.round(x / s), -qmax - 1, qmax)
-    return (q * s).astype(np.float32)
+    return np.clip(np.round(x / s), -qmax - 1, qmax) * s
 
 def quant_grouped(x, bits, g):
-    rows, cols = x.shape
-    return quant_sym(x.reshape(rows, cols // g, g), bits, axis=2).reshape(rows, cols)
+    return quant_sym(x.reshape(x.shape[0], -1, g), bits, axis=2).reshape(x.shape)
 
-X = rng.normal(size=(512, 4096)).astype(np.float32)             # calibration activations
-ref = X @ W.T
-for name, W_hat in [("int8 per-tensor", quant_sym(W, 8)),
-                    ("int4 per-tensor", quant_sym(W, 4)),
+for name, W_hat in [("int8 per-tensor", quant_sym(W, 8)), ("int4 per-tensor", quant_sym(W, 4)),
                     ("int4 per-channel", quant_sym(W, 4, axis=1)),
-                    ("int4 group=128", quant_grouped(W, 4, 128)),
-                    ("int4 group=32", quant_grouped(W, 4, 32))]:
-    err = np.linalg.norm(X @ W_hat.T - ref) / np.linalg.norm(ref)
+                    ("int4 group=128", quant_grouped(W, 4, 128)), ("int4 group=32", quant_grouped(W, 4, 32))]:
+    err = np.linalg.norm(X @ (W_hat - W).T) / np.linalg.norm(X @ W.T)
     print(f"{name:17s} relative output error = {err:.3f}")
-# Prints roughly 0.32 / 0.85 / 0.68 / 0.16 / 0.10 (int8 per-tensor already hurts with a 40x outlier).
-# Per-channel still fails here because every output row contains the outlier column, so every
-# row's scale is set by it; grouping isolates the damage to 1/32 (g=128) or 1/128 (g=32) of the weights.
-# GPTQ would additionally push each group's rounding error into its neighbours; AWQ would rescale
-# channel 7 before rounding. Bits per weight with an fp16 scale + 4-bit zero-point per group, as in
-# the ladder above: 8 / 4 / 4 / ~4.16 / ~4.6 respectively (this symmetric toy stores no zero-point).
+# Roughly 0.32 / 0.85 / 0.68 / 0.16 / 0.10. Per-channel fails because every row contains the outlier
+# column; grouping confines its damage to one group per row.
 ```
 
 ### Sizing calculator: real bits per weight
@@ -250,18 +241,11 @@ Pure Python. Shows why "4-bit" 70B lands at 35–40 GB, not 35 GB flat.
 def bits_per_weight(bits, group=None, scale_bits=16, zero_bits=0):
     return bits if group is None else bits + (scale_bits + zero_bits) / group
 
-def weights_gb(params_b, bpw):
-    return params_b * 1e9 * bpw / 8 / 1e9
-
-schemes = {
-    "bf16":              bits_per_weight(16),
-    "int8 per-channel":  bits_per_weight(8),            # per-row scales: negligible overhead
-    "int4 g=128 (+zp)":  bits_per_weight(4, 128, 16, 4),
-    "int4 g=32 (+zp)":   bits_per_weight(4, 32, 16, 4),
-    "Q4_0 (block 32)":   bits_per_weight(4, 32, 16),
-}
-for name, bpw in schemes.items():
-    print(f"{name:18s} {bpw:5.2f} bits/w   7B: {weights_gb(7, bpw):5.1f} GB   70B: {weights_gb(70, bpw):6.1f} GB")
+for name, bpw in {"bf16": bits_per_weight(16), "int8 per-channel": bits_per_weight(8),
+                  "int4 g=128 (+zp)": bits_per_weight(4, 128, 16, 4),
+                  "int4 g=32 (+zp)": bits_per_weight(4, 32, 16, 4),
+                  "Q4_0 (block 32)": bits_per_weight(4, 32, 16)}.items():
+    print(f"{name:18s} {bpw:5.2f} bits/w   7B: {7 * bpw / 8:5.1f} GB   70B: {70 * bpw / 8:6.1f} GB")
 # bf16               16.00 bits/w   7B:  14.0 GB   70B:  140.0 GB
 # int8 per-channel    8.00 bits/w   7B:   7.0 GB   70B:   70.0 GB
 # int4 g=128 (+zp)    4.16 bits/w   7B:   3.6 GB   70B:   36.4 GB
@@ -304,22 +288,17 @@ import json
 
 def tool_call_validity(call_model, cases, tools):
     """cases: [{"messages": [...], "expect_tool": "search_orders"}]; tools: {name: required_arg_names}."""
-    ok_json = ok_tool = ok_args = 0
+    ok = 0
     for c in cases:
-        raw = call_model(c["messages"])            # tool-call text: {"name": ..., "arguments": {...}}
         try:
-            call = json.loads(raw)
+            call = json.loads(call_model(c["messages"]))   # {"name": ..., "arguments": {...}}
         except json.JSONDecodeError:
             continue
-        ok_json += 1
-        if call.get("name") == c["expect_tool"]:
-            ok_tool += 1
-            if set(tools[call["name"]]) <= set(call.get("arguments", {})):
-                ok_args += 1
-    n = len(cases)
-    return {"json": ok_json / n, "right_tool": ok_tool / n, "valid_args": ok_args / n}
+        if call.get("name") == c["expect_tool"] and set(tools[call["name"]]) <= set(call.get("arguments", {})):
+            ok += 1                                        # parsed, right tool, required args present
+    return ok / len(cases)
 
-# Gate: block the quantized build if any rate drops more than your agreed threshold versus bf16,
+# Gate: block the quantized build if this rate drops more than your agreed threshold versus bf16,
 # then confirm on full replayed tasks, because per-call drops compound over many steps.
 ```
 

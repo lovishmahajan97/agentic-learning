@@ -154,13 +154,13 @@ flowchart TD
 ## Examples
 ### One Pydantic model for schema and validator
 The Pydantic model is the single source for the schema the model sees and the validator the handler runs.
-The regex and bounds are shape rules; the existence check is semantic; the tenant check is authorization
-using the session, not the model's argument. Errors are turned into results.
+The regex and bounds are shape rules; the order lookup is semantic; the tenant check is authorization from
+the session, not the model's argument, and answers exactly like a missing id. Errors become fixable results.
 
 ```python
-# Runs as is; checked with pydantic 2.14.1 on Python 3.12 (str.removeprefix needs 3.9+).
+# Runs as is; checked with pydantic 2.14.1 on Python 3.12.
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 ORDERS = {"ORD-104233": {"tenant": "acme", "paid_cents": 12_900}}
 
@@ -170,39 +170,24 @@ class RefundInput(BaseModel):
     amount_cents: int = Field(gt=0, description="Refund amount in cents (minor units)")
     reason: Literal["damaged", "late", "wrong_item", "other"]
 
-    @field_validator("order_id")
-    @classmethod
-    def must_exist(cls, v: str) -> str:                   # semantic layer: hits data, not just regex
-        if v not in ORDERS:
-            raise ValueError(f"order {v} not found; ids look like ORD-123456")
-        return v
+REFUND_TOOL = {"name": "issue_refund", "description": "Refund part or all of a paid order.",
+               "input_schema": RefundInput.model_json_schema()}   # the schema the model sees
 
-REFUND_TOOL = {"name": "issue_refund",
-               "description": "Refund part or all of a paid order. Call only after the user "
-                              "has confirmed the order id and amount.",
-               "input_schema": RefundInput.model_json_schema()}
-# If you enable strict mode, strip keywords outside the provider's subset (e.g. gt on Anthropic)
-# from the sent schema and keep enforcing them here; some SDK helpers do this for you.
-
-def handle_refund(block, session_tenant: str) -> dict:
+def handle_refund(raw: dict, session_tenant: str) -> str:
     try:
-        args = RefundInput.model_validate(block.input)
+        args = RefundInput.model_validate(raw)                     # shape: every error at once
     except ValidationError as e:
-        msg = "; ".join(f"{'.'.join(map(str, err['loc']))}: {err['msg'].removeprefix('Value error, ')}"
-                        for err in e.errors())
-        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
-                "content": f"invalid arguments: {msg}"}
-    order = ORDERS[args.order_id]
-    if order["tenant"] != session_tenant:                 # authorization from the session
-        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,  # identical to a
-                "content": f"invalid arguments: order_id: order {args.order_id} not found; "
-                           "ids look like ORD-123456"}                          # missing id
-
-    if args.amount_cents > order["paid_cents"]:           # cross-field semantic rule
-        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
-                "content": f"amount_cents exceeds paid amount {order['paid_cents']}"}
-    return {"type": "tool_result", "tool_use_id": block.id,
-            "content": f'{{"status": "refunded", "amount_cents": {args.amount_cents}}}'}
+        return "invalid arguments: " + "; ".join(f"{x['loc'][0]}: {x['msg']}" for x in e.errors())
+    order = ORDERS.get(args.order_id)
+    if order is None or order["tenant"] != session_tenant:        # meaning + permission, same message
+        return f"invalid arguments: order_id: order {args.order_id} not found"
+    if args.amount_cents > order["paid_cents"]:                   # cross-field rule
+        return f"invalid arguments: amount_cents exceeds paid amount {order['paid_cents']}"
+    return f"refunded {args.amount_cents}"
+print(handle_refund({"order_id": "104233", "amount_cents": 12.9, "reason": "broken"}, "acme"))
+# invalid arguments: order_id: String should match pattern ...; amount_cents: ...; reason: ...
+print(handle_refund({"order_id": "ORD-104233", "amount_cents": 129000, "reason": "damaged"}, "acme"))
+# invalid arguments: amount_cents exceeds paid amount 12900
 ```
 
 ### Worked trace: one bad call, one round trip

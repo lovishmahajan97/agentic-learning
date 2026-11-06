@@ -339,34 +339,25 @@ flowchart TD
 
 ## Examples
 ### The same eval in a Docker sandbox
-After the lab passes, move the order table into a container. Save as `lab_docker.py` next to `lab.py`,
-with the `compose.yaml` below. Checked against inspect-ai 0.3.287 and Docker 29, 2026-11.
+After the lab passes, move the order table into a container. Save both parts as `lab_docker.py` next
+to `lab.py`. Checked against inspect-ai 0.3.287 and Docker 29, 2026-11. First, tools that read and
+write a file through `sandbox()`:
 
 ```python
-# lab_docker.py: the environment is a file inside a per-sample Docker container
+# lab_docker.py: the order table is a file in each sample's own container (inspect-ai 0.3.287)
 import json
-from inspect_ai import Task, eval, task
-from inspect_ai.dataset import Sample
-from inspect_ai.model import get_model
-from inspect_ai.scorer import CORRECT, INCORRECT, Score, Target, accuracy, includes, scorer
-from inspect_ai.solver import TaskState, generate, system_message, use_tools
 from inspect_ai.tool import ToolError, tool
 from inspect_ai.util import sandbox
-from lab import DATASET, diff_state, scripted_agent
 
-DB = "orders.json"                                  # relative to the sandbox working directory
-
-async def load() -> dict:
-    return json.loads(await sandbox().read_file(DB))
+async def load() -> dict:                       # orders.json, relative to the sandbox working dir
+    return json.loads(await sandbox().read_file("orders.json"))
 
 @tool
 def get_order():
     async def execute(order_id: str) -> str:
         """Look up the status of one order.
-
         Args:
-            order_id: The order id, for example ord-2.
-        """
+            order_id: The order id, for example ord-2."""
         return (await load()).get(order_id, "not found")
     return execute
 
@@ -374,55 +365,51 @@ def get_order():
 def cancel_order():
     async def execute(order_id: str) -> str:
         """Cancel one order that has not shipped yet.
-
         Args:
-            order_id: The order id, for example ord-2.
-        """
+            order_id: The order id, for example ord-2."""
         orders = await load()
         if orders.get(order_id) != "processing":
             raise ToolError(f"{order_id} cannot be cancelled ({orders.get(order_id, 'not found')})")
         orders[order_id] = "cancelled"
-        await sandbox().write_file(DB, json.dumps(orders))
+        await sandbox().write_file("orders.json", json.dumps(orders))
         return f"{order_id} cancelled"
     return execute
+```
+
+Then a state scorer that reads the same file, and a task whose samples seed it with `files`:
+
+```python
+from inspect_ai import Task, eval, task
+from inspect_ai.dataset import Sample
+from inspect_ai.model import get_model
+from inspect_ai.scorer import CORRECT, INCORRECT, Score, accuracy, includes, scorer
+from inspect_ai.solver import generate, system_message, use_tools
+from lab import DATASET, diff_state, scripted_agent
 
 @scorer(metrics=[accuracy()])
 def final_state():
-    async def score(state: TaskState, target: Target) -> Score:
-        orders = await load()                       # read the container, not the transcript
-        d = diff_state(state.metadata["expected"], orders)
-        return Score(value=INCORRECT if d else CORRECT, answer=json.dumps(orders, sort_keys=True),
-                     explanation="; ".join(d))
+    async def score(state, target) -> Score:
+        d = diff_state(state.metadata["expected"], await load())   # read the container, not the reply
+        return Score(value=INCORRECT if d else CORRECT, explanation="; ".join(d))
     return score
 
 @task
 def cancel_orders_docker():
     dataset = [Sample(input=s.input, target=s.target, metadata=s.metadata,
-                      files={DB: json.dumps(s.metadata["seed"])}) for s in DATASET]
-    return Task(dataset=dataset,
+                      files={"orders.json": json.dumps(s.metadata["seed"])}) for s in DATASET]
+    return Task(dataset=dataset, scorer=[includes(), final_state()], message_limit=12,
                 solver=[system_message("You manage orders. Use the tools."),
                         use_tools(get_order(), cancel_order()), generate()],
-                scorer=[includes(), final_state()],
-                sandbox=("docker", "compose.yaml"), message_limit=12)
+                sandbox="docker")              # one fresh container per sample
 
 if __name__ == "__main__":
     log = eval(cancel_orders_docker(), model=get_model("mockllm/model", custom_outputs=scripted_agent),
-               display="none", log_dir="logs")[0]
-    print(log.status, {r.name: r.metrics["accuracy"].value for r in log.results.scores} if log.results else log.error)
-```
-
-```yaml
-# compose.yaml: one isolated service per sample, no network
-services:
-  default:
-    image: python:3.12-slim
-    command: tail -f /dev/null
-    init: true
-    network_mode: none
+               display="none")[0]
+    print({r.name: r.metrics["accuracy"].value for r in log.results.scores})  # includes 1.0, final_state 0.5
 ```
 
 Run it three ways:
-- **Scripted agent:** `python lab_docker.py` prints `success {'includes': 1.0, 'final_state': 0.5}`,
+- **Scripted agent:** `python lab_docker.py` prints `{'includes': 1.0, 'final_state': 0.5}`,
   the same grades, now read from each container.
 - **Do-nothing baseline:** `inspect eval lab_docker.py --model mockllm/model` scores `final_state` 0.25.
 - **A real model:** `inspect eval lab_docker.py --model <provider>/<model> --epochs 5`, with that

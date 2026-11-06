@@ -200,38 +200,29 @@ real streaming clients or a Pipecat or LiveKit Agents pipeline later.
 ```python
 import asyncio, re, time
 
-async def llm_stream(text):                  # stub: yields tokens like a streaming LLM
-    reply = "Sure. Your table for two is booked at seven. Anything else?"
-    for tok in re.findall(r"\S+\s*", reply):
-        await asyncio.sleep(0.04); yield tok
-
-async def tts(sentence):                     # stub: time to synthesise, then play
-    await asyncio.sleep(0.15); return f"<audio:{sentence.strip()}>"
-
-async def speak_turn(transcript, t0, spoken):
+async def speak_turn(t0, spoken):
     buf = ""
-    async for tok in llm_stream(transcript):
-        buf += tok
-        if re.search(r"[.?!]\s*$", buf):     # first full sentence goes to TTS at once
-            audio = await tts(buf)
-            if not spoken:
-                print(f"first audio after {int((time.perf_counter()-t0)*1000)} ms")
-            spoken.append(buf.strip()); print("play", audio); buf = ""
+    for tok in re.findall(r"\S+\s*", "Sure. Your table for two is booked at seven. Anything else?"):
+        await asyncio.sleep(0.04); buf += tok          # stub: streaming LLM tokens
+        if re.search(r"[.?!]\s*$", buf):               # first full sentence goes to TTS at once
+            await asyncio.sleep(0.15)                  # stub TTS: synthesise, then play
+            print(f"play at {int((time.perf_counter()-t0)*1000)} ms:", buf.strip())
+            spoken.append(buf.strip()); buf = ""
 
 async def main(barge_in_after=None):
-    spoken, t0 = [], time.perf_counter()     # t0 = end of caller speech
-    turn = asyncio.create_task(speak_turn("book a table for two at 7", t0, spoken))
+    spoken, t0 = [], time.perf_counter()               # t0 = end of caller speech
+    turn = asyncio.create_task(speak_turn(t0, spoken))
     if barge_in_after:
         await asyncio.sleep(barge_in_after)
-        turn.cancel()                        # caller started talking: stop LLM and TTS
+        turn.cancel()                                  # caller started talking: stop LLM and TTS
     try:
         await turn
     except asyncio.CancelledError:
         print("barge-in: cancelled")
-    print("history keeps only:", spoken)     # never store words the caller did not hear
+    print("history keeps only:", spoken)               # never store words the caller did not hear
 
-asyncio.run(main())
-asyncio.run(main(barge_in_after=0.3))
+asyncio.run(main())                                    # play at ~190 ms: Sure. (then 2 more)
+asyncio.run(main(barge_in_after=0.3))                  # history keeps only: ['Sure.']
 ```
 
 ### Speech-to-speech in practice: a RealtimeAgent with one tool
@@ -249,19 +240,10 @@ def check_availability(clinic: str, date: str) -> str:
     """Return free slots for a clinic on a date (YYYY-MM-DD)."""
     return "09:30, 14:00"                       # stub: call the booking system here
 
-agent = RealtimeAgent(
-    name="Booking line",
-    instructions="Answer in one or two short spoken sentences. Read back date and time.",
-    tools=[check_availability],
-)
-runner = RealtimeRunner(agent, config={"model_settings": {
-    "model_name": "gpt-realtime-2.1",
-    "audio": {
-        "input": {"transcription": {"model": "gpt-4o-mini-transcribe"},   # text transcripts
-                  "turn_detection": {"type": "semantic_vad", "interrupt_response": True}},
-        "output": {"voice": "ash"},
-    },
-}})
+agent = RealtimeAgent(name="Booking line", tools=[check_availability],
+                      instructions="Answer in one or two short spoken sentences.")
+runner = RealtimeRunner(agent, config={"model_settings": {"model_name": "gpt-realtime-2.1",
+    "audio": {"input": {"turn_detection": {"type": "semantic_vad", "interrupt_response": True}}}}})
 
 async def main():
     session = await runner.run()                # opens a WebSocket session
@@ -270,19 +252,15 @@ async def main():
         await session.send_message("Any slots at the Lyon clinic on 2026-11-12?")
         async for event in session:
             if event.type == "tool_start":
-                tool_called = True
-                print("tool:", event.tool.name)
+                tool_called = True; print("tool:", event.tool.name)
             elif event.type == "agent_start" and tool_called:
                 replying = True                 # the turn that speaks the tool result
             elif event.type == "history_added":
                 print(event.item)               # user and assistant transcripts
             elif event.type == "agent_end" and replying:
                 break                           # the first agent_end only ends the tool-call turn
-            elif event.type == "error":
-                print("error:", event.error)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
 ```
 
 - **Real audio.** Replace `send_message` with `session.send_audio(pcm16_bytes)` from the call, and play
@@ -333,6 +311,8 @@ pricing.
   card numbers never enter the LLM.
 - **Graceful fallback.** If a vendor stage times out, switch to a backup STT or TTS, or say a fixed
   apology and transfer to a human.
+- **Realtime session settings.** Turn on input transcription (for example `gpt-4o-mini-transcribe`) so
+  caller audio gets text transcripts, set an output voice, and handle the session's `error` events.
 
 ## Trade-offs
 - **Cascaded vs speech-to-speech.** Cascaded gives text logs, redaction points and vendor choice;

@@ -251,57 +251,40 @@ flowchart TD
 ```
 
 ## Examples
-### Starter code: models, validators and the retry loop
-The model call is injected, so the loop is unit-testable with a fake.
+### Starter code: a business-rule validator and the retry loop
+The model call is injected, so the loop runs here with a fake that fixes its total on the second try.
 
 ```python
+# pip install pydantic   (checked with pydantic 2.13)
 import json
-from datetime import date
 from decimal import Decimal
-from typing import Callable
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
-
-class LineItem(BaseModel):
-    description: str
-    quantity: int = Field(gt=0)
-    unit_price: Decimal = Field(ge=0)
+from pydantic import BaseModel, ValidationError, model_validator
 
 class Invoice(BaseModel):
     vendor: str
-    invoice_number: str
-    issue_date: date
-    currency: str = Field(pattern=r"^[A-Z]{3}$")
-    items: list[LineItem] = Field(min_length=1)
+    items: list[Decimal]                  # line amounts
     total: Decimal
-
-    @field_validator("vendor")
-    @classmethod
-    def not_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("vendor must not be blank")
-        return v.strip()
-
     @model_validator(mode="after")
     def total_matches_items(self):
-        expected = sum(i.quantity * i.unit_price for i in self.items)
-        if abs(expected - self.total) > Decimal("0.01"):
-            raise ValueError(f"total {self.total} != sum of items {expected}")
+        if abs(sum(self.items) - self.total) > Decimal("0.01"):
+            raise ValueError(f"total {self.total} != sum of items {sum(self.items)}")
         return self
 
-def extract(text: str, llm: Callable[[list[dict]], str], max_attempts: int = 3) -> Invoice:
+def extract(text, llm, max_attempts=3) -> Invoice:
     schema = json.dumps(Invoice.model_json_schema())      # real JSON, not a Python dict repr
-    messages = [{"role": "system", "content": f"Extract the invoice as JSON matching this schema: {schema}"},
-                {"role": "user", "content": text}]
-    last_error = None
-    for attempt in range(1, max_attempts + 1):
+    messages = [{"role": "user", "content": f"Extract JSON matching {schema}:\n{text}"}]
+    for _ in range(max_attempts):
         raw = llm(messages)
         try:
             return Invoice.model_validate_json(raw)
-        except ValidationError as e:
-            last_error = e
+        except ValidationError as e:                      # send the exact error back
             messages += [{"role": "assistant", "content": raw},
                          {"role": "user", "content": f"Validation failed:\n{e}\nReturn corrected JSON only."}]
-    raise RuntimeError(f"extraction failed after {max_attempts} attempts: {last_error}")
+    raise RuntimeError(f"extraction failed after {max_attempts} attempts")
+
+replies = iter(['{"vendor": "Acme", "items": ["5", "15"], "total": "25"}',
+                '{"vendor": "Acme", "items": ["5", "15"], "total": "20"}'])
+print(extract("Acme: pens 5, paper 15", lambda m: next(replies)).total)   # 20
 ```
 
 A real `llm` can wrap the OpenAI SDK: `client.chat.completions.create(model=..., messages=messages,

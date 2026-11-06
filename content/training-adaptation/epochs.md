@@ -185,21 +185,17 @@ import math, random
 
 def plan_run(token_counts, seq_len=8192, batch=8, epochs=3, warmup_ratio=0.03, evals_per_epoch=4):
     """Turn a trajectory dataset into optimizer steps when sequences are packed."""
-    total_tokens = sum(token_counts)
-    seqs_per_epoch = math.ceil(total_tokens / seq_len)        # packed sequences, not rows
+    seqs_per_epoch = math.ceil(sum(token_counts) / seq_len)   # packed sequences, not rows
     steps_per_epoch = math.ceil(seqs_per_epoch / batch)
     total = epochs * steps_per_epoch
-    return {"trajectories": len(token_counts), "tokens": total_tokens,
-            "steps_per_epoch": steps_per_epoch, "total_steps": total,
+    return {"steps_per_epoch": steps_per_epoch, "total_steps": total,
             "warmup_steps": max(1, round(warmup_ratio * total)),
             "eval_every": max(1, steps_per_epoch // evals_per_epoch)}
 
 random.seed(0)
-# Tokens per trajectory after the chat template: system prompt, tool schemas, calls and results.
-agent_traces = [random.randint(1000, 5000) for _ in range(1500)]
+agent_traces = [random.randint(1000, 5000) for _ in range(1500)]   # tokens per trajectory
 print(plan_run(agent_traces))
-# {'trajectories': 1500, 'tokens': 4456124, 'steps_per_epoch': 68, 'total_steps': 204,
-#  'warmup_steps': 6, 'eval_every': 17}
+# {'steps_per_epoch': 68, 'total_steps': 204, 'warmup_steps': 6, 'eval_every': 17}
 ```
 
 - **Reading it.** Three epochs are only about 204 optimizer steps, so a warmup or eval cadence copied from
@@ -245,34 +241,26 @@ from torch.utils.data import DataLoader, TensorDataset
 
 N, B, EPOCHS, ACCUM = 1000, 8, 3, 4
 x = torch.randn(N, 16); y = (x.sum(1) > 0).float()
-xv = torch.randn(200, 16); yv = (xv.sum(1) > 0).float()            # held-out
-model = torch.nn.Sequential(torch.nn.Linear(16, 32), torch.nn.ReLU(), torch.nn.Linear(32, 1))
+model = torch.nn.Linear(16, 1)
 opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
-loss_fn = torch.nn.functional.binary_cross_entropy_with_logits
-
-micro_per_epoch = math.ceil(N / B)                                 # 125
-total_steps = math.ceil(EPOCHS * micro_per_epoch / ACCUM)          # 94 optimizer steps, incl. final flush
+total_steps = math.ceil(EPOCHS * math.ceil(N / B) / ACCUM)        # 94 optimizer steps, incl. final flush
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: max(0.0, 1 - s / total_steps))
 
 micro, step = 0, 0
 for epoch in range(EPOCHS):
     g = torch.Generator().manual_seed(1234 + epoch)                # new order every epoch, reproducible
-    loader = DataLoader(TensorDataset(x, y), batch_size=B, shuffle=True, generator=g)
-    model.train()
-    for xb, yb in loader:
-        (loss_fn(model(xb).squeeze(1), yb) / ACCUM).backward()
+    for xb, yb in DataLoader(TensorDataset(x, y), batch_size=B, shuffle=True, generator=g):
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(model(xb).squeeze(1), yb)
+        (loss / ACCUM).backward()
         micro += 1
         if micro % ACCUM == 0:                                     # one update per ACCUM micro-batches
             opt.step(); sched.step(); opt.zero_grad(); step += 1
-    model.eval()
-    with torch.no_grad():
-        val = loss_fn(model(xv).squeeze(1), yv).item()
-    print(f"epoch {epoch+1}: micro-batches={micro} optimizer steps={step} "
-          f"lr={sched.get_last_lr()[0]:.2e} val_loss={val:.3f}")
+    print(f"epoch {epoch + 1}: micro-batches={micro} optimizer steps={step}")
 
-# 375 micro-batches is not divisible by 4: three gradients are still pending. Flush them.
-if micro % ACCUM:
+if micro % ACCUM:                     # 375 is not divisible by 4: three gradients are pending. Flush.
     opt.step(); opt.zero_grad(); step += 1
+print(step, total_steps)              # 94 94
+# epoch 1: micro-batches=125 optimizer steps=31 ... epoch 3: micro-batches=375 optimizer steps=93
 ```
 
 The leftover micro-batches are the kind of accounting detail epochs hide:
@@ -295,12 +283,9 @@ args = TrainingArguments(
     num_train_epochs=5,                 # upper bound; early stopping decides
     eval_strategy="steps",              # named evaluation_strategy in older releases
     eval_steps=50,
-    save_strategy="steps",
     save_steps=50,                      # must line up with eval for load_best_model_at_end
     load_best_model_at_end=True,
     metric_for_best_model="eval_loss",
-    greater_is_better=False,
-    save_total_limit=3,
 )
 trainer = Trainer(model=model, args=args, train_dataset=train_ds, eval_dataset=val_ds,
                   callbacks=[EarlyStoppingCallback(early_stopping_patience=3)])

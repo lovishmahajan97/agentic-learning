@@ -242,16 +242,12 @@ sequenceDiagram
 ### A Temporal-style approval workflow
 A Temporal workflow (Python SDK) in which the LLM call and the send are activities, and the approval
 wait is a durable timer plus signal. A crash after `draft_reply` completes resumes at the wait without
-calling the model again.
-
-This and the next example were run with stub `llm`, `mailer` and activities in
-`WorkflowEnvironment.start_time_skipping()`, checked against temporalio 1.35.0, 2026-11.
+calling the model again. Checked against temporalio 1.35.0, 2026-11; `llm` and `mailer` are your clients.
 
 ```python
 import asyncio
 from datetime import timedelta
 from temporalio import activity, workflow
-from temporalio.common import RetryPolicy
 
 @activity.defn
 async def draft_reply(ticket_id: str) -> str:
@@ -264,29 +260,21 @@ async def send_reply(ticket_id: str, text: str) -> None:
 
 @workflow.defn
 class TicketReplyWorkflow:
-    def __init__(self) -> None:
-        self.approved: bool | None = None
-
+    approved: bool | None = None
     @workflow.signal
     def approve(self, ok: bool) -> None:          # delivered by the review UI
         self.approved = ok
 
     @workflow.run
     async def run(self, ticket_id: str) -> str:
-        draft = await workflow.execute_activity(
-            draft_reply, ticket_id,
-            start_to_close_timeout=timedelta(seconds=90),
-            retry_policy=RetryPolicy(maximum_attempts=3, initial_interval=timedelta(seconds=2)),
-        )
+        draft = await workflow.execute_activity(draft_reply, ticket_id, start_to_close_timeout=timedelta(seconds=90))
         try:   # durable wait: no worker is blocked, and it survives restarts and deploys
             await workflow.wait_condition(lambda: self.approved is not None, timeout=timedelta(days=2))
         except asyncio.TimeoutError:
             return "expired"
-        if not self.approved:
-            return "rejected"
-        await workflow.execute_activity(send_reply, args=[ticket_id, draft],
-                                        start_to_close_timeout=timedelta(seconds=30))
-        return "sent"
+        if self.approved:
+            await workflow.execute_activity(send_reply, args=[ticket_id, draft], start_to_close_timeout=timedelta(seconds=30))
+        return "sent" if self.approved else "rejected"
 ```
 
 - **Notice what is *not* in the workflow:** no `datetime.now()`, no HTTP, no database. Those would be
@@ -297,53 +285,28 @@ class TicketReplyWorkflow:
   legitimately get a second reply from a later workflow, while a retry of this step must never send twice.
 
 ### A durable tool-calling agent loop
-The same conventions applied to a whole agent loop: one activity asks the model for the next action, one
-runs the chosen tool, and the step budget lives in workflow state. `start_transcript`, `call_model` and
-`run_tool` are your own activities (checked against temporalio 1.35.0, 2026-11).
+The same conventions applied to a whole agent loop, in outline:
 
-```python
-from datetime import timedelta
-from temporalio import workflow
-from temporalio.common import RetryPolicy
-
-STEP = dict(start_to_close_timeout=timedelta(minutes=2),
-            retry_policy=RetryPolicy(maximum_attempts=3,
-                                     non_retryable_error_types=["ValidationError"]))
-
-@workflow.defn
-class AgentRun:
-    @workflow.run
-    async def run(self, task: str, transcript_ref: str | None = None, steps: int = 0) -> str:
-        ref = transcript_ref or await workflow.execute_activity(start_transcript, task, **STEP)
-        while steps < 200:                       # step budget: deterministic, survives replay
-            action = await workflow.execute_activity(call_model, ref, **STEP)
-            if action["type"] == "final":
-                return action["answer"]
-            ref = await workflow.execute_activity(run_tool, args=[ref, action], **STEP)
-            steps += 1
-            if steps % 50 == 0:                  # keep history small on long runs
-                workflow.continue_as_new(args=[task, ref, steps])
-        return "step budget exhausted"
-```
-
+- **One activity asks the model for the next action (`call_model`), one runs the chosen tool
+  (`run_tool`),** and the step budget (for example 200) lives in workflow state, so it is deterministic and
+  survives replay.
 - **A crash anywhere replays to the last recorded step:** earlier `call_model` results come from history,
   so no tokens are re-spent and the model's earlier choices cannot change.
-- **`run_tool` derives its idempotency key** from workflow ID, run ID (`info.workflow_run_id`) and
-  activity ID. Unlike `send_reply` above, this loop uses continue-as-new, and activity IDs are numbered
-  per run, so workflow ID plus activity ID alone would collide across continued runs and dedupe a new
-  tool call against an old one.
-- **The transcript lives behind `ref`,** so the history holds references, not tens of thousands of tokens.
+- **Every 50 steps the loop calls `workflow.continue_as_new`** with the task, transcript reference and step
+  count, which keeps history small on long runs.
+- **The transcript lives behind a reference,** so the history holds references, not tens of thousands of
+  tokens.
 
 ### Trace one run through a redeploy
 The reviewer is slow, and the worker is redeployed on day one. The history so far (simplified; real
 Temporal histories also interleave workflow-task and activity-started events):
 
-```
-1 WorkflowExecutionStarted  ticket_id="T-812"
-2 ActivityTaskScheduled     draft_reply
-3 ActivityTaskCompleted     result="Hi Dana, the refund was issued on ..."
-4 TimerStarted              2 days   (from wait_condition's timeout)
-```
+| # | Event | Detail |
+|---|---|---|
+| 1 | WorkflowExecutionStarted | `ticket_id="T-812"` |
+| 2 | ActivityTaskScheduled | `draft_reply` |
+| 3 | ActivityTaskCompleted | `result="Hi Dana, the refund was issued on ..."` |
+| 4 | TimerStarted | 2 days (from `wait_condition`'s timeout) |
 
 1. A new worker picks the workflow up and runs `run()` from the top.
 2. At `execute_activity(draft_reply)` the engine finds events 2 and 3 and returns the recorded draft
@@ -361,9 +324,7 @@ executing. It shows why steps before the crash cost nothing the second time, and
 surfaces as a non-determinism error.
 
 ```python
-class Crash(Exception):
-    pass
-
+class Crash(Exception): pass
 class Ctx:
     def __init__(self, history):
         self.history, self.pos, self.executed = history, 0, []
@@ -375,27 +336,21 @@ class Ctx:
                 raise RuntimeError(f"non-determinism: history has {recorded}, code asked {name}")
         else:                                             # new step: really run it, then record
             result = fn()
-            self.executed.append(name)
-            self.history.append((name, result))
+            self.executed.append(name); self.history.append((name, result))
         self.pos += 1
         return result
 
-def research(ctx, topic, crash_after=None):
-    notes = []
+def research(ctx, crash_after=None):
     for i in range(4):
-        notes.append(ctx.activity(f"step{i}", lambda i=i: f"{topic}-note{i}"))
-        if crash_after == i:
-            raise Crash()
-    return notes
+        ctx.activity(f"step{i}", lambda: f"note{i}")
+        if i == crash_after: raise Crash()
 
 history = []                                              # stands in for the durable store
-try:
-    research(Ctx(history), "kv", crash_after=1)
-except Crash:
-    pass
-ctx = Ctx(history)
-print(research(ctx, "kv"), ctx.executed)
-# ['kv-note0', 'kv-note1', 'kv-note2', 'kv-note3'] ['step2', 'step3']
+try: research(Ctx(history), crash_after=1)
+except Crash: pass
+ctx = Ctx(history)                                        # restart: replay the same history
+research(ctx)
+print(ctx.executed)                                       # ['step2', 'step3']
 ```
 
 - **Only `step2` and `step3` ran after the crash;** the first two returned recorded results.
@@ -429,6 +384,12 @@ print(research(ctx, "kv"), ctx.executed)
   tool calls as activities. Temporal's catalog
   also lists LangGraph, Claude Agent SDK, Google ADK, Strands, Deep Agents, MCP and the Vercel AI SDK.
   Check each plugin's maturity label before relying on it.
+- **Bound every activity.** Give each activity a `start_to_close_timeout` (for example 90 s for a model
+  draft, 30 s for a send) and a retry policy such as 3 attempts from a 2 s initial interval, with
+  `ValidationError` listed as non-retryable for agent steps.
+- **Idempotency keys across continue-as-new.** Activity IDs are numbered per run, so a tool activity in a
+  loop that continues-as-new must key on workflow ID, run ID (`info.workflow_run_id`) and activity ID, or
+  a new tool call is deduped against an old one.
 
 ## Trade-offs
 - **Crash-proof resumption vs determinism rules.** You get readable straight-line orchestration in

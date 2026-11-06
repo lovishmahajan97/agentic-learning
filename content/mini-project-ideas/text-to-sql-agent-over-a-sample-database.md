@@ -303,35 +303,27 @@ flowchart TD
 ## Examples
 ### Starter code: the sandboxed SQL tools and the eval metric
 The authorizer denies every action except reads, selects and function calls, so writes, `ATTACH` and
-`PRAGMA` fail even if the model is tricked. The progress handler aborts queries that run too long.
+`PRAGMA` fail even if the model is tricked. `WITH RECURSIVE` is allowed because the progress handler
+aborts queries that run too long, which the safety test checks.
 
 ```python
+# sqltool.py: stdlib only (Python 3.10+)
 import sqlite3, time
 
-ALLOWED = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
-           getattr(sqlite3, "SQLITE_RECURSIVE", -1)}          # WITH RECURSIVE on newer Pythons
+ALLOWED = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
 
 def open_readonly(path):
-    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     db.set_authorizer(lambda action, *args: sqlite3.SQLITE_OK if action in ALLOWED else sqlite3.SQLITE_DENY)
     return db
-
-def list_tables(db):
-    return [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
-
-def describe_table(db, table):
-    row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
-    return row[0] if row else f"unknown table {table!r}; call list_tables"
 
 def run_sql(db, sql, max_rows=50, timeout_s=3.0):
     """Tool the agent calls. Returns rows or an error string the model can act on."""
     deadline = time.monotonic() + timeout_s
     db.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
     try:
-        cur = db.execute(sql)
-        cols = [d[0] for d in cur.description or []]
-        rows = cur.fetchmany(max_rows + 1)
-        return {"columns": cols, "rows": rows[:max_rows], "truncated": len(rows) > max_rows}
+        rows = db.execute(sql).fetchmany(max_rows + 1)
+        return {"rows": rows[:max_rows], "truncated": len(rows) > max_rows}
     except (sqlite3.Error, sqlite3.Warning) as e:   # denied writes, 2+ statements, syntax errors, timeouts
         return {"error": str(e)}
     finally:
@@ -339,7 +331,7 @@ def run_sql(db, sql, max_rows=50, timeout_s=3.0):
 
 def execution_match(db, predicted_sql, gold_sql):
     """Execution accuracy: same result set, order ignored unless the gold query sorts."""
-    got, want = run_sql(db, predicted_sql, max_rows=10_000), run_sql(db, gold_sql, max_rows=10_000)
+    got, want = run_sql(db, predicted_sql, 10_000), run_sql(db, gold_sql, 10_000)
     if "error" in got:
         return False
     if "order by" in gold_sql.lower():
@@ -351,28 +343,21 @@ def execution_match(db, predicted_sql, gold_sql):
 Run it in CI so a refactor that loosens the sandbox fails the build.
 
 ```python
+# test_sqltool.py: pip install pytest, then pytest -q
 import sqlite3
-from sqltool import open_readonly, list_tables, describe_table, run_sql, execution_match
-
-def make(tmp_path):
-    p = tmp_path / "t.db"
-    c = sqlite3.connect(p)
-    c.executescript("CREATE TABLE Artist(ArtistId INTEGER PRIMARY KEY, Name TEXT);"
-                    "INSERT INTO Artist(Name) VALUES ('A'),('B'),('C');")
-    c.commit(); c.close()
-    return open_readonly(p)
+from sqltool import open_readonly, run_sql, execution_match
 
 def test_safety(tmp_path):
-    db = make(tmp_path)
-    assert list_tables(db) == ["Artist"]
-    assert "CREATE TABLE" in describe_table(db, "Artist")
-    assert "error" in run_sql(db, "DELETE FROM Artist")
-    assert "error" in run_sql(db, "DROP TABLE Artist")
-    assert "error" in run_sql(db, "SELECT 1; DELETE FROM Artist")
-    assert "error" in run_sql(db, "ATTACH DATABASE 'x.db' AS x")
-    assert "error" in run_sql(db, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c", timeout_s=0.2)
-    r = run_sql(db, "SELECT Name FROM Artist", max_rows=2)
-    assert r["truncated"] and len(r["rows"]) == 2
+    c = sqlite3.connect(tmp_path / "t.db")
+    c.executescript("CREATE TABLE Artist(Name TEXT); INSERT INTO Artist VALUES ('A'),('B'),('C');")
+    c.commit(); c.close()
+    db = open_readonly(tmp_path / "t.db")
+    for bad in ["DELETE FROM Artist", "DROP TABLE Artist", "SELECT 1; DELETE FROM Artist",
+                "ATTACH DATABASE 'x.db' AS x"]:
+        assert "error" in run_sql(db, bad)
+    loop = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c"
+    assert "error" in run_sql(db, loop, timeout_s=0.2)
+    assert run_sql(db, "SELECT Name FROM Artist", max_rows=2)["truncated"]
     assert execution_match(db, "SELECT Name FROM Artist ORDER BY Name DESC", "SELECT Name FROM Artist")
     assert not execution_match(db, "SELECT Name FROM Artist WHERE Name='A'", "SELECT Name FROM Artist")
 ```
@@ -407,6 +392,8 @@ def test_safety(tmp_path):
   review failed traces weekly to grow the golden set.
 - **Portfolio polish.** A README with accuracy, the error-analysis table and the safety suite, a demo
   video, and a one-command eval that anyone can rerun.
+- **Threaded tool servers.** Pass `check_same_thread=False` to `sqlite3.connect` if the tool runs in a
+  worker thread other than the one that opened the connection.
 
 ## Trade-offs
 - **Agentic exploration vs one-shot prompt.** Letting the model call tools and retry raises accuracy but

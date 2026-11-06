@@ -363,10 +363,13 @@ flowchart TD
 ```
 
 ## Examples
-### Provider fan-out with classified errors
-Fan-out to three providers with `allSettled` so every outcome is known, classify each failure with a status
-and a retryable flag, preserve the original cause when wrapping, abort the losers once a winner arrives,
-and give the fire-and-forget audit call an explicit `.catch` so it can never become an unhandled rejection.
+### Classifying provider errors without losing the cause
+`callProvider` classifies each failure with a status and a retryable flag and keeps the original error as
+`cause` when it wraps a transport failure.
+
+Save as `classify.mts` and run `npx tsx classify.mts` (the
+`.mts` extension allows top-level `await`, and the parameter properties need a transform, not just type
+stripping); `.example` hosts never resolve, so `fetch` fails with a transport error.
 
 ```ts
 class ProviderError extends Error {
@@ -377,14 +380,9 @@ class ProviderError extends Error {
 
 async function callProvider(name: string, prompt: string, signal: AbortSignal): Promise<string> {
   try {
-    const res = await fetch(`https://${name}.example/v1/complete`, {
-      method: "POST", body: JSON.stringify({ prompt }), signal,
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new ProviderError(`${name} returned ${res.status}: ${body.slice(0, 200)}`,
-        res.status, res.status === 429 || res.status >= 500);
-    }
+    const res = await fetch(`https://${name}.example/v1/complete`, { method: "POST", body: JSON.stringify({ prompt }), signal });
+    if (!res.ok) throw new ProviderError(`${name} returned ${res.status}: ${(await res.text()).slice(0, 200)}`,
+      res.status, res.status === 429 || res.status >= 500);     // 429 and 5xx retryable, other 4xx permanent
     return await res.text();                 // `return await` so the try block sees a rejection
   } catch (e: unknown) {
     if (e instanceof ProviderError || signal.aborted) throw e; // classified, or a cancellation: not retryable
@@ -392,22 +390,8 @@ async function callProvider(name: string, prompt: string, signal: AbortSignal): 
   }
 }
 
-async function bestEffort(prompt: string) {
-  const ac = new AbortController();
-  const names = ["alpha", "beta", "gamma"];
-  let winner: string | undefined;
-  const calls = names.map((n) => callProvider(n, prompt, ac.signal).then((text) => {
-    winner ??= text; ac.abort(); return text;   // first success aborts the losers mid-flight
-  }));
-  const results = await Promise.allSettled(calls); // losers now settle quickly with AbortError
-  if (winner !== undefined) return winner;
-  const reasons = results.map((r) => (r as PromiseRejectedResult).reason);
-  const retryable = reasons.every((r) => r instanceof ProviderError && r.retryable);
-  throw new AggregateError(reasons, retryable ? "all providers failed (retryable)" : "all providers failed");
-}
-
-// Fire-and-forget logging is still a promise: attach a handler or the rejection becomes fatal.
-void (async () => { /* audit sink */ })().catch((e) => console.error("audit sink failed", e));
+const err = await callProvider("alpha", "hi", new AbortController().signal).catch((e) => e);
+console.log(err.message, err.retryable, err.cause.message);  // alpha transport failure true fetch failed
 ```
 
 ### Watching the attachment window crash a process
@@ -444,25 +428,18 @@ In a tool-calling loop, a failed tool should usually be reported to the model, n
 type ToolCall = { id: string; name: string; args: unknown };
 type ToolResult = { toolCallId: string; content: string; isError: boolean };
 
-async function runToolBatch(
-  calls: ToolCall[],
-  exec: (c: ToolCall, signal: AbortSignal) => Promise<string>,
-  signal: AbortSignal,
-): Promise<ToolResult[]> {
+async function runToolBatch(calls: ToolCall[], exec: (c: ToolCall, signal: AbortSignal) => Promise<string>,
+                            signal: AbortSignal): Promise<ToolResult[]> {
   const settled = await Promise.allSettled(calls.map((c) => exec(c, signal)));
   return settled.map((r, i) => {
-    const id = calls[i]!.id;
-    if (r.status === "fulfilled") return { toolCallId: id, content: r.value, isError: false };
+    const toolCallId = calls[i]!.id;
+    if (r.status === "fulfilled") return { toolCallId, content: r.value, isError: false };
+    if (signal.aborted) throw r.reason;                  // the run was cancelled: stop the loop
     const e: unknown = r.reason;
-    if (signal.aborted) throw e;                         // the run was cancelled: stop the loop
-    if (e instanceof ProviderError && !e.retryable) {    // permanent: tell the model, let it adapt
-      return { toolCallId: id, content: `error ${e.status}: ${e.message}`, isError: true };
-    }
-    if (e instanceof ProviderError) {                    // retryable, but exec's retries ran out
-      return { toolCallId: id, content: "temporary failure after retries", isError: true };
-    }
-    console.error("tool bug", calls[i]!.name, e);        // not classified: likely our own code
-    return { toolCallId: id, content: "internal tool error", isError: true };
+    const content = !(e instanceof ProviderError) ? "internal tool error"   // not classified: likely our own bug
+      : e.retryable ? "temporary failure after retries"                     // retryable, but exec's retries ran out
+      : `error ${e.status}: ${e.message}`;                                  // permanent: tell the model, let it adapt
+    return { toolCallId, content, isError: true };
   });
 }
 ```
@@ -500,6 +477,12 @@ An agent step needs a model call, a tool call and an embedding lookup that do no
 - **Fan-out with `allSettled` plus abort.** Use `Promise.allSettled` with one `AbortController` per batch, and
   give side-effecting tools idempotency keys so a retry of one failed call cannot duplicate an email or
   charge. Monitor duplicate-side-effect reports and per-provider failure rates.
+- **Race providers, then abort the losers.** For multi-provider fallback, have the first success call
+  `ac.abort()` on a shared `AbortController`, await `Promise.allSettled` (the losers then settle quickly
+  with `AbortError`), and if none succeeded throw an `AggregateError` of the reasons, marked retryable only
+  when every reason is a retryable `ProviderError`.
+- **Log unclassified tool errors.** An error that is not a `ProviderError` is most likely a bug in your own
+  code: log it with the tool name before returning "internal tool error" to the model.
 
 ## Trade-offs
 - **`Promise.all`: simple vs lossy.** Fastest to fail, but discards the other outcomes and leaves them

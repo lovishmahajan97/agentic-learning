@@ -439,64 +439,39 @@ sequenceDiagram
 
 ## Examples
 ### A minimal harness in one file
-A run manifest, concurrent execution with retries, stored raw outputs, pluggable graders, and a
+A run manifest, retries around the call, pluggable graders, errors counted rather than dropped, and a
 per-slice summary with a Wilson confidence interval. `target` is any callable, so the same code
-evaluates a prompt or an agent.
+evaluates a prompt or an agent. Runs as is.
 
 ```python
 import hashlib, json, math, time
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 
-GRADERS = {
-    "exact": lambda out, item: out.strip() == item["expected"].strip(),
-    "contains_all": lambda out, item: all(s in out for s in item["expected"]),
-}
+GRADERS = {"exact": lambda out, item: out.strip() == item["expected"].strip()}
 
-def run_eval(items, target, config: dict, out_path: str, workers=8, retries=3):
-    manifest = {**config, "dataset_sha": hashlib.sha256(json.dumps(items, sort_keys=True).encode()).hexdigest()[:12],
-                "prompt_sha": hashlib.sha256(config["prompt"].encode()).hexdigest()[:12], "started": time.time()}
+def call(target, item, config, retries=3):         # retries cover the call, not grading
+    for attempt in range(retries):
+        try: return target(item, config)
+        except Exception: time.sleep(2 ** attempt)     # rate limit, timeout, transient error
+    return None                                    # an error: reported, never dropped
 
-    def one(item):                                      # run only: retries cover the call, not grading
-        last = None
-        for attempt in range(retries):
-            try:
-                t0 = time.time(); out = target(item, config)
-                return {"id": item["id"], "slice": item["slice"], "output": out,
-                        "latency_s": round(time.time() - t0, 3), "error": None}
-            except Exception as e:                      # rate limit, timeout, transient error
-                last = repr(e)
-                if attempt < retries - 1: time.sleep(2 ** attempt)
-        return {"id": item["id"], "slice": item["slice"], "output": None, "error": last}
-
-    with ThreadPoolExecutor(workers) as ex:
-        results = list(ex.map(one, items))
-    with open(out_path, "w") as f:                      # raw outputs first; grading can be redone later
-        f.write(json.dumps({"manifest": manifest}) + "\n")
-        for r in results: f.write(json.dumps(r) + "\n")
-    by_id = {it["id"]: it for it in items}              # separate grading pass over the stored outputs
-    for r in results:
-        it = by_id[r["id"]]
-        r["pass"] = None if r["error"] else GRADERS[it["grader"]](r["output"], it)
-    return summarize(results)
-
-def summarize(results):
-    by_slice = defaultdict(list)
-    for r in results: by_slice[r["slice"]].append(r)
-    report = {}
-    for s, rs in sorted(by_slice.items()):
-        graded = [r for r in rs if r["pass"] is not None]
-        n, k = len(graded), sum(r["pass"] for r in graded)
-        report[s] = {"n": n, "pass": round(k / n, 3) if n else None,
-                     "ci95": wilson(k, n), "errors": len(rs) - n}
-    return report
-
-def wilson(k, n, z=1.96):          # stays sane at 10/10 or 0/10, where the normal approximation gives ±0
-    if n == 0: return None
+def wilson(k, n, z=1.96):          # stays sane at 10/10, where p ± 1.96·SE claims 100% ± 0
     p, d = k / n, 1 + z * z / n
     c, h = (p + z * z / (2 * n)) / d, z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
     return (round(c - h, 3), round(c + h, 3))
-# e.g. {'billing': {'n': 60, 'pass': 0.817, 'ci95': (0.701, 0.894), 'errors': 0}, ...}
+
+def run_eval(items, target, config):
+    manifest = {**config, "dataset_sha": hashlib.sha256(json.dumps(items).encode()).hexdigest()[:12]}
+    outputs = [call(target, it, config) for it in items]   # store raw outputs; grading can be redone
+    report = {}
+    for s in sorted({it["slice"] for it in items}):
+        rs = [(it, o) for it, o in zip(items, outputs) if it["slice"] == s]
+        g = [GRADERS[it["grader"]](o, it) for it, o in rs if o is not None]
+        report[s] = {"n": len(g), "errors": len(rs) - len(g), "ci95": wilson(sum(g), len(g)) if g else None}
+    return manifest, report
+
+items = [{"id": i, "slice": "billing", "grader": "exact", "expected": "ok" if i < 49 else "no"} for i in range(60)]
+print(run_eval(items, lambda item, config: "ok", {"model": "m-2026-09-01", "prompt": "v1"})[1])
+# {'billing': {'n': 60, 'errors': 0, 'ci95': (0.701, 0.894)}}: 49/60 passed
 ```
 
 - **Reading the `billing` line:** the interval is about 19 points wide at n = 60, so a 5-point change
@@ -511,32 +486,22 @@ and returns the final state plus the trace. `agent_step` stands for one call of 
 or model API; `seed_db` and `TOOLS` are your fixtures.
 
 ```python
-import copy, time
-
+import copy
 class BudgetExceeded(Exception): pass
 
-def agent_target(item, config):
-    db = copy.deepcopy(seed_db(item["seed"]))           # fresh state per item, never shared
-    tools = {name: (lambda f: lambda **a: f(db, **a))(f) for name, f in TOOLS.items()}
-    messages, trace, t0, tokens = [{"role": "user", "content": item["input"]["message"]}], [], time.time(), 0
-    for step in range(config["max_steps"]):            # e.g. 10
-        action = agent_step(messages, config)          # -> {"tool", "args"} or {"final"}, plus "usage_tokens"
-        tokens += action["usage_tokens"]
-        messages.append({"role": "assistant", "content": action})   # the call precedes its result
-        if tokens > config["max_tokens"] or time.time() - t0 > config["max_seconds"]:
-            raise BudgetExceeded(f"step {step}")
+def agent_target(item, config):                    # seed_db, agent_step and TOOLS are your fixtures
+    db, trace = copy.deepcopy(seed_db(item["seed"])), []   # fresh state per item, never shared
+    for step in range(config["max_steps"]):        # e.g. 10; also cap tokens and wall-clock seconds
+        action = agent_step(item["input"], trace, config)  # -> {"tool", "args"} or {"final"}
         if "final" in action:
-            return {"final": action["final"], "state": db, "trace": trace, "steps": step + 1, "tokens": tokens}
-        result = tools[action["tool"]](**action["args"])
-        trace.append({"tool": action["tool"], "args": action["args"], "result": result})
-        messages.append({"role": "tool", "name": action["tool"], "content": str(result)})
-    raise BudgetExceeded("max_steps")                  # a looping agent is a recorded failure
+            return {"final": action["final"], "state": db, "trace": trace, "steps": step + 1}
+        trace.append({**action, "result": TOOLS[action["tool"]](db, **action["args"])})
+    raise BudgetExceeded("max_steps")              # a looping agent is a recorded failure
 
-def grade_agent(out, item):                            # outcome first, path only where it matters
-    exp = item["expected"]
+def grade_agent(out, item):                        # outcome first, path only where it matters
+    exp, called = item["expected"], {t["tool"] for t in out["trace"]}
     state_ok = all(out["state"][k] == v for k, v in exp["final_state"].items())
-    called = [t["tool"] for t in out["trace"]]
-    path_ok = all(t in called for t in exp["required_tools"]) and not set(called) & set(exp["forbidden_tools"])
+    path_ok = set(exp["required_tools"]) <= called and not called & set(exp["forbidden_tools"])
     return state_ok and path_ok and out["steps"] <= exp["max_steps"]
 ```
 
@@ -549,42 +514,30 @@ def grade_agent(out, item):                            # outcome first, path onl
 
 - **Reading it:** the 12 budget errors cluster on 4 tasks where the agent re-calls `lookup_order` in a
   loop; the stored trace shows the tool returned an error string the prompt never explains.
-- **One adjustment to `run_eval`:** catch `BudgetExceeded` before the generic handler and record the
-  run as failed (`pass = False`), without retrying, because it is an agent failure, not a transient
-  provider error; retry and report as errors only rate limits and timeouts.
+- **One adjustment to `run_eval`:** catch `BudgetExceeded` in `call` and record the run as failed
+  (`pass = False`), without retrying, because it is an agent failure, not a transient provider error;
+  retry and report as errors only rate limits and timeouts.
 
 ### A CI gate against a baseline
 Pure Python. It compares graded results from a baseline and a candidate run on the same items, fails on
 errors and slice floors, and reports whether the flip count clears the measured noise floor.
 
 ```python
-import sys
-
-def gate(base, cand, noise_floor, slice_floor, max_error_rate=0.0):
-    """base, cand: id -> {"slice": str, "pass": bool | None}; None means the item errored."""
-    problems, notes = [], []
-    errors = sum(r["pass"] is None for r in cand.values())
-    if errors / len(cand) > max_error_rate:
-        problems.append(f"{errors} errored items (reported, not dropped)")
-    both = [i for i in base if base[i]["pass"] is not None and cand[i]["pass"] is not None]
-    gained = sum(1 for i in both if cand[i]["pass"] and not base[i]["pass"])
-    lost = sum(1 for i in both if base[i]["pass"] and not cand[i]["pass"])
-    if gained + lost <= noise_floor:
-        notes.append(f"{gained + lost} flips <= noise floor {noise_floor}: no demonstrated effect")
+def gate(base, cand, noise_floor, slice_floor):   # id -> {"slice", "pass": bool, or None if errored}
+    problems = [f"item {i} errored (reported, not dropped)" for i, r in cand.items() if r["pass"] is None]
+    both = [i for i in base if None not in (base[i]["pass"], cand[i]["pass"])]
+    gained = sum(cand[i]["pass"] and not base[i]["pass"] for i in both)
+    lost = sum(base[i]["pass"] and not cand[i]["pass"] for i in both)
     for s, floor in slice_floor.items():
         rs = [r["pass"] for r in cand.values() if r["slice"] == s and r["pass"] is not None]
-        if rs and sum(rs) / len(rs) < floor:
-            problems.append(f"slice {s}: {sum(rs)}/{len(rs)} below floor {floor}")
-    return problems, notes, (gained, lost)
+        if sum(rs) / len(rs) < floor: problems.append(f"slice {s}: {sum(rs)}/{len(rs)} below floor {floor}")
+    return problems, (gained, lost), gained + lost > noise_floor   # at or under the floor: noise
 
-base = {str(i): {"slice": "billing" if i < 60 else "other", "pass": i % 5 != 0} for i in range(300)}
-cand = {k: dict(v) for k, v in base.items()}
-for i in range(0, 60, 5): cand[str(i)]["pass"] = True        # 12 gains in billing
-for i in [j for j in range(60) if j % 5][:12]: cand[str(i)]["pass"] = False   # 12 losses, also billing
-problems, notes, flips = gate(base, cand, noise_floor=11, slice_floor={"billing": 0.85})
-print(flips, problems, notes)
-sys.exit(1 if problems else 0)
-# (12, 12) ['slice billing: 48/60 below floor 0.85'] []
+base = {i: {"slice": "billing", "pass": i % 5 != 0} for i in range(60)}           # 48/60 pass
+cand = {i: {**r, "pass": not r["pass"] if i % 5 == 0 or i < 15 else r["pass"]} for i, r in base.items()}
+problems, flips, effect = gate(base, cand, noise_floor=11, slice_floor={"billing": 0.85})
+print(problems, flips, effect)  # ['slice billing: 48/60 below floor 0.85'] (12, 12) True
+raise SystemExit(1 if problems else 0)            # exit code 1 blocks the merge
 ```
 
 | Signal (illustrative numbers) | Value | Reading |
@@ -614,6 +567,11 @@ sys.exit(1 if problems else 0)
 - **Trace link on every result.** Store the trace id from your tracing tool next to each graded item,
   so the PR comment's list of flipped tasks opens straight into the step where the agent diverged.
   Monitor items with missing traces, since those failures cannot be diagnosed.
+- **Concurrent runs, raw outputs first.** Run items through a bounded worker pool (for example 8
+  threads), record per-item latency, and write the manifest plus raw outputs to JSONL before grading,
+  so grading can be redone without calling the target again.
+- **Per-step agent budgets.** Check the token and wall-clock budgets after every agent step, not only
+  at the end, and append each assistant tool call to the message list before its tool result.
 
 ## Trade-offs
 - **Stored outputs vs storage.** Storing every raw output makes re-grading free and failures

@@ -287,110 +287,56 @@ flowchart TD
 ```
 
 ## Examples
-### Starter code: the memory store
-The LLM is injected as `llm(task, text)` so tests can use a fake. In the real version, `extract_facts`
-returns a JSON list validated against a schema and `summarize` returns plain text.
+### Starter code: facts with supersession and deletion
+The LLM fact extractor is injected as `llm(text)` so tests can use a fake; in the real version it returns
+a JSON list validated against a schema. The full layer (Lab) adds a rolling summary on top. Save as `mem.py`.
 
 ```python
-import json, sqlite3, time
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, user_id TEXT, role TEXT, content TEXT, ts REAL);
-CREATE TABLE IF NOT EXISTS summaries(user_id TEXT PRIMARY KEY, text TEXT, upto_id INTEGER);
-CREATE TABLE IF NOT EXISTS facts(id INTEGER PRIMARY KEY, user_id TEXT, key TEXT, value TEXT,
-                                 source_msg_id INTEGER, ts REAL, superseded_by INTEGER);
-"""
+import sqlite3
 
 class Memory:
-    def __init__(self, path, llm, keep_recent=6, fold_after=12):
-        self.db = sqlite3.connect(path)
-        self.db.executescript(SCHEMA)
-        self.llm, self.keep_recent, self.fold_after = llm, keep_recent, fold_after
+    def __init__(self, llm):
+        self.db, self.llm = sqlite3.connect(":memory:"), llm
+        self.db.executescript("""
+            CREATE TABLE messages(id INTEGER PRIMARY KEY, user_id TEXT, content TEXT);
+            CREATE TABLE facts(id INTEGER PRIMARY KEY, user_id TEXT, key TEXT, value TEXT,
+                               source_msg_id INTEGER, superseded_by INTEGER);""")
 
-    def add(self, user_id, role, content):
-        cur = self.db.execute("INSERT INTO messages(user_id, role, content, ts) VALUES (?,?,?,?)",
-                              (user_id, role, content, time.time()))
-        if role == "user":
-            self._extract_facts(user_id, cur.lastrowid, content)
-        self.db.commit()
-        self._maybe_summarize(user_id)
-
-    def _extract_facts(self, user_id, msg_id, text):
-        for f in json.loads(self.llm("extract_facts", text)):      # [{"key": "city", "value": "Berlin"}]
-            old = self.db.execute("SELECT id FROM facts WHERE user_id=? AND key=? AND superseded_by IS NULL",
-                                  (user_id, f["key"])).fetchone()
-            new = self.db.execute("INSERT INTO facts(user_id, key, value, source_msg_id, ts) VALUES (?,?,?,?,?)",
-                                  (user_id, f["key"], f["value"], msg_id, time.time())).lastrowid
-            if old:
-                self.db.execute("UPDATE facts SET superseded_by=? WHERE id=?", (new, old[0]))
-
-    def _summary(self, user_id):
-        return self.db.execute("SELECT text, upto_id FROM summaries WHERE user_id=?", (user_id,)).fetchone() or ("", 0)
-
-    def _maybe_summarize(self, user_id):
-        prev, upto = self._summary(user_id)
-        rows = self.db.execute("SELECT id, role, content FROM messages WHERE user_id=? AND id>? ORDER BY id",
-                               (user_id, upto)).fetchall()
-        if len(rows) < self.fold_after:
-            return
-        fold = rows[:-self.keep_recent]                              # keep the newest turns verbatim
-        text = self.llm("summarize", prev + "\n" + "\n".join(f"{r}: {c}" for _, r, c in fold))
-        self.db.execute("INSERT INTO summaries VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE "
-                        "SET text=excluded.text, upto_id=excluded.upto_id", (user_id, text, fold[-1][0]))
-        self.db.commit()
+    def add(self, user_id, content):
+        msg = self.db.execute("INSERT INTO messages(user_id, content) VALUES (?,?)", (user_id, content)).lastrowid
+        for key, value in self.llm(content):                    # e.g. [("city", "Berlin")]
+            new = self.db.execute("INSERT INTO facts(user_id, key, value, source_msg_id) VALUES (?,?,?,?)",
+                                  (user_id, key, value, msg)).lastrowid
+            self.db.execute("UPDATE facts SET superseded_by=? WHERE user_id=? AND key=? AND id<? AND "
+                            "superseded_by IS NULL", (new, user_id, key, new))   # old row stays as history
 
     def context(self, user_id):
-        summary, upto = self._summary(user_id)
-        facts = self.db.execute("SELECT key, value FROM facts WHERE user_id=? AND superseded_by IS NULL",
-                                (user_id,)).fetchall()
-        recent = self.db.execute("SELECT role, content FROM messages WHERE user_id=? AND id>? ORDER BY id",
-                                 (user_id, upto)).fetchall()
-        return {"summary": summary, "facts": dict(facts), "recent": recent}
+        return dict(self.db.execute("SELECT key, value FROM facts WHERE user_id=? AND superseded_by IS NULL",
+                                    (user_id,)))
 
     def forget_fact(self, user_id, key):
-        src = [r[0] for r in self.db.execute("SELECT source_msg_id FROM facts WHERE user_id=? AND key=?",
-                                             (user_id, key))]
-        self.db.execute("DELETE FROM facts WHERE user_id=? AND key=?", (user_id, key))   # every version
-        self.db.executemany("DELETE FROM messages WHERE id=?", [(i,) for i in src])     # the source turns
-        self.db.execute("DELETE FROM summaries WHERE user_id=?", (user_id,))            # rebuild, never patch
-        self.db.commit()
-        self._maybe_summarize(user_id)
-
-    def forget_user(self, user_id):
-        for t in ("messages", "summaries", "facts"):
-            self.db.execute(f"DELETE FROM {t} WHERE user_id=?", (user_id,))
-        self.db.commit()          # also: vector index, caches, traces and backups per your retention policy
+        self.db.execute("DELETE FROM messages WHERE id IN (SELECT source_msg_id FROM facts "
+                        "WHERE user_id=? AND key=?)", (user_id, key))                  # the source turns
+        self.db.execute("DELETE FROM facts WHERE user_id=? AND key=?", (user_id, key))  # every version
 ```
 
-### Starter test: update, deletion and isolation
-A fake LLM makes the behaviour deterministic. The deletion assertion checks the whole context, so a fact
-that survived inside the summary fails the test.
+### Demo: update, deletion and isolation
+A fake extractor makes the behaviour deterministic. Append to `mem.py`.
 
 ```python
-import json
-from mem import Memory
+import re
+def fake_llm(text):
+    m = re.search(r"live in (\w+)", text)
+    return [("city", m[1])] if m else []
 
-def fake_llm(task, text):
-    if task == "extract_facts":
-        if "live in" in text:
-            return json.dumps([{"key": "city", "value": text.split("live in ")[1].strip(". ")}])
-        return "[]"
-    return "SUMMARY:" + text.replace("\n", " ")[-200:]
-
-def test_update_and_forget():
-    m = Memory(":memory:", fake_llm)
-    m.add("u1", "user", "I live in Berlin.")
-    for i in range(14):
-        m.add("u1", "user", f"chat {i}")
-    m.add("u1", "user", "I live in Lisbon.")
-    assert m.context("u1")["facts"]["city"] == "Lisbon"
-    m.forget_fact("u1", "city")
-    ctx = json.dumps(m.context("u1"))
-    assert "Berlin" not in ctx and "Lisbon" not in ctx
-    m.add("u2", "user", "I live in Paris.")
-    assert "Paris" not in json.dumps(m.context("u1"))
-    m.forget_user("u2")
-    assert m.context("u2")["facts"] == {}
+m = Memory(fake_llm)
+m.add("u1", "I live in Berlin.")
+m.add("u1", "I live in Lisbon.")
+m.add("u2", "I live in Paris.")
+print(m.context("u1"))                      # {'city': 'Lisbon'}: newest wins, Berlin kept as history
+m.forget_fact("u1", "city")
+print(m.context("u1"), m.context("u2"))     # {} {'city': 'Paris'}: deleted for u1 only
+print(m.db.execute("SELECT count(*) FROM messages WHERE user_id='u1'").fetchone())   # (0,)
 ```
 
 ### Milestones, time estimates and done-when checks
@@ -414,6 +360,10 @@ def test_update_and_forget():
   wrong answer traces to a stale fact or a bad extraction.
 - **Portfolio polish.** A README that states the memory policy in plain words, the five scripts with pass
   rates, a demo of "forget my city" end to end, and tests in CI.
+- **Fold old turns into a rolling summary.** Keep the newest 6 turns verbatim and summarise once 12
+  unsummarised turns pile up; `forget_fact` deletes the summary and rebuilds it from what remains.
+- **Deletion reaches every store.** `forget_user` removes a user's messages, summaries and facts, and also
+  the vector index, caches, traces and backups per your retention policy.
 
 ## Trade-offs
 - **Summaries vs verbatim history.** Summaries keep context small but lose detail and add an LLM call;

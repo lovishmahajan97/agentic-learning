@@ -200,38 +200,6 @@ calls and results that bring the p95 trace to ~16k tokens. Target: QLoRA on one 
   (for example Liger Kernel via `use_liger_kernel=True`) and verify the real peak with
   `torch.cuda.max_memory_allocated()` on the longest trace before the full run.
 
-### Pre-flight: size the run from your agent traces
-Pure Python with a tokenizer, no GPU: measure trace lengths the way the trainer will render them, then
-estimate activations before booking hardware.
-
-```python
-import json
-from transformers import AutoTokenizer
-
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
-
-# Defaults are a Llama-7B-class shape; copy layers, h and a from your model's config.json.
-def act_gb(s, layers=32, h=4096, a=32, flash=True, ckpt=True):
-    per_layer = (34 * s * h + (0 if flash else 5 * a * s * s)) / 1e9   # bf16, b = 1
-    return layers * s * h * 2 / 1e9 + per_layer if ckpt else per_layer * layers
-
-lengths = []
-with open("agent_traces.jsonl") as f:          # rows: {"messages": [...], "tools": [...]}
-    for line in f:
-        row = json.loads(line)
-        ids = tok.apply_chat_template(row["messages"], tools=row.get("tools"),
-                                      tokenize=True, return_dict=False)
-        lengths.append(len(ids))
-
-lengths.sort()
-p95, longest = lengths[int(0.95 * len(lengths))], lengths[-1]
-print(f"p95 {p95} tokens, max {longest} tokens")
-for s in (p95, longest):
-    print(f"s={s}: flash {act_gb(s, ckpt=False):.1f} GB | flash+ckpt {act_gb(s):.1f} GB")
-# Pick max_length at or above p95 so most trajectories keep their final answer, and drop
-# (do not truncate) the few that are longer still.
-```
-
 ### Residual MLP stack with and without checkpointing
 Work the budget out before running it:
 - **Parameters:** each block has 8·d² ≈ 33.5M parameters at d = 2048, so 24 blocks are ~805M: ~3.2 GB of
@@ -248,54 +216,39 @@ Work the budget out before running it:
 import torch, torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-class Block(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.ff = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
-    def forward(self, x):
-        return x + self.ff(x)
-
-class Net(nn.Module):
-    def __init__(self, d, n, ckpt):
-        super().__init__()
-        self.blocks = nn.ModuleList(Block(d) for _ in range(n))
-        self.ckpt = ckpt
-    def forward(self, x):
-        for b in self.blocks:
-            x = checkpoint(b, x, use_reentrant=False) if self.ckpt else b(x)
-        return x
+def block(d):
+    return nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
 
 def peak_gb(ckpt, d=2048, n=24, tokens=4096):
     torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
-    net = Net(d, n, ckpt).cuda()
+    blocks = nn.ModuleList(block(d) for _ in range(n)).cuda()
     x = torch.randn(tokens, d, device="cuda", requires_grad=True)
-    net(x).sum().backward()
+    for b in blocks:                                    # residual: x + f(x)
+        x = x + (checkpoint(b, x, use_reentrant=False) if ckpt else b(x))
+    x.sum().backward()
     return torch.cuda.max_memory_allocated() / 2**30
 
 for flag in (False, True):
     print(f"checkpointing={flag}: peak {peak_gb(flag):.1f} GB")
 # Rough expectation: ~10-11 GB without (weights + all activations) vs ~7 GB with (weights +
-# gradients + block inputs + one live block). Double `tokens` and the unchecked peak grows by ~7 GB
-# while the checkpointed one grows by about 1 GB: activations scale with tokens, weights do not.
+# gradients + block inputs + one live block).
 # Hugging Face equivalent: model.gradient_checkpointing_enable(
 #     gradient_checkpointing_kwargs={"use_reentrant": False})
 ```
+
+Double `tokens` and the unchecked peak grows by ~7 GB while the checkpointed one grows by about 1 GB:
+activations scale with tokens, weights do not.
 
 ### Activation budget calculator for a 7B fine-tune
 Plug the Korthikanti estimate into a planning script before you book hardware.
 
 ```python
-def act_gb_per_layer(s, b=1, h=4096, a=32, flash=False):
-    linear = 34 * s * b * h                    # bytes, bf16, Korthikanti et al.
-    scores = 0 if flash else 5 * a * s * s * b # the s^2 attention-score term
-    return (linear + scores) / 1e9
-
 def budget(s, layers=32, h=4096, a=32, flash=True, ckpt=False):
-    per_layer = act_gb_per_layer(s, h=h, a=a, flash=flash)
+    """Activation GB for a 7B-class model, bf16, b = 1 (Korthikanti et al.)."""
+    per_layer = (34 * s * h + (0 if flash else 5 * a * s * s)) / 1e9   # s^2 term is attention scores
     if not ckpt:
         return per_layer * layers               # every layer's activations live at once
-    inputs = layers * s * h * 2 / 1e9           # one bf16 block input per layer
-    return inputs + per_layer                   # plus one live block during recompute
+    return layers * s * h * 2 / 1e9 + per_layer # one bf16 block input per layer + one live block
 
 for s in (4096, 8192):
     print(f"s={s}: eager {budget(s, flash=False):.0f} GB | flash {budget(s):.1f} GB"
@@ -337,6 +290,9 @@ Reading the output for a QLoRA run on a 24 GB card (~4 GB of 4-bit weights):
 - **Measure before and after in a smoke test.** Run one step each way on the longest agent trace, log
   `torch.cuda.max_memory_allocated()`, and keep the numbers next to the config so regressions show up when
   sequence length, tool count or model changes.
+- **Measure lengths the way the trainer renders them.** Tokenize each trace with
+  `tokenizer.apply_chat_template(messages, tools=tools, tokenize=True)` so tool schemas count, and take p95
+  and max from those lengths, not from raw message text.
 
 ## Trade-offs
 - **Compute vs memory.** You pay roughly one extra forward pass per step (20–30% wall-clock,

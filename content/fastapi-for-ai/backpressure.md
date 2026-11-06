@@ -322,28 +322,23 @@ is full the endpoint rejects at once instead of queueing more work than the work
 latency budget.
 
 ```python
-import asyncio, logging
+# pip install fastapi uvicorn
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 
 EMBED_WORKERS, QUEUE_MAX = 8, 200   # 200 waiting chunks is the most we accept
-log = logging.getLogger(__name__)
 
 async def embed_worker(q: asyncio.Queue):
     while True:
         chunk = await q.get()
-        try:
-            await embed_and_store(chunk)          # slow stage: the embedding service
-        except Exception:
-            log.exception("embed failed")         # an escaping error would kill this worker
-        finally:
-            q.task_done()
+        await asyncio.sleep(0.5)         # stand-in for the slow embedding call
+        q.task_done()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    q = asyncio.Queue(maxsize=QUEUE_MAX)
-    workers = [asyncio.create_task(embed_worker(q)) for _ in range(EMBED_WORKERS)]
-    app.state.embed_q = q
+    app.state.embed_q = asyncio.Queue(maxsize=QUEUE_MAX)
+    workers = [asyncio.create_task(embed_worker(app.state.embed_q)) for _ in range(EMBED_WORKERS)]
     yield
     for w in workers: w.cancel()
 
@@ -351,7 +346,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/ingest")
 async def ingest(body: dict, request: Request):
-    q: asyncio.Queue = request.app.state.embed_q
+    q = request.app.state.embed_q
     if q.qsize() + len(body["chunks"]) > QUEUE_MAX:            # all-or-nothing admission
         raise HTTPException(503, "ingest saturated", headers={"Retry-After": "10"})
     for c in body["chunks"]:            # no await since the check, so nothing can interleave
@@ -359,72 +354,12 @@ async def ingest(body: dict, request: Request):
     return {"accepted": len(body["chunks"]), "queued": q.qsize()}
 ```
 
-Numbers (illustrative):
-| Quantity | Value |
-|---|---|
-| Embed call | 0.5 s each |
-| Drain rate | 8 workers → 16 chunks per second |
-| Wait at a full queue of 200 | 200 / 16 ≈ 12.5 s |
-| Ceiling for a 15 s searchable-within budget | 16 × 15 = 240; 200 leaves margin for the embed call itself and slow calls |
-| Unbounded queue, 30-chunks-per-second burst | grows by 14 chunks every second |
-| After five minutes | about 4,200 chunks, a wait of over four minutes for the newest |
-
-Two details make the bound real, plus two caveats:
-- **The worker catches errors,** *because* a worker task that dies on one bad chunk silently cuts drain
-  rate, and the queue then fills at a load it used to handle.
-- **Admission checks the whole batch before enqueuing any of it,** so a client never gets a 503 for a
-  request that was half accepted.
-- **Caveat:** this in-process queue is lost on restart; work that must survive belongs in a durable job
-  queue with the same depth limit.
-- **Caveat:** `body: dict` means FastAPI has already read and parsed the body before the admission check.
-  That is fine for small JSON batches; for large uploads, admit before reading the body, as described
-  above.
-
-### Admitting agent runs: run now, queue, or refuse
-Interactive runs start only if a run slot is free; background runs go to a bounded pending queue and get
-202 with a run ID; everything else gets 503. `start_run` and `enqueue_run` stand in for your agent runner
-and job queue.
-
-```python
-import uuid
-from fastapi import HTTPException, Request
-from fastapi.responses import JSONResponse
-
-MAX_ACTIVE_RUNS, MAX_PENDING = 20, 100          # per worker, from the sizing table below
-
-@app.post("/runs")
-async def create_run(body: dict, request: Request):
-    st = request.app.state                       # active_runs: BoundedSemaphore(20), pending: int
-    if body.get("mode") == "interactive":
-        if st.active_runs.locked():              # no free slot: refuse now, do not queue
-            raise HTTPException(503, "agents busy", headers={"Retry-After": "5"})
-        await st.active_runs.acquire()           # free slot, so this does not wait
-        return start_run(body, release=st.active_runs.release)   # streams events, releases at end
-    if st.pending >= MAX_PENDING:
-        raise HTTPException(503, "run queue full", headers={"Retry-After": "60"})
-    st.pending += 1
-    run_id = str(uuid.uuid4())
-    await enqueue_run(run_id, body)              # durable queue; worker decrements pending on pickup
-    return JSONResponse({"run_id": run_id, "status": "queued"}, status_code=202)
-```
-
-- **In real code** keep the pending count in the durable queue itself, since a per-process counter is lost
-  on restart and differs per worker.
-
-### Worked numbers: sizing agent-run admission
-Illustrative: interactive runs average 30 s and make 5 model calls each; the worker may hold 20 runs.
-
-| Quantity | Value |
-|---|---|
-| Run throughput per worker | 20 / 30 s ≈ 0.67 runs per second |
-| Model calls in flight at full admission | up to 20 (one model call per run at a time) |
-| Burst of 2 runs per second for 60 s | 120 arrive, about 40 can start in that minute |
-| Unbounded admission | 80 extra runs compete for model slots and every run slows |
-| Bounded admission | 80 get fast 503s or move to the background queue |
-| Background queue of 100 at 0.67 runs/s | the last one waits about 150 s, acceptable for a 202 job |
+Admission checks the whole batch before enqueuing any of it, so a client never gets a 503 for a request
+that was half accepted.
 
 ### Runnable: bounded vs unbounded under the same burst
-Thirty arrivals per second against a 16-per-second stage for 300 seconds. Pure Python, no dependencies.
+Thirty arrivals per second against a 16-per-second stage (8 workers, 0.5 s per embed) for 300 seconds.
+Pure Python, no dependencies.
 
 ```python
 def simulate(arrive, drain, seconds, bound=None):
@@ -444,7 +379,19 @@ for bound in (None, 200):
 
 - **Unbounded:** nothing is rejected, but the newest item waits over four minutes, so in practice it
   times out and the work was wasted anyway.
-- **Bounded:** the excess gets fast, honest 503s while admitted work stays inside the 15 s budget.
+- **Bounded:** the excess gets fast, honest 503s while admitted work stays inside a 15 s budget
+  (16 × 15 = 240 is the ceiling; 200 leaves margin).
+
+### Worked numbers: sizing agent-run admission
+Illustrative: interactive runs average 30 s; the worker may hold 20 runs (`MAX_ACTIVE_RUNS = 20`) and
+100 pending background runs (`MAX_PENDING = 100`).
+
+| Quantity | Value |
+|---|---|
+| Run throughput per worker | 20 / 30 s ≈ 0.67 runs per second |
+| Burst of 2 runs per second for 60 s | 120 arrive, about 40 can start in that minute |
+| Bounded admission | the other 80 get a fast 503 (interactive) or a 202 plus run ID (background) |
+| Background queue of 100 at 0.67 runs/s | the last one waits about 150 s, acceptable for a 202 job |
 
 ## Production patterns
 - **Expose queue depth and time in queue as metrics.** For every bounded queue, publish `qsize()` as a
@@ -468,6 +415,14 @@ for bound in (None, 200):
 - **Durable queue for work that can wait.** Route batch embedding, re-indexing and long agent tasks to a
   durable job queue with a depth limit and return 202, keeping in-process queues for short-lived work.
   Monitor job age and dead-letter counts.
+- **Catch errors inside queue workers.** Wrap each item in `try/except` with `task_done()` in `finally`;
+  a worker task that dies on one bad chunk silently cuts drain rate, and the queue then fills at a load it
+  used to handle.
+- **In-process queues and counters do not survive restarts.** An `asyncio.Queue` or a per-process pending
+  counter is lost on restart and differs per worker; keep durable work and its depth count in the job
+  queue itself.
+- **A parsed `body: dict` is read before your admission check.** Fine for small JSON batches; for large
+  uploads take the raw `Request` and admit before reading the body.
 
 ## Trade-offs
 - **Predictable latency vs absorbed bursts.** Bounded queues keep latency predictable but reject work

@@ -338,41 +338,36 @@ The v2 shape renamed `summary` to `text` and added citations, a breaking change.
 representation with a `Sunset` header and an OpenAPI deprecation flag, not as a forked code path.
 
 ```python
+# pip install fastapi httpx   (httpx only for the TestClient call at the end)
 from fastapi import APIRouter, FastAPI, Response
-from pydantic import BaseModel, ConfigDict
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
 
 class SummaryV2(BaseModel):             # current shape: renamed field, structured citations
     id: str
     text: str
     citations: list[dict]
-    model: str
 
 class SummaryV1(BaseModel):             # frozen shape old clients depend on
-    model_config = ConfigDict(extra="ignore")   # Pydantic's default, spelled out: unknown input dropped
     id: str
-    summary: str                        # renamed to `text` in v2, hence the shim below
-
-async def summarize(doc_id: str) -> SummaryV2:
-    return SummaryV2(id="sum_1", text="...", citations=[{"doc": doc_id, "span": [0, 40]}],
-                     model="summarizer-2026-03-01")   # pinned model snapshot is part of the contract
+    summary: str                        # renamed to `text` in v2
 
 v1, v2 = APIRouter(prefix="/v1"), APIRouter(prefix="/v2")
 
 @v2.post("/summaries", response_model=SummaryV2)
-async def create_v2(doc_id: str):
-    return await summarize(doc_id)
+def summarize(doc_id: str) -> SummaryV2:
+    return SummaryV2(id="sum_1", text="...", citations=[{"doc": doc_id, "span": [0, 40]}])
 
 @v1.post("/summaries", response_model=SummaryV1, deprecated=True)   # flagged in OpenAPI docs
-async def create_v1(doc_id: str, response: Response):
-    s = await summarize(doc_id)                      # one implementation, two representations
+def create_v1(doc_id: str, response: Response):
+    s = summarize(doc_id)                            # one implementation, two representations
     response.headers["Deprecation"] = "@1767225600"            # RFC 9745: deprecated since 2026-01-01
     response.headers["Sunset"] = "Sat, 31 Oct 2026 00:00:00 GMT"  # RFC 8594: removal date
-    response.headers["Link"] = '</docs/migrate-v2>; rel="deprecation"'
-    return SummaryV1(id=s.id, summary=s.text)        # render the old shape; drop fields v1 never promised
+    return SummaryV1(id=s.id, summary=s.text)        # render the old shape
 
-app = FastAPI()
-app.include_router(v1)
-app.include_router(v2)
+app = FastAPI(); app.include_router(v1); app.include_router(v2)
+r = TestClient(app).post("/v1/summaries?doc_id=d1")
+print(r.json(), r.headers["sunset"])   # {'id': 'sum_1', 'summary': '...'} Sat, 31 Oct 2026 00:00:00 GMT
 ```
 
 ### Renaming a tool argument without breaking deployed agents
@@ -380,14 +375,13 @@ The `search_tickets` tool renames `q` to `query`. Expand phase: the schema adver
 parser still accepts `q` from agents running older prompts, and every use of the old name is counted.
 
 ```python
-from pydantic import BaseModel, Field, AliasChoices, ConfigDict
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 LEGACY_ARG_USES = {"search_tickets.q": 0}             # export as a metric in real code
 
 class SearchTicketsArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")         # unknown args go back to the model as errors
-    query: str = Field(validation_alias=AliasChoices("query", "q"),
-                       description="Free-text search over ticket titles and bodies")
+    query: str = Field(validation_alias=AliasChoices("query", "q"))
     limit: int = Field(10, ge=1, le=50)
 
 def parse_args(raw: dict) -> SearchTicketsArgs:
@@ -395,44 +389,10 @@ def parse_args(raw: dict) -> SearchTicketsArgs:
         LEGACY_ARG_USES["search_tickets.q"] += 1      # who still sends the old name?
     return SearchTicketsArgs.model_validate(raw)
 
-tool_def = {
-    "name": "search_tickets",
-    "description": "Search support tickets. Use before answering questions about past issues.",
-    "input_schema": SearchTicketsArgs.model_json_schema(by_alias=False),  # advertises `query` only
-}
-
-print(parse_args({"q": "refund failed", "limit": 5}).query)   # old agent: still works
-print(parse_args({"query": "refund failed"}).limit)          # new agent: default limit 10
-print(LEGACY_ARG_USES)                                       # {'search_tickets.q': 1}
-```
-
-### A tolerant reader on the client side
-Runnable with the standard library. The client survives a new enum value, a new field and the
-`summary` to `text` rename during the expand phase.
-
-```python
-from enum import Enum
-
-class Status(str, Enum):
-    QUEUED = "queued"
-    DONE = "done"
-    UNKNOWN = "unknown"
-
-    @classmethod
-    def _missing_(cls, value):          # open enum: a value added later maps to UNKNOWN
-        return cls.UNKNOWN
-
-def read_job(payload: dict) -> dict:
-    return {
-        "id": payload["id"],
-        "status": Status(payload.get("status", "unknown")),
-        "text": payload.get("text") or payload.get("summary"),  # new name first, old as fallback
-    }                                    # unknown fields such as "citations" are simply ignored
-
-print(read_job({"id": "j1", "status": "done", "summary": "old shape"}))
-print(read_job({"id": "j2", "status": "cancelled", "text": "new shape", "citations": []}))
-# {'id': 'j1', 'status': <Status.DONE: 'done'>, 'text': 'old shape'}
-# {'id': 'j2', 'status': <Status.UNKNOWN: 'unknown'>, 'text': 'new shape'}
+schema = SearchTicketsArgs.model_json_schema(by_alias=False)   # the tool's input_schema
+print(list(schema["properties"]))             # ['query', 'limit']: advertises `query` only
+print(parse_args({"q": "refund failed"}).query)   # refund failed: an old agent still works
+print(LEGACY_ARG_USES)                        # {'search_tickets.q': 1}
 ```
 
 ### Worked scenario: renaming a field with expand and contract
@@ -475,6 +435,10 @@ An agent's final step returns JSON that three services parse. Numbers are illust
 - **Pin model snapshots and prompt versions.** Store the exact model snapshot name and prompt version in
   config, include them in responses or logs, and run the eval and format-parsing suite before changing
   either. Monitor downstream parse-failure rate after each change.
+- **Point deprecated responses at the guide.** Send `Link: </docs/migrate-v2>; rel="deprecation"` next to
+  the `Deprecation` and `Sunset` headers so a client developer finds the migration path from the response.
+- **Make clients tolerant readers.** Map unknown enum values to an `UNKNOWN` member, read the new field
+  name first with the old one as fallback during the expand phase, and ignore fields you do not use.
 
 ## Trade-offs
 - **Additive-only vs a clean API.** Every client keeps working with no migration, but the API accumulates

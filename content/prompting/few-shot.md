@@ -188,38 +188,27 @@ import anthropic, json
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-client, MODEL = anthropic.Anthropic(), "claude-opus-5-5"
-embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
-# Labelled pool: in practice a few hundred boundary cases curated from real traffic, balanced by label.
+client, embedder = anthropic.Anthropic(), SentenceTransformer("all-MiniLM-L6-v2")
 POOL = [("Charged twice for March", "billing"), ("Refund never arrived", "billing"),
         ("Export button does nothing on Safari", "bug"), ("Dashboard shows yesterday's numbers", "bug"),
-        ("Please add dark mode", "feature_request"), ("Could reports be scheduled weekly?", "feature_request"),
-        ("Thanks, all working now", "other"), ("What is your office address?", "other")]
+        ("Please add dark mode", "feature_request"), ("Thanks, all working now", "other")]
 POOL_VECS = embedder.encode([t for t, _ in POOL], normalize_embeddings=True)
-
-SYSTEM = ("Classify the ticket into one of: billing, bug, feature_request, other. "
-          "The examples show where the boundaries fall; copy their format exactly: JSON {\"label\": ...} only.")
+SYSTEM = "Classify the ticket as billing, bug, feature_request or other. Reply JSON {\"label\": ...} only."
 
 def classify(ticket, k=4):
     q = embedder.encode([ticket], normalize_embeddings=True)[0]
     nearest = np.argsort(-(POOL_VECS @ q))[:k][::-1]               # cosine top-k, most similar last
     messages = []
     for i in nearest:                                             # demonstrations as user/assistant pairs
-        text, label = POOL[i]
-        messages += [{"role": "user", "content": f"<ticket>{text}</ticket>"},
-                     {"role": "assistant", "content": json.dumps({"label": label})}]
+        messages += [{"role": "user", "content": f"<ticket>{POOL[i][0]}</ticket>"},
+                     {"role": "assistant", "content": json.dumps({"label": POOL[i][1]})}]
     messages.append({"role": "user", "content": f"<ticket>{ticket}</ticket>"})
-    r = client.messages.create(model=MODEL, max_tokens=1024, system=SYSTEM, messages=messages)
-    text = next((b.text for b in r.content if b.type == "text"), "")  # thinking counts toward max_tokens
-    shown = [POOL[i][1] for i in nearest]                         # labels the model was shown
-    try:
-        return json.loads(text)["label"], shown
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return "FORMAT_ERROR", shown
+    r = client.messages.create(model="claude-opus-5-5", max_tokens=1024, system=SYSTEM, messages=messages)
+    text = next(b.text for b in r.content if b.type == "text")
+    return json.loads(text)["label"], [POOL[i][1] for i in nearest]   # label, labels the model was shown
 
 label, shown = classify("My invoice total is wrong and the PDF download is broken")
-print(label, "<- neighbours:", shown)
+print(label, "<- neighbours:", shown)   # e.g. billing <- neighbours: ['bug', 'other', 'billing', 'billing']
 ```
 
 - **This ticket straddles two labels**, so its neighbours are likely a mix of billing and bug examples, and
@@ -245,17 +234,11 @@ def calibrate(p_input, p_null, floor=1e-3):
     """Divide out the skew the prompt shows on a content-free input, then renormalise."""
     return normalise({y: p_input[y] / max(p_null[y], floor) for y in LABELS})
 
-# Label frequencies over 20 samples of a content-free input ("N/A") with the same examples:
-p_null = normalise({"billing": 2, "bug": 12, "feature_request": 3, "other": 3})
-# Frequencies over 20 samples of a real, borderline ticket:
-p_input = normalise({"billing": 8, "bug": 10, "feature_request": 1, "other": 1})
-
-raw = max(p_input, key=p_input.get)
+p_null = normalise({"billing": 2, "bug": 12, "feature_request": 3, "other": 3})   # 20 samples of "N/A"
+p_input = normalise({"billing": 8, "bug": 10, "feature_request": 1, "other": 1})  # 20 samples, real ticket
 cal = calibrate(p_input, p_null)
-print("raw:", raw, "| calibrated:", max(cal, key=cal.get))
-print({k: round(v, 2) for k, v in cal.items()})
-# raw: bug | calibrated: billing
-# {'billing': 0.73, 'bug': 0.15, 'feature_request': 0.06, 'other': 0.06}
+print("raw:", max(p_input, key=p_input.get), "| calibrated:", max(cal, key=cal.get), round(cal["billing"], 2))
+# raw: bug | calibrated: billing 0.73
 ```
 
 - **The null input exposes the prior.** With no content, the prompt still says "bug" 60% of the time:
@@ -271,28 +254,22 @@ example values leaking into arguments.
 import json
 
 EXAMPLES = [  # placeholders are deliberately fake so leaks are detectable
-    {"user": "Refund order ORDER-EXAMPLE-1, it arrived broken",
-     "calls": [("get_order", {"order_id": "ORDER-EXAMPLE-1"}),
-               ("issue_refund", {"order_id": "ORDER-EXAMPLE-1", "reason": "damaged"})]},
-    {"user": "What did I order on 2000-01-15?",
-     "calls": [("search_orders", {"date": "2000-01-15"})]},
+    ("Refund order ORDER-EXAMPLE-1, it arrived broken",
+     [("get_order", {"order_id": "ORDER-EXAMPLE-1"}),
+      ("issue_refund", {"order_id": "ORDER-EXAMPLE-1", "reason": "damaged"})]),
+    ("What did I order on 2000-01-15?", [("search_orders", {"date": "2000-01-15"})]),
 ]
-# Only placeholder values: an enum value such as "damaged" is legitimate in real calls too.
-EXAMPLE_VALUES = {"ORDER-EXAMPLE-1", "2000-01-15"}
+EXAMPLE_VALUES = {"ORDER-EXAMPLE-1", "2000-01-15"}   # placeholders only: an enum like "damaged" is legit
 
-def render_examples():
-    blocks = []
-    for ex in EXAMPLES:
-        steps = "\n".join(f"call {name} {json.dumps(args)}" for name, args in ex["calls"])
-        blocks.append(f"<example>\nuser: {ex['user']}\n{steps}\n</example>")
-    return "Examples of correct tool use (values are placeholders):\n" + "\n".join(blocks)
+SYSTEM = "You are a refund agent. Always call get_order before issue_refund. Dates are YYYY-MM-DD.\n"
+for user, calls in EXAMPLES:                         # static: stays inside the cached prefix
+    steps = "\n".join(f"call {name} {json.dumps(args)}" for name, args in calls)
+    SYSTEM += f"<example>\nuser: {user}\n{steps}\n</example>\n"
 
 def leaked(tool_args: dict) -> bool:
     """True if a real call reuses a value that only exists in the examples."""
     return any(isinstance(v, str) and v in EXAMPLE_VALUES for v in tool_args.values())
 
-SYSTEM = "You are a refund agent. Always call get_order before issue_refund. Dates are YYYY-MM-DD.\n"
-SYSTEM += render_examples()          # static: stays inside the cached prefix
 print(leaked({"order_id": "ORDER-EXAMPLE-1"}), leaked({"order_id": "A-88231"}))   # True False
 ```
 
@@ -334,6 +311,9 @@ stable and volume stays high.
 - **Retrieve past successful trajectories.** Memory-backed agents can store solved tasks and insert the
   most similar one or two as examples after the cached block. Monitor whether retrieved trajectories
   raise task success against a no-example baseline, and prune ones that lead to failures.
+- **Parse defensively and leave token headroom.** Map a missing text block or unparseable JSON to a
+  `FORMAT_ERROR` label and count it, and set `max_tokens` with room to spare (for example 1024), since
+  thinking counts toward it.
 
 ## Trade-offs
 - **Specification by demonstration vs per-call tokens.** The balance flips toward fine-tuning once volume

@@ -214,51 +214,34 @@ Pure Python, runnable as is. It shows on-demand growth, `fork()`-style sharing f
 copy-on-write of a shared tail block.
 
 ```python
-class BlockPool:
-    def __init__(self, num_blocks, block=16):
-        self.block, self.free = block, list(range(num_blocks))
-        self.ref = [0] * num_blocks
+BLOCK = 16
+free, ref = list(range(8)), [0] * 8              # an 8-block pool and per-block reference counts
 
-    def alloc(self):
-        if not self.free:
-            raise MemoryError("out of blocks: preempt a sequence")
-        b = self.free.pop()
-        self.ref[b] = 1
-        return b
+def alloc():
+    if not free:
+        raise MemoryError("out of blocks: preempt a sequence")
+    b = free.pop(); ref[b] = 1
+    return b
 
-    def release(self, b):
-        self.ref[b] -= 1
-        if self.ref[b] == 0:
-            self.free.append(b)
+def append(seq):                                 # store one new token's K and V
+    if seq["len"] % BLOCK == 0:                  # last block full, or no block yet
+        seq["table"].append(alloc())
+    elif ref[seq["table"][-1]] > 1:              # copy-on-write a shared partial block
+        ref[seq["table"][-1]] -= 1
+        seq["table"][-1] = alloc()               # (a real engine also copies its K/V)
+    seq["len"] += 1
 
-class Sequence:
-    def __init__(self, pool, n_prompt=0):
-        self.pool, self.len, self.table = pool, 0, []
-        for _ in range(n_prompt):
-            self.append()
+def fork(seq):                                   # parallel sampling: share, do not copy
+    for b in seq["table"]:
+        ref[b] += 1
+    return {"len": seq["len"], "table": list(seq["table"])}
 
-    def append(self):                              # store one new token's K and V
-        p = self.pool
-        if self.len % p.block == 0:                # last block full, or no block yet
-            self.table.append(p.alloc())
-        elif p.ref[self.table[-1]] > 1:            # copy-on-write a shared partial block
-            p.release(self.table[-1])
-            self.table[-1] = p.alloc()             # (a real engine also copies its K/V)
-        self.len += 1
-
-    def fork(self):                                # parallel sampling: share, do not copy
-        child = Sequence(self.pool)
-        child.len, child.table = self.len, list(self.table)
-        for b in self.table:
-            self.pool.ref[b] += 1
-        return child
-
-pool = BlockPool(num_blocks=8)
-a = Sequence(pool, n_prompt=40)                    # 40 tokens -> 3 blocks (16 + 16 + 8)
-b = a.fork()                                       # n=2 sampling shares all 3
-print(a.table, b.table, "free:", len(pool.free))   # [7, 6, 5] [7, 6, 5] free: 5
-a.append(); b.append()                             # both write into the shared tail block
-print(a.table, b.table, "free:", len(pool.free))   # [7, 6, 4] [7, 6, 5] free: 4
+a = {"len": 0, "table": []}
+for _ in range(40): append(a)                    # 40 tokens -> 3 blocks (16 + 16 + 8)
+b = fork(a)                                      # n=2 sampling shares all 3
+print(a["table"], b["table"], "free:", len(free))   # [7, 6, 5] [7, 6, 5] free: 5
+append(a); append(b)                             # both write into the shared tail block
+print(a["table"], b["table"], "free:", len(free))   # [7, 6, 4] [7, 6, 5] free: 4
 ```
 
 ### Worked scenario: how many research agents fit on one GPU

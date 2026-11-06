@@ -334,7 +334,6 @@ flowchart TD
 Created in the lifespan with explicit limits and timeouts, and reused by every request.
 
 ```python
-import os
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -343,10 +342,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 async def lifespan(app: FastAPI):
     app.state.http = httpx.AsyncClient(
         base_url="https://llm.internal.example",
-        limits=httpx.Limits(max_connections=64, max_keepalive_connections=32,
-                            keepalive_expiry=30.0),
+        limits=httpx.Limits(max_connections=64),
         timeout=httpx.Timeout(connect=3.0, read=60.0, write=10.0, pool=2.0),
-        headers={"Authorization": f"Bearer {os.environ['LLM_TOKEN']}"},
     )
     yield
     await app.state.http.aclose()   # drain the pool on shutdown
@@ -360,9 +357,7 @@ def get_http(request: Request) -> httpx.AsyncClient:
 async def complete(body: dict, http: httpx.AsyncClient = Depends(get_http)):
     try:
         r = await http.post("/v1/complete", json=body)
-        r.raise_for_status()
-    except httpx.PoolTimeout:
-        # pool exhausted: shed load with a retryable status instead of queueing forever
+    except httpx.PoolTimeout:       # pool full: shed load fast instead of queueing
         raise HTTPException(503, "upstream busy", headers={"Retry-After": "2"})
     return r.json()
 ```
@@ -372,51 +367,9 @@ async def complete(body: dict, http: httpx.AsyncClient = Depends(get_http)):
 - **In a load-test trace,** the per-request version shows a TLS handshake on every call; the shared
   version shows them only while the pool warms up.
 
-### An agent with one client per upstream
-The model SDK and each tool upstream get their own lifespan-built client, so a slow CRM cannot starve
-model calls. The model name and URLs are placeholders.
-
-```python
-from contextlib import asynccontextmanager
-import httpx
-from anthropic import AsyncAnthropic
-from fastapi import FastAPI
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    llm_http = httpx.AsyncClient(limits=httpx.Limits(max_connections=32),
-                                 timeout=httpx.Timeout(connect=3.0, read=60.0, write=10.0, pool=2.0))
-    app.state.llm = AsyncAnthropic(http_client=llm_http)          # SDK reuses this pool
-    app.state.tools = {
-        "search": httpx.AsyncClient(base_url="https://search.internal.example",
-                                    limits=httpx.Limits(max_connections=16),
-                                    timeout=httpx.Timeout(5.0, pool=1.0)),
-        "crm": httpx.AsyncClient(base_url="https://crm.internal.example",
-                                 limits=httpx.Limits(max_connections=8),
-                                 timeout=httpx.Timeout(10.0, pool=1.0)),
-    }
-    yield
-    for c in app.state.tools.values():
-        await c.aclose()
-    await llm_http.aclose()
-
-async def call_tool(app: FastAPI, name: str, path: str, args: dict) -> dict:
-    try:
-        r = await app.state.tools[name].post(path, json=args)
-        r.raise_for_status()
-        return r.json()
-    except httpx.PoolTimeout:
-        return {"error": f"{name} busy, try again later"}   # the model sees a tool error, not a crash
-    except httpx.HTTPError as e:
-        return {"error": f"{name} failed: {type(e).__name__}"}
-```
-
-- **Tool errors go back to the model as results,** so the agent can retry, pick another tool or tell the
-  user, instead of the whole run failing on one upstream.
-
 ### Relaying a provider stream without leaking connections
 `send(..., stream=True)` keeps the connection checked out until `aclose()`, so the relay closes it in a
-`finally` and on the early error path.
+`finally` and on the early error path. Builds on the app above.
 
 ```python
 from fastapi.responses import StreamingResponse
@@ -436,7 +389,7 @@ async def stream(body: dict, http: httpx.AsyncClient = Depends(get_http)):
         finally:
             await r.aclose()              # completion, upstream error, or generator closed early
 
-    return StreamingResponse(relay(), media_type=r.headers.get("content-type", "text/event-stream"))
+    return StreamingResponse(relay(), media_type="text/event-stream")
 ```
 
 - **One gap remains:** a generator's `finally` runs only once the generator has started. If the client
@@ -472,6 +425,9 @@ tool calls); the range covers DNS cached (0 ms) or not (one round trip).
 - **Configure SDKs through `http_client=`.** Pass a lifespan-built `httpx.AsyncClient` to the OpenAI or
   Anthropic SDK client so proxies, CA bundles and limits live in one place. Monitor connect and TLS
   spans in agent traces, which should only appear during warm-up.
+- **Return tool failures to the model as results.** Inside the agent loop, catch `httpx.PoolTimeout` and
+  other `httpx.HTTPError`s from a tool client and return `{"error": "..."}` as the tool result, so the
+  agent can retry, pick another tool or tell the user instead of the whole run failing.
 
 ## Trade-offs
 - **Shared pool vs contention.** It removes per-call handshake cost and caps sockets, but becomes a

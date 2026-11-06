@@ -395,130 +395,71 @@ sequenceDiagram
   discoverable), then ownership or an explicit permission.
 
 ```python
+# pip install "pyjwt[crypto]" fastapi
 import jwt                                   # PyJWT
 from fastapi import Depends, FastAPI, HTTPException, Request
 
 app = FastAPI()
 JWKS = jwt.PyJWKClient("https://idp.example.com/.well-known/jwks.json")
 
-class Principal:
-    def __init__(self, claims):
-        self.user_id = claims["sub"]
-        self.tenant_id = claims["tenant"]
-        self.permissions = set(claims.get("permissions", []))
-
-def current_principal(request: Request) -> Principal:        # AUTHENTICATION
-    auth = request.headers.get("authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(401, headers={"WWW-Authenticate": "Bearer"})
-    token = auth.removeprefix("Bearer ")
+def current_principal(request: Request) -> dict:             # AUTHENTICATION
+    token = request.headers.get("authorization", "").removeprefix("Bearer ")
     try:
         key = JWKS.get_signing_key_from_jwt(token).key
-        claims = jwt.decode(token, key, algorithms=["RS256"],     # pinned, never from the header
-                            issuer="https://idp.example.com", audience="docs-api",
-                            options={"require": ["exp", "sub", "tenant"]})
+        return jwt.decode(token, key, algorithms=["RS256"],      # pinned, never from the header
+                          issuer="https://idp.example.com", audience="docs-api",
+                          options={"require": ["exp", "sub", "tenant"]})
     except jwt.PyJWTError:                                   # bad signature, issuer, audience or expiry
         raise HTTPException(401, headers={"WWW-Authenticate": "Bearer"})
-    return Principal(claims)
 
-def authorize(p: Principal, action: str, doc) -> None:       # AUTHORIZATION, default deny
-    if doc.tenant_id != p.tenant_id:
+def authorize(p: dict, action: str, doc) -> None:            # AUTHORIZATION, default deny
+    if doc is None or doc.tenant_id != p["tenant"]:
         raise HTTPException(404)                             # do not reveal cross-tenant existence
-    if doc.owner_id == p.user_id or f"documents:{action}" in p.permissions:
-        return
-    raise HTTPException(403)
+    if doc.owner_id != p["sub"] and f"documents:{action}" not in p.get("permissions", []):
+        raise HTTPException(403)
 
 @app.delete("/documents/{doc_id}")
-def delete_document(doc_id: int, p: Principal = Depends(current_principal)):
-    doc = db.get_document(doc_id)
-    if doc is None:
-        raise HTTPException(404)
+def delete_document(doc_id: int, p: dict = Depends(current_principal)):
+    doc = db.get_document(doc_id)                            # `db`: the application's data layer
     authorize(p, "delete", doc)
-    db.delete_document(doc_id, actor=p.user_id)              # audit records who, not just what
+    db.delete_document(doc_id, actor=p["sub"])               # audit records who, not just what
     return {"deleted": doc_id}
 ```
 
-- **`db` is the application's data layer.**
 - **Note what is *not* here:** no permission logic in the token parsing, no identity logic in the handler,
   and the tenant check runs before any content-dependent decision.
-
-### Runnable: issuing and checking API keys
-Standard library only. The key is shown once, stored as a SHA-256 hash with a public key id and the
-tenant it is bound to, and checked in constant time.
-
-```python
-import hashlib, hmac, secrets
-
-STORE = {}                                   # key_id -> record; in production, a database table
-
-def issue_api_key(tenant_id):
-    key_id = secrets.token_hex(4)            # public part: lets you find and name the key safely
-    plaintext = f"docs_{key_id}_{secrets.token_urlsafe(32)}"   # prefix helps secret scanners
-    STORE[key_id] = {"tenant_id": tenant_id,
-                     "sha256": hashlib.sha256(plaintext.encode()).hexdigest()}
-    return plaintext                         # shown to the customer once, never stored
-
-def authenticate_api_key(presented):
-    try:
-        prefix, key_id, _ = presented.split("_", 2)
-    except ValueError:
-        return None
-    record = STORE.get(key_id)
-    if prefix != "docs" or record is None:
-        return None
-    digest = hashlib.sha256(presented.encode()).hexdigest()
-    if not hmac.compare_digest(digest, record["sha256"]):   # constant-time comparison
-        return None
-    return {"tenant_id": record["tenant_id"], "auth_method": "api_key", "key_id": key_id}
-
-key = issue_api_key("tenant-a")
-print(authenticate_api_key(key))             # principal bound to tenant-a
-print(authenticate_api_key(key[:-1] + ("x" if key[-1] != "x" else "y")))   # None: tampered secret
-print(authenticate_api_key("garbage"))       # None: wrong format
-```
 
 ### Agent scenario: a tool dispatcher that authorizes as the user
 Every model-requested tool call runs with the end user's principal. The dispatcher checks the tool's
 required permission, the tool checks the tenant, and the audit log names the user.
 
 ```python
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Principal:
     user_id: str
     tenant_id: str
-    permissions: frozenset = field(default_factory=frozenset)
+    permissions: frozenset
 
-DOCS = {"d1": {"tenant": "t1", "owner": "alice", "text": "Q3 plan"},
-        "d2": {"tenant": "t2", "owner": "bob", "text": "t2 salaries"}}
-TOOLS = {}
+DOCS = {"d1": {"tenant": "t1", "text": "Q3 plan"}, "d2": {"tenant": "t2", "text": "t2 salaries"}}
 
-def tool(name, needs):
-    def wrap(fn):
-        TOOLS[name] = (fn, needs)
-        return fn
-    return wrap
-
-@tool("read_document", needs="documents:read")
 def read_document(p: Principal, doc_id: str):
     doc = DOCS.get(doc_id)
     if doc is None or doc["tenant"] != p.tenant_id:   # tenant check in the tool, not the prompt
         return {"error": "not_found"}
     return {"text": doc["text"]}
 
+TOOLS = {"read_document": (read_document, "documents:read")}   # tool -> required permission
+
 def dispatch(p: Principal, call: dict, audit: list):
     """Run a model-requested tool call as the USER, default deny."""
     fn, needs = TOOLS.get(call["name"], (None, None))
-    if fn is None or needs not in p.permissions:
-        result = {"error": "forbidden"}               # returned to the model as the tool result
-    else:
-        result = fn(p, **call["args"])
-    audit.append((p.user_id, call["name"], call["args"], "error" not in result))
+    result = fn(p, **call["args"]) if fn and needs in p.permissions else {"error": "forbidden"}
+    audit.append((p.user_id, call["name"], "error" not in result))   # the user is the actor
     return result
 
-alice = Principal("alice", "t1", frozenset({"documents:read"}))
-audit = []
+alice, audit = Principal("alice", "t1", frozenset({"documents:read"})), []
 print(dispatch(alice, {"name": "read_document", "args": {"doc_id": "d1"}}, audit))    # {'text': 'Q3 plan'}
 print(dispatch(alice, {"name": "read_document", "args": {"doc_id": "d2"}}, audit))    # {'error': 'not_found'}
 print(dispatch(alice, {"name": "delete_document", "args": {"doc_id": "d1"}}, audit))  # {'error': 'forbidden'}
@@ -561,6 +502,9 @@ The `DELETE /documents/{doc_id}` endpoint above, called by different principals.
 - **Permission-filtered retrieval with a red-team eval.** Apply the user's ACLs as filters inside the
   vector query, and keep an eval set of prompts that try to extract another user's documents. Monitor
   that set's leak rate in CI; the target is zero.
+- **Store API keys as hashes.** Issue keys like `docs_<key_id>_<secret>`: show the plaintext once, store
+  only its SHA-256 hash with the public key id and bound tenant, and compare with `hmac.compare_digest`.
+  The fixed prefix lets secret scanners find leaked keys.
 
 ## Trade-offs
 - **Stateless JWTs vs revocation.** No store lookup per request, but no revocation before expiry; flip to

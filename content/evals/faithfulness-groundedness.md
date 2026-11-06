@@ -198,20 +198,23 @@ def faithfulness(answer: str, context: str, llm) -> dict:
     verdicts = [llm(VERIFY.format(context=context, claim=c)).strip().splitlines()[-1].strip()
                 for c in claims]
     n = len(claims)
-    return {
-        "faithfulness": sum(v == "SUPPORTED" for v in verdicts) / n if n else 1.0,  # no claims: trivially faithful
-        "contradicted": sum(v == "CONTRADICTED" for v in verdicts),
-        "claims": list(zip(claims, verdicts)),
-    }
-
-# Context: "Standard plans may be refunded within 30 days of purchase. Enterprise plans are non-refundable."
-# Answer:  "Standard plans can be refunded within 30 days. This also applies to Enterprise plans.
-#           Refunds go back to the original payment method."
-# Claims -> "Standard plans can be refunded within 30 days"   SUPPORTED
-#           "Enterprise plans can be refunded within 30 days" CONTRADICTED
-#           "Refunds go to the original payment method"       NOT_FOUND
-# faithfulness = 1/3, contradicted = 1  ->  fails a contradiction gate despite a correct first sentence.
+    return {"faithfulness": sum(v == "SUPPORTED" for v in verdicts) / n if n else 1.0,  # no claims: trivially faithful
+            "contradicted": sum(v == "CONTRADICTED" for v in verdicts),
+            "claims": list(zip(claims, verdicts))}
 ```
+
+Context: "Standard plans may be refunded within 30 days of purchase. Enterprise plans are non-refundable."
+Answer: "Standard plans can be refunded within 30 days. This also applies to Enterprise plans. Refunds go
+back to the original payment method."
+
+| Extracted claim | Verdict |
+|---|---|
+| Standard plans can be refunded within 30 days | SUPPORTED |
+| Enterprise plans can be refunded within 30 days | CONTRADICTED |
+| Refunds go to the original payment method | NOT_FOUND |
+
+- **Result:** faithfulness = 1/3, contradicted = 1, so it fails a contradiction gate despite a correct
+  first sentence.
 
 - **Averaged over an eval set,** the headline is the mean faithfulness, but the decision-relevant numbers
   are the fraction of answers with any contradicted claim and the per-claim log that shows *which* fact
@@ -226,19 +229,15 @@ import re
 
 NUM = re.compile(r"\d+(?:[.,]\d+)*%?")
 
-def numbers(text):
-    """Figures as written, with thousands separators removed: '$1,500' -> '1500', '30%' -> '30%'."""
+def numbers(text):                       # thousands separators removed: '$1,500' -> '1500'
     return {m.replace(",", "") for m in NUM.findall(text)}
 
 def unsupported_numbers(answer, context):
     return sorted(numbers(answer) - numbers(context))
 
-context = ("Standard plans may be refunded within 30 days of purchase. "
-           "Accidental damage is covered up to $1,500 per claim, with a 10% excess.")
-good = "You can get a refund within 30 days, and damage is covered up to $1,500 (10% excess)."
-bad  = "You can get a refund within 30 days, and damage is covered up to $2,000 (10% excess)."
-print(unsupported_numbers(good, context))   # []
-print(unsupported_numbers(bad, context))    # ['2000']  -> gate: regenerate, abstain or send to review
+context = "Refunds within 30 days. Damage is covered up to $1,500 per claim, with a 10% excess."
+print(unsupported_numbers("Covered up to $1,500 (10% excess).", context))   # []
+print(unsupported_numbers("Covered up to $2,000 (10% excess).", context))   # ['2000'] -> regenerate, abstain or review
 ```
 
 - **Limits:** it misses figures written as words ("thirty days") and flags legitimate reformatting
@@ -249,8 +248,7 @@ The context is built from the run itself: tool results are the evidence, and the
 only support for claims about actions. Reuses `unsupported_numbers` from the guard above.
 
 ```python
-def grounding_context(trace: list[dict]) -> str:
-    """Only what the tools returned this run counts as evidence."""
+def grounding_context(trace: list[dict]) -> str:   # only what tools returned this run counts as evidence
     return "\n".join(m["content"] for m in trace if m["role"] == "tool")
 
 def actions_taken(trace: list[dict]) -> list[str]:
@@ -265,13 +263,9 @@ trace = [
     {"role": "assistant", "content": "Yes: order 8812 is 12 days old, inside the 30-day window. "
                                      "I have issued a $240 refund to your card."},
 ]
-reply, ctx = trace[-1]["content"], grounding_context(trace)
-print(unsupported_numbers(reply, ctx))   # []  every figure is in a tool result
-print(actions_taken(trace))              # ['get_order(8812)', "search_policy('refund window')"]
-# Claims "order 8812 can be refunded", "it is 12 days old", "it is inside the 30-day window"
-#                                    -> SUPPORTED by the two tool results.
-# Claim "a $240 refund was issued" -> NOT_FOUND: no refund tool was ever called.
-# Claim "refunded to your card"    -> NOT_FOUND: no tool result mentions the payment method.
+reply = trace[-1]["content"]
+print(unsupported_numbers(reply, grounding_context(trace)))   # []  every figure is in a tool result
+print(actions_taken(trace))   # ['get_order(8812)', "search_policy('refund window')"]: no refund call
 ```
 
 | Check | Result | What it says |
@@ -281,6 +275,9 @@ print(actions_taken(trace))              # ['get_order(8812)', "search_policy('r
 | Action claims vs tool calls | 1 unsupported action | the agent says it refunded but never called a refund tool |
 | Decision | block the reply | regenerate with the instruction to call the refund tool or say a refund is possible |
 
+- **Claims:** "order 8812 can be refunded", "it is 12 days old" and "it is inside the 30-day window"
+  are SUPPORTED by the two tool results; "a $240 refund was issued" is NOT_FOUND (no refund tool was
+  called) and "refunded to your card" is NOT_FOUND (no tool result mentions the payment method).
 - **The lesson:** a cheap number guard is necessary but not sufficient. Action claims need their own
   check against the tool-call record, and they belong behind a hard gate (illustrative numbers above).
 

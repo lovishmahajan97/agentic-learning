@@ -215,18 +215,15 @@ ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 P = bi.encode(passages, normalize_embeddings=True)
 q = bi.encode(query, normalize_embeddings=True)
 stage1 = np.argsort(-(P @ q))[:5]                     # top-5 by cosine: cheap, precomputable
-print("stage 1:", [passages[i][:40] for i in stage1])
-
-pairs = [(query, passages[i]) for i in stage1]
-scores = ce.predict(pairs)                            # one joint forward pass per pair
+scores = ce.predict([(query, passages[i]) for i in stage1])   # one joint forward pass per pair
 for i, s in sorted(zip(stage1, scores), key=lambda t: -t[1]):
     print(f"{s:+6.2f}  {passages[i][:60]}")
-# Re-run on sentence-transformers 6.2.0 (2026-11), same as on 5.1: the 14-day laptop rule +5.79
-# first, unopened software +3.61, the general 30-day rule +2.27, then warranty -1.98 and price-match
-# -7.45 at the bottom. The order of the top three varies by model, and neither model reasons that the
-# exception overrides the rule: that is the LLM's job, so k must be large enough (here 3) for the
-# rule and exception to survive.
+# +5.79 14-day laptop rule, +3.61 unopened software, +2.27 30-day rule, -1.98 warranty, -7.45 price-match
 ```
+
+Scores are from sentence-transformers 6.2.0 (same order on 5.1); the order of the top three varies by
+model. Neither model reasons that the exception overrides the rule: that is the LLM's job, so k must be
+large enough (here 3) for the rule and the exception to survive.
 
 ### Worked scenario: what reranking saves an agent in context tokens
 A research agent searches 5 times per task. Chunks are 400 tokens, and every tool result stays in the
@@ -253,16 +250,15 @@ from sentence_transformers import CrossEncoder
 ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
 ce.predict([("warm up", "warm up")])   # at startup: a cold first call (0.3-0.8 s on CPU) misses BUDGET_S
 pool = ThreadPoolExecutor(max_workers=4)
-THRESHOLD = 0.0          # calibrated on labeled queries for THIS model version
-BUDGET_S = 0.15          # hard latency budget for the rerank step
+THRESHOLD, BUDGET_S = 0.0, 0.15        # threshold calibrated for THIS model version; budget in seconds
 
 def search_tool(query, first_stage, n=50, k=3):
     cands = first_stage(query, n)                       # [(chunk_id, text)], best first
     fut = pool.submit(ce.predict, [(query, t) for _, t in cands], batch_size=64)
     try:
         scores = fut.result(timeout=BUDGET_S)
-    except Timeout:                                     # the abandoned call still occupies a worker
-        return {"results": [c for c, _ in cands[:k]], "reranked": False}   # fallback
+    except Timeout:                                     # fallback: first-stage order
+        return {"results": [c for c, _ in cands[:k]], "reranked": False}
     ranked = sorted(zip(cands, scores), key=lambda x: -x[1])
     keep = [(c[0], float(s)) for c, s in ranked[:k] if s >= THRESHOLD]
     if not keep:
@@ -273,47 +269,29 @@ def search_tool(query, first_stage, n=50, k=3):
 - **Log `reranked` and the top score** in the trace; a rising fallback rate or a shifted score
   distribution is the first sign of GPU trouble or a model change.
 
-### Production snippet: windowed scoring plus a per-source cap
+### Windowed scoring for long candidates
 Long candidates are split into overlapping windows (by words here, as a stand-in for tokens) so nothing
-is truncated, all windows go in one batched call, and a per-document cap stops near-duplicates filling
-the top k. `score_pairs` is any batch scorer, such as `CrossEncoder(...).predict`.
+is truncated, and every window goes in one batched call. `score_pairs` is any batch scorer, such as
+`CrossEncoder(...).predict`; `toy` counts shared words.
 
 ```python
 def windows(text, size=200, stride=150):
-    """Split a long passage into overlapping word windows that fit the reranker."""
     words = text.split()
-    if len(words) <= size:
-        return [text]
-    return [" ".join(words[i:i + size]) for i in range(0, len(words) - size + stride, stride)]
+    return [" ".join(words[i:i + size]) for i in range(0, max(len(words) - size, 0) + stride, stride)]
 
-def rerank(query, candidates, score_pairs, k=5, per_source=2):
-    """candidates: [(source_id, text)]. score_pairs: e.g. CrossEncoder(...).predict."""
-    pairs, owner = [], []
-    for idx, (_, text) in enumerate(candidates):
-        for w in windows(text):
-            pairs.append((query, w)); owner.append(idx)
-    scores = score_pairs(pairs)                      # one batched call for every window
+def rerank(query, candidates, score_pairs):
+    pairs = [(query, w, src) for src, text in candidates for w in windows(text)]
+    scores = score_pairs([(q, w) for q, w, _ in pairs])      # one batched call for every window
     best = {}
-    for idx, s in zip(owner, scores):                # passage score = its best window
-        best[idx] = max(s, best.get(idx, float("-inf")))
-    out, used = [], {}
-    for idx in sorted(best, key=best.get, reverse=True):
-        src = candidates[idx][0]
-        if used.get(src, 0) < per_source:            # cap near-duplicates from one document
-            out.append((src, round(best[idx], 2))); used[src] = used.get(src, 0) + 1
-        if len(out) == k:
-            break
-    return out
+    for (_, _, src), s in zip(pairs, scores):
+        best[src] = max(s, best.get(src, float("-inf")))   # a passage scores as its best window
+    return sorted(best.items(), key=lambda t: -t[1])
 
 toy = lambda pairs: [sum(w in p.lower() for w in q.lower().split()) for q, p in pairs]
-cands = [("policy-v1", "laptops may be returned within 14 days"),
-         ("policy-v2", "laptops may be returned within 14 days unopened"),
-         ("policy-v2", "laptops may be returned within 14 days if unopened box"),
-         ("policy-v2", "unopened laptops returned within 14 days"),
+cands = [("policy", "laptops may be returned within 14 days"),
          ("faq", "filler " * 500 + "return an unopened laptop within 14 days")]
-print(rerank("return unopened laptop 14 days", cands, toy, k=4))
-# [('policy-v2', 5), ('policy-v2', 5), ('faq', 5), ('policy-v1', 4)]
-# The third policy-v2 copy is capped; the FAQ answer at word 500 is found by its last window.
+print(rerank("return unopened laptop 14 days", cands, toy))
+# [('faq', 5), ('policy', 4)]   <- the FAQ answer at word 500 is found by its last window
 ```
 
 ### Worked scenario: choosing n from the cost curve
@@ -348,6 +326,9 @@ runs out.
 - **Deduplicate and keep k small.** Cap results per source document or apply MMR before returning to the
   agent, and keep k at 3 to 5 unless evals show the agent needs more. Monitor duplicate-source rate and
   tool-result tokens per task.
+- **Warm up and bound the rerank pool.** Call the reranker once at startup, since a cold first call
+  (0.3-0.8 s on CPU) blows a 150 ms budget, and size the thread pool knowing a timed-out call keeps
+  occupying its worker until it finishes.
 
 ## Trade-offs
 - **Precision the first stage cannot reach,** at one transformer pass per candidate per query; it turns

@@ -200,44 +200,32 @@ flowchart TD
 ## Examples
 ### Rubric as data, one judge call per criterion, gate before aggregation
 Item-specific criteria are attached to the golden item and skipped for items that do not declare them.
+`fake_llm` stands in for your judge call so the example runs.
 
 ```python
 RUBRIC = {
-    "no_fabricated_citation": {"gate": True, "check":
-        "Every cited source ID appears in the provided context. FAIL if any citation is absent."},
-    "answers_question": {"gate": False, "check":
-        "The response directly answers the user's question within its first two sentences."},
-    "grounded": {"gate": False, "check":
-        "Every factual claim in the response is supported by a quoted span from the context."},
-    "refund_window_stated": {"gate": False, "item_specific": True, "check":
-        "The response states that the refund window is 30 days."},
+    "no_fabricated_citation": {"gate": True, "check": "Every cited source ID appears in the context."},
+    "answers_question": {"gate": False, "check": "The response answers the question in two sentences."},
+    "refund_window_stated": {"gate": False, "item_specific": True, "check": "States the 30-day window."},
 }
-
-PROMPT = """You are grading ONE criterion of a support-bot answer.
-Context:
-{context}
-
-Question: {question}
-Response: {response}
-Criterion: {check}
-Quote the evidence from the response and context (or write NONE), then output exactly PASS or FAIL on the last line."""
+PROMPT = ("Grade ONE criterion.\nContext: {context}\nQuestion: {question}\nResponse: {response}\n"
+          "Criterion: {check}\nQuote the evidence (or NONE), then exactly PASS or FAIL on the last line.")
 
 def grade(item, response, llm):
-    """item = {'context':..., 'question':..., 'criteria': [item-specific criterion names]}"""
     results = {}
     for name, c in RUBRIC.items():
         if c.get("item_specific") and name not in item["criteria"]:
-            continue
-        out = llm(PROMPT.format(context=item["context"], question=item["question"],
-                                response=response, check=c["check"]))
-        results[name] = out.strip().splitlines()[-1].strip() == "PASS"
-    gates_failed = [n for n, r in results.items() if RUBRIC[n]["gate"] and not r]
-    if gates_failed:
-        return 0.0, results, gates_failed          # a gate failure zeroes the score
-    return sum(results.values()) / len(results), results, []   # skipped criteria never enter the denominator
+            continue                              # skipped: never enters the denominator
+        out = llm(PROMPT.format(check=c["check"], response=response, **item))
+        results[name] = out.strip().splitlines()[-1] == "PASS"
+    if any(RUBRIC[n]["gate"] and not ok for n, ok in results.items()):
+        return 0.0, results                       # a gate failure zeroes the score
+    return sum(results.values()) / len(results), results
 
-# A response citing "DOC-9" when the context only holds DOC-1..DOC-4 returns (0.0, {...}, ['no_fabricated_citation'])
-# even if it answers the question, is otherwise grounded and states the 30-day window.
+fake_llm = lambda p: "DOC-9 is not in the context\nFAIL" if "cited source" in p else "NONE\nPASS"
+item = {"context": "DOC-1..DOC-4", "question": "Refund window?", "criteria": []}
+print(grade(item, "30 days, see DOC-9.", fake_llm))
+# (0.0, {'no_fabricated_citation': False, 'answers_question': True})
 ```
 
 - **Log the per-criterion results**, because "grounded dropped from 94% to 81% after the prompt change"
@@ -249,8 +237,7 @@ Pure Python. `None` means the criterion did not apply; gate failures are reporte
 ```python
 from collections import defaultdict
 
-def aggregate(graded, gates):
-    """graded: one dict per item, criterion -> True / False / None (None = N/A)."""
+def aggregate(graded, gates):                 # graded: per item, criterion -> True/False/None (N/A)
     per = defaultdict(lambda: [0, 0])          # criterion -> [passes, applicable]
     item_scores, gate_fails = [], 0
     for g in graded:
@@ -260,66 +247,44 @@ def aggregate(graded, gates):
         if any(applied.get(k) is False for k in gates):
             gate_fails += 1; continue             # report gate failures separately
         rest = [v for k, v in applied.items() if k not in gates]
-        item_scores.append(sum(rest) / len(rest) if rest else 1.0)
+        item_scores.append(sum(rest) / len(rest))
     return ({k: f"{p}/{n}" for k, (p, n) in per.items()},
-            gate_fails / len(graded), round(sum(item_scores) / len(item_scores), 2))
+            round(gate_fails / len(graded), 2), sum(item_scores) / len(item_scores))
 
 graded = [
-    {"no_fabrication": True,  "answers": True,  "grounded": True,  "escalates": None},
-    {"no_fabrication": True,  "answers": True,  "grounded": False, "escalates": None},
-    {"no_fabrication": False, "answers": True,  "grounded": True,  "escalates": None},
-    {"no_fabrication": True,  "answers": False, "grounded": True,  "escalates": False},
+    {"no_fabrication": True,  "answers": True,  "escalates": None},
+    {"no_fabrication": False, "answers": True,  "escalates": None},
+    {"no_fabrication": True,  "answers": False, "escalates": False},
 ]
 print(aggregate(graded, gates={"no_fabrication"}))
-# ({'no_fabrication': '3/4', 'answers': '3/4', 'grounded': '3/4', 'escalates': '0/1'}, 0.25, 0.61)
+# ({'no_fabrication': '2/3', 'answers': '2/3', 'escalates': '0/1'}, 0.33, 0.5)
 ```
 
 | Reported number | N/A excluded (correct) | N/A scored as pass |
 |---|---|---|
-| "escalates" pass rate | 0/1: the only out-of-scope item was mishandled | 3/4 = 75%, looks healthy |
-| Gate failure rate | 25%, shown on its own | hidden inside an average |
+| "escalates" pass rate | 0/1: the only out-of-scope item was mishandled | 2/3 = 67%, looks healthy |
+| Gate failure rate | 33%, shown on its own | hidden inside an average |
 
-### Agent scenario: code checks over a trajectory, judge only for the reply
-An order-support agent's trace is a list of steps. Outcome, process and gate criteria are plain
-functions returning True, False or None (N/A); only the reply criterion needs a judge. The output
-plugs straight into `aggregate()` above.
+### Agent scenario: a code check over a trajectory
+Outcome, process and gate criteria for an order-support agent are plain functions over the trace that
+return True, False or None (N/A); only the reply criterion needs a judge. The results plug straight into
+`aggregate()` above.
 
 ```python
 DESTRUCTIVE = {"cancel_order", "issue_refund"}
 
-def calls(trace):
-    return [s for s in trace["steps"] if s["type"] == "tool_call"]
-
-def confirmed_before_destructive(trace):
+def confirmed_before_destructive(steps):          # a gate criterion
     confirmed = False
-    for s in trace["steps"]:
+    for s in steps:
         if s["type"] == "user" and s.get("confirms"):
             confirmed = True
         if s["type"] == "tool_call" and s["name"] in DESTRUCTIVE:
-            return confirmed                          # first destructive call decides it
-    return None                                       # N/A: nothing destructive happened
+            return confirmed                      # first destructive call decides it
+    return None                                   # N/A: nothing destructive happened
 
-def looked_up_first(trace):
-    names = [c["name"] for c in calls(trace)]
-    if "cancel_order" not in names:
-        return None
-    return "lookup_order" in names[:names.index("cancel_order")]
-
-def within_budget(trace, max_steps=8):
-    return len(calls(trace)) <= max_steps
-
-def final_state_ok(trace):
-    return trace["sandbox_after"].get(trace["expect_key"]) == trace["expect_value"]
-
-CHECKS = {"confirmed": confirmed_before_destructive, "lookup_first": looked_up_first,
-          "budget": within_budget, "outcome": final_state_ok}
-GATES = {"confirmed"}
-
-def grade_run(trace, judge_reply):
-    g = {name: fn(trace) for name, fn in CHECKS.items()}
-    g["reply_matches_tools"] = judge_reply(trace)     # the one criterion that needs an LLM judge
-    return g
-# per_criterion, gate_rate, score = aggregate([grade_run(t, judge) for t in traces], gates=GATES)
+steps = [{"type": "user", "text": "cancel order A-7"}, {"type": "tool_call", "name": "lookup_order"},
+         {"type": "tool_call", "name": "cancel_order"}]
+print(confirmed_before_destructive(steps), confirmed_before_destructive(steps[:2]))   # False None
 ```
 
 Illustrative release comparison over 200 eval runs:

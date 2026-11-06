@@ -211,42 +211,30 @@ flowchart TD
 
 ## Examples
 ### A destination-aware policy at the gateway
-The same input gets different treatment depending on where it is going.
+The same card number is blocked on its way to an external model and masked on its way to a log line. The
+Luhn checksum keeps order numbers out of it.
 
 ```python
 import re
 
-CARD = re.compile(r"\b\d(?:[ -]?\d){12,18}\b")   # 13-19 digits, no trailing separator
-EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+CARD = re.compile(r"\b\d(?:[ -]?\d){12,18}\b")      # 13-19 digits, spaces or dashes allowed
+POLICY = {"external_llm": "block", "log": "mask"}   # action for a card number, per destination
 
-def luhn_ok(digits: str) -> bool:
-    nums = [int(c) for c in digits][::-1]
-    total = sum(n if i % 2 == 0 else (n * 2 - 9 if n * 2 > 9 else n * 2) for i, n in enumerate(nums))
-    return total % 10 == 0
+def luhn_ok(digits):
+    return sum(sum(divmod(int(c) * (1 + i % 2), 10)) for i, c in enumerate(reversed(digits))) % 10 == 0
 
-POLICY = {  # (entity, destination) -> action
-    ("CARD", "external_llm"): "block",   ("CARD", "log"): "mask",
-    ("EMAIL", "external_llm"): "pseudonymise", ("EMAIL", "log"): "mask",
-}
+def enforce(text, dest):
+    for m in CARD.findall(text):
+        digits = re.sub(r"\D", "", m)
+        if luhn_ok(digits):                          # order numbers fail it and are left alone
+            if POLICY[dest] == "block":
+                return None
+            text = text.replace(m, "****" + digits[-4:])
+    return text
 
-def enforce(text: str, dest: str):
-    mapping, n = {}, 0
-    for m in CARD.finditer(text):
-        digits = re.sub(r"\D", "", m.group())
-        if luhn_ok(digits) and POLICY[("CARD", dest)] == "block":
-            return None, {"blocked": "CARD"}
-        if luhn_ok(digits):
-            text = text.replace(m.group(), "****" + digits[-4:])
-    for m in set(EMAIL.findall(text)):
-        if POLICY[("EMAIL", dest)] == "pseudonymise":
-            n += 1; mapping[f"<EMAIL_{n}>"] = m; text = text.replace(m, f"<EMAIL_{n}>")
-        else:
-            text = text.replace(m, m[0] + "***@" + m.split("@")[1])
-    return text, mapping   # mapping stays server-side, short TTL, never logged
-
-msg = "Refund jane.doe@example.com, card 4111 1111 1111 1111"
-print(enforce(msg, "log"))           # masked card and email for the log line
-print(enforce(msg, "external_llm"))  # (None, {'blocked': 'CARD'})
+msg = "Refund order 1234 5678 9012 3456, card 4111 1111 1111 1111"
+print(enforce(msg, "log"))           # Refund order 1234 5678 9012 3456, card ****1111
+print(enforce(msg, "external_llm"))  # None (blocked)
 ```
 
 - **Why the checksum matters:** `4111 1111 1111 1111` is a well-known test card number that passes Luhn;
@@ -263,14 +251,13 @@ import re, time
 class Pseudonymiser:
     """One per conversation: the same value maps to the same placeholder in every turn."""
     def __init__(self, ttl_s=900):
-        self.fwd, self.rev, self.counts = {}, {}, {}
+        self.fwd, self.rev = {}, {}
         self.expires = time.time() + ttl_s
 
     def mask(self, text, spans):              # spans: [(entity_type, value)] from your detectors
         for etype, value in spans:
             if value not in self.fwd:
-                self.counts[etype] = self.counts.get(etype, 0) + 1
-                ph = f"{etype}_{self.counts[etype]}"
+                ph = f"{etype}_{sum(k.startswith(etype + '_') for k in self.rev) + 1}"
                 self.fwd[value], self.rev[ph] = ph, value
             text = text.replace(value, self.fwd[value])
         return text
@@ -281,12 +268,9 @@ class Pseudonymiser:
         return re.sub(r"\b[A-Z]+_\d+\b", lambda m: self.rev.get(m.group(), m.group()), text)
 
 p = Pseudonymiser()
-print(p.mask("Jane Doe (jane@example.com) wants a refund", [("PERSON", "Jane Doe"), ("EMAIL", "jane@example.com")]))
-print(p.mask("Did Jane Doe confirm?", [("PERSON", "Jane Doe")]))   # still PERSON_1
-print(p.unmask("I have emailed PERSON_1 at EMAIL_1."))
-# PERSON_1 (EMAIL_1) wants a refund
-# Did PERSON_1 confirm?
-# I have emailed Jane Doe at jane@example.com.
+print(p.mask("Jane Doe wants a refund", [("PERSON", "Jane Doe")]))  # PERSON_1 wants a refund
+print(p.mask("Did Jane Doe confirm?", [("PERSON", "Jane Doe")]))    # Did PERSON_1 confirm?
+print(p.unmask("I have refunded PERSON_1."))                         # I have refunded Jane Doe.
 ```
 
 - **The mapping object is itself a sensitive store:** keep it in memory or a short-TTL cache, never in
@@ -298,31 +282,21 @@ inside your boundary get real values at dispatch; tools outside it must never re
 tool result is masked before it re-enters the context.
 
 ```python
-import re
-
-EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
-INTERNAL = {"lookup_customer", "send_customer_email"}      # run inside your boundary
-
-def detect(text):                                           # stand-in for your real detectors
-    return [("EMAIL", e) for e in EMAIL.findall(text)]
+EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")   # stand-in for your real detectors
+INTERNAL = {"lookup_customer", "send_customer_email"}  # run inside your boundary
 
 def call_tool(p, name, args, tools):
-    if name in INTERNAL:                                     # real values only inside the boundary
-        args = {k: p.unmask(v) if isinstance(v, str) else v for k, v in args.items()}
-    elif any(detect(str(v)) for v in args.values()):
+    if name in INTERNAL:                                # real values only inside the boundary
+        args = {k: p.unmask(v) for k, v in args.items()}
+    elif any(EMAIL.search(v) for v in args.values()):
         raise PermissionError("raw PII in arguments to an external tool")
     result = tools[name](**args)
-    return p.mask(result, detect(result))                    # results re-enter context pseudonymised
-
-tools = {
-    "lookup_customer": lambda order_id: f"order {order_id} belongs to jane@example.com",
-    "send_customer_email": lambda to, body: f"sent to {to}",
-}
+    return p.mask(result, [("EMAIL", e) for e in EMAIL.findall(result)])  # re-enters context masked
+tools = {"lookup_customer": lambda order_id: f"order {order_id} belongs to jane@example.com",
+         "send_customer_email": lambda to: f"sent to {to}"}
 p = Pseudonymiser()
-print(call_tool(p, "lookup_customer", {"order_id": "4411"}, tools))   # order 4411 belongs to EMAIL_1
-# the model only ever saw EMAIL_1, so that is what it proposes as the recipient:
-print(call_tool(p, "send_customer_email", {"to": "EMAIL_1", "body": "Refund sent"}, tools))
-# sent to EMAIL_1  (the real address was used inside the tool, then masked again)
+print(call_tool(p, "lookup_customer", {"order_id": "4411"}, tools))  # order 4411 belongs to EMAIL_1
+print(call_tool(p, "send_customer_email", {"to": "EMAIL_1"}, tools)) # sent to EMAIL_1 (real address used inside)
 ```
 
 - **Traces stay clean for free,** because the context the framework logs only ever holds placeholders.

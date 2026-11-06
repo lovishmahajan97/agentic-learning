@@ -430,14 +430,14 @@ sequenceDiagram
 ```
 
 ## Examples
-### SDK setup and an application span around a model call
+### SDK setup loaded before the app
 `instrumentation.ts` configures the SDK and is loaded before the app with
 `node --import ./instrumentation.js app.js` (for a CommonJS build, use `--require` and drop the two
 `register` lines, which only an ES module can run).
 
-The second block shows an application span around a model call; the Anthropic SDK's own
-`anthropic.messages.create` span, with token usage, nests under it automatically because the SDK uses
-the registered provider.
+Once it has started, the Anthropic SDK's own
+`anthropic.messages.create` span, with token usage, nests under whatever span of yours is active, because
+the SDK uses the registered provider.
 
 ```ts
 // instrumentation.ts — loaded first, never imported by application code except for shutdown
@@ -452,36 +452,15 @@ export const sdk = new NodeSDK({
   instrumentations: [getNodeAutoInstrumentations({ "@opentelemetry/instrumentation-fs": { enabled: false } })],
 });
 sdk.start();                                          // registers the provider and the AsyncLocalStorage context manager
-
-// llm.ts — your span carries app semantics; the SDK span carries gen_ai.* usage
-import { trace, SpanStatusCode } from "@opentelemetry/api";
-import Anthropic from "@anthropic-ai/sdk";
-const tracer = trace.getTracer("agent-api");
-const client = new Anthropic();                       // SDK tracing on by default, metadata only: no prompt text exported
-
-export async function plan(tenant: string, runId: string, prompt: string) {
-  return tracer.startActiveSpan("agent.plan", async (span) => {
-    span.setAttributes({ "app.tenant": tenant, "app.run_id": runId, "app.prompt_version": "planner-v7" });
-    try {
-      const res = await client.messages.create(
-        { model: process.env.MODEL ?? "claude-opus-5-5", max_tokens: 16000, messages: [{ role: "user", content: prompt }] },
-        { openTelemetry: { conversationId: runId } },   // written to gen_ai.conversation.id on the SDK span
-      );
-      span.setAttribute("app.stop_reason", res.stop_reason ?? "unknown");
-      return res.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
-    } catch (e: any) {
-      span.recordException(e); span.setStatus({ code: SpanStatusCode.ERROR, message: e.message });
-      throw e;
-    } finally {
-      span.end();                                     // always end, or the span never exports
-    }
-  });
-}
 ```
 
 ### Agent scenario: one span per run, step and tool call
-The run span holds totals; each step span holds that step's tokens and tool count; each tool span holds
-the tool name and whether it returned an error. A slow or looping run then reads as a waterfall.
+The run span holds totals; each step span holds that step's tokens; each tool span holds the tool name.
+A slow or looping run then reads as a waterfall.
+
+`callModel` and `callTool` are your own code; a span
+that throws is marked ERROR, so `callTool` should throw only on failures you want to end the run, and
+return ordinary tool errors to the model as results.
 
 ```ts
 import { trace, SpanStatusCode, type Span } from "@opentelemetry/api";
@@ -491,26 +470,21 @@ async function inSpan<T>(name: string, attrs: Record<string, string | number>, f
   return tracer.startActiveSpan(name, { attributes: attrs }, async (span) => {
     try { return await fn(span); }
     catch (e: any) { span.recordException(e); span.setStatus({ code: SpanStatusCode.ERROR }); throw e; }
-    finally { span.end(); }
+    finally { span.end(); }                                      // always end, or the span never exports
   });
 }
 
-export function runAgent(runId: string, tenant: string, task: string) {
+export function runAgent(runId: string, tenant: string) {
   return inSpan("agent.run", { "app.run_id": runId, "app.tenant": tenant, "app.prompt_version": "agent-v3" }, async (run) => {
     let tokens = 0;
     for (let step = 0; step < 20; step++) {
       const turn = await inSpan("agent.step", { "app.step": step }, async (s) => {
         const t = await callModel(runId, step);                  // SDK model-call span nests here
-        s.setAttributes({ "app.tool_calls": t.toolCalls.length, "app.step_tokens": t.inputTokens + t.outputTokens });
-        for (const c of t.toolCalls) {
-          await inSpan(`tool.${c.name}`, { "app.tool": c.name }, async (ts) => {
-            const r = await callTool(c);                         // returns { content, isError }
-            ts.setAttribute("app.tool_error", r.isError ? 1 : 0);
-          });
-        }
+        s.setAttribute("app.step_tokens", t.tokens);
+        for (const name of t.toolCalls) await inSpan(`tool.${name}`, { "app.tool": name }, () => callTool(name));
         return t;
       });
-      tokens += turn.inputTokens + turn.outputTokens;
+      tokens += turn.tokens;
       if (turn.toolCalls.length === 0) break;
     }
     run.setAttribute("app.total_tokens", tokens);
@@ -526,27 +500,21 @@ Without the opt-in `telemetry` option, the producer writes `traceparent` into th
 worker restores it, so the worker's `CONSUMER` span becomes a child of the API request.
 
 ```ts
-import { context, propagation, trace, SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import { context, propagation, trace, SpanKind } from "@opentelemetry/api";
 import { Queue, Worker } from "bullmq";
 const tracer = trace.getTracer("agent-worker");
 
-// producer (API process)
-export async function enqueueRun(queue: Queue, runId: string) {
+export async function enqueueRun(queue: Queue, runId: string) {          // producer (API process)
   const carrier: Record<string, string> = {};
   propagation.inject(context.active(), carrier);          // writes traceparent (and tracestate if set)
   await queue.add("run", { runId, otel: carrier }, { jobId: `run-${runId}` });
 }
 
-// consumer (worker process)
-export const worker = new Worker("runs", async (job) => {
+export const worker = new Worker("runs", async (job) => {               // consumer (worker process)
   const parent = propagation.extract(context.active(), job.data.otel ?? {});
   return context.with(parent, () =>
     tracer.startActiveSpan("run.process", { kind: SpanKind.CONSUMER, attributes: { "app.run_id": job.data.runId } },
-      async (span) => {
-        try { return await processRun(job.data.runId); }
-        catch (e: any) { span.recordException(e); span.setStatus({ code: SpanStatusCode.ERROR }); throw e; }
-        finally { span.end(); }
-      }));
+      (span) => processRun(job.data.runId).finally(() => span.end())));
 }, { connection });                                         // connection: your ioredis instance or options
 ```
 
@@ -587,6 +555,14 @@ to collector capacity.
   sampling. Watch attribute cardinality: tenant ids are fine, run ids are not.
 - **Correlate logs automatically.** Enable the Pino instrumentation (`@opentelemetry/instrumentation-pino`)
   so every line carries `trace_id` and `span_id`. Monitor the share of error logs that have a trace id.
+- **Wrap each model call in an application span.** Start your own span (`agent.plan`) with tenant, run id
+  and prompt version, record `stop_reason` on it, call `recordException` plus `setStatus(ERROR)` in a
+  `catch` and `span.end()` in `finally`; the Anthropic SDK's span nests under it. Its per-request
+  `openTelemetry: { conversationId: runId }` option writes `gen_ai.conversation.id` on the SDK span, and
+  SDK tracing stays metadata-only (no prompt text) unless you opt in.
+- **Mark failed jobs on the consumer span.** In the worker, call `span.recordException(e)` and
+  `span.setStatus({ code: SpanStatusCode.ERROR })` before rethrowing, then end the span, or error-based
+  tail sampling never keeps the traces of failed jobs.
 
 ## Trade-offs
 - **Zero-code coverage vs control.** Auto-instrumentation gives HTTP, DB and Redis spans with no code

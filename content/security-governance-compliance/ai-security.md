@@ -222,47 +222,36 @@ flowchart TD
   they are checked in code the model cannot reach.
 
 ```python
-from dataclasses import dataclass, field
-
-@dataclass
-class Turn:
-    user_id: str
-    tainted: bool = False                       # set once any untrusted content entered the context
-    approvals: set = field(default_factory=set)  # (tool, args) pairs a human has approved
-
-TOOLS = {
-    "search_tickets": {"effect": "read"},
-    "read_url":       {"effect": "read", "taints": True},
-    "send_email":     {"effect": "external"},
-    "issue_refund":   {"effect": "external", "max_amount": 200},
-}
+TOOLS = {"read_url":     {"effect": "read", "taints": True},
+         "send_email":   {"effect": "external"},
+         "issue_refund": {"effect": "external", "max_amount": 200}}
 ALLOWED_DOMAINS = {"example.com"}
 
-def dispatch(name, args):                       # real tool implementations live behind this
-    return {"ok": True}
+class Turn:
+    def __init__(self, user_id):
+        self.user_id, self.tainted, self.approvals = user_id, False, set()
 
 def run_tool(turn: Turn, name: str, args: dict, approve):
     spec = TOOLS[name]
     if name == "send_email" and args["to"].rsplit("@", 1)[-1] not in ALLOWED_DOMAINS:
-        raise PermissionError("recipient outside allowlist")     # exfiltration channel closed regardless of model
+        raise PermissionError("recipient outside allowlist")  # code the model cannot reach
     if name == "issue_refund" and args["amount"] > spec["max_amount"]:
-        raise PermissionError("amount above tool ceiling")        # the model cannot talk its way past this
-    key = (name, tuple(sorted(args.items())))
+        raise PermissionError("amount above tool ceiling")
+    key = (name, tuple(sorted(args.items())))                  # approve this call, not the tool
     if spec["effect"] == "external" and turn.tainted and key not in turn.approvals:
-        if not approve(turn.user_id, name, args):                 # a human sees the actual arguments
+        if not approve(turn.user_id, name, args):              # a human sees the actual arguments
             raise PermissionError("not approved")
-        turn.approvals.add(key)                                   # this call only, not the whole tool
-    result = dispatch(name, args)
+        turn.approvals.add(key)
     if spec.get("taints"):
-        turn.tainted = True                                       # everything after this is suspect
-    return result
+        turn.tainted = True                                    # everything after this is suspect
+    return {"ok": True}                                        # real tool dispatch goes here
 
-t = Turn(user_id="u42")
-run_tool(t, "read_url", {"url": "https://example.com/faq"}, approve=lambda *a: False)
+t = Turn("u42")
+run_tool(t, "read_url", {"url": "https://example.com/faq"}, approve=None)
 try:
     run_tool(t, "send_email", {"to": "x@example.com", "body": "hi"}, approve=lambda *a: False)
 except PermissionError as e:
-    print(e)   # "not approved": the turn read untrusted content, so sending needs a human
+    print(e)   # not approved: the turn read untrusted content, so sending needs a human
 ```
 
 Two design choices are worth noticing:

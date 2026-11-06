@@ -379,59 +379,40 @@ flowchart TD
 ```
 
 ## Examples
-### Resolver: file mount or manager, TTL refresh and log redaction
-A small resolver that reads a secret from a mounted file when one exists (Vault agent or CSI driver),
-otherwise from AWS Secrets Manager using the pod's or instance's ambient IAM identity. It re-reads after a
-TTL so rotations take effect without restarts, and installs a logging filter that redacts the value.
+### Resolver: TTL refresh and refetch on 401
+A small resolver that reads a secret from AWS Secrets Manager using the pod's or instance's ambient IAM
+identity, caches it for a TTL so rotations take effect without restarts, and refetches once on a 401.
 
 ```python
-import logging, os, time, boto3
+import time, boto3
 from requests import post
 
 class Secrets:
     """No static credential anywhere: boto3 picks up the IAM role from the environment (IRSA / instance profile)."""
-    def __init__(self, mount="/var/run/secrets/app", ttl_s=300):
-        self.mount, self.ttl_s, self._cache = mount, ttl_s, {}
+    def __init__(self, ttl_s=300):
+        self.ttl_s, self._cache = ttl_s, {}
         self._sm = boto3.client("secretsmanager")
 
     def get(self, name: str, force=False) -> str:
         hit = self._cache.get(name)
         if hit and not force and time.monotonic() - hit[1] < self.ttl_s:
-            return hit[0]
-        path = os.path.join(self.mount, name.replace("/", "_"))
-        if os.path.exists(path):                                   # file mount rotates in place
-            value = open(path).read().strip()
-        else:                                                      # manager call, audited per identity
-            value = self._sm.get_secret_value(SecretId=name)["SecretString"]
+            return hit[0]                                          # cheap: served from cache until ttl
+        value = self._sm.get_secret_value(SecretId=name)["SecretString"]   # audited per identity
         self._cache[name] = (value, time.monotonic())
         return value
 
-class Redact(logging.Filter):
-    def __init__(self, values): super().__init__(); self.values = [v for v in values if v]
-    def filter(self, record):
-        msg = record.getMessage()
-        if any(v in msg for v in self.values):
-            for v in self.values: msg = msg.replace(v, "[REDACTED]")
-            record.msg, record.args = msg, ()
-        return True
-
 secrets = Secrets()
-LLM_KEY = secrets.get("prod/llm-gateway/api-key")        # per-service key with a spend cap
-logging.basicConfig(level=logging.INFO)
-for h in logging.getLogger().handlers:                   # on handlers: logger filters skip propagated records
-    h.addFilter(Redact([LLM_KEY]))                       # re-register with the new value after a rotation
 
 def call_provider(payload):
-    key = secrets.get("prod/llm-gateway/api-key")        # cheap: served from cache until ttl
-    r = post("https://llm-gateway.internal/v1/chat", json=payload, headers={"Authorization": f"Bearer {key}"})
-    if r.status_code == 401:                             # rotated under us: refetch once, then retry
-        key = secrets.get("prod/llm-gateway/api-key", force=True)
+    for force in (False, True):                          # rotated under us: refetch once, then retry
+        key = secrets.get("prod/llm-gateway/api-key", force=force)
         r = post("https://llm-gateway.internal/v1/chat", json=payload, headers={"Authorization": f"Bearer {key}"})
+        if r.status_code != 401:
+            break
     return r
 ```
 
-- **On rotation** the file mount updates or the next TTL expiry refetches; the 401 branch covers the window
-  in between.
+- **On rotation** the next TTL expiry refetches; the 401 branch covers the window in between.
 - **Nothing** in the repository, image or environment contains the value.
 
 ### Worked scenario: a rotation that caused an outage, and the fixed plan
@@ -444,38 +425,6 @@ boot. The figures are illustrative.
 | Fixed: create, store as pending, verify, promote, wait, revoke (steps 1 to 6) | Consumers move over on their next refresh; revoke only after TTL plus the longest restart time |
 | Better: per-service credentials | One service's rotation cannot break the other eleven |
 | Best where possible: dynamic database users | Each workload gets its own user with a TTL; no shared password to rotate |
-
-### Build secrets and CI federation instead of stored keys
-A BuildKit secret mount for a private package index, and a GitHub Actions job that gets cloud credentials
-from OIDC instead of a stored key.
-
-```dockerfile
-# syntax=docker/dockerfile:1
-# build with: docker build --secret id=pip_token,src=./pip_token.txt .
-FROM python:3.12-slim
-COPY requirements.txt .
-# the token exists only during this RUN step and is never written to a layer
-RUN --mount=type=secret,id=pip_token \
-    PIP_INDEX_URL="https://__token__:$(cat /run/secrets/pip_token)@pypi.internal/simple" \
-    pip install -r requirements.txt
-```
-
-```yaml
-on:
-  push: {branches: [main]}   # the role's trust policy accepts only this branch
-permissions:
-  id-token: write        # lets the job request an OIDC token
-  contents: read
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::123456789012:role/deploy-main   # trusts only repo:org/app:ref:refs/heads/main
-          aws-region: us-east-1
-      - run: aws sts get-caller-identity   # temporary credentials (1 hour by default)
-```
 
 ### Agent tool runtime: credentials by reference, output scrubbed
 The model asks for `crm.search` for tenant `acme`; the runtime resolves the token by tenant, calls the API
@@ -538,6 +487,15 @@ developer notebook. The notebook is pushed to a public repo. Figures are illustr
 - **Redact before traces leave the process.** Apply the same redaction filter to the trace exporter as to
   logs, so prompts, tool calls and headers sent to observability or eval vendors carry no secrets. Run a
   scanner over a sample of stored traces weekly and count findings.
+- **Prefer a mounted secret file when one exists.** A Vault agent or CSI driver mount rotates in place;
+  fall back to the manager API only when no file is present.
+- **Attach log redaction filters to handlers, not loggers.** Logger filters skip propagated records; re-register
+  the filter with the new value after a rotation.
+- **Build secrets via BuildKit mounts.** `RUN --mount=type=secret,id=...` (build with
+  `docker build --secret id=...,src=...`) exposes the token only for that step and never writes it to a layer.
+- **CI cloud access via OIDC, not stored keys.** In GitHub Actions grant `id-token: write`, use
+  `aws-actions/configure-aws-credentials@v4` with `role-to-assume`, and make the role's trust policy accept
+  only `repo:org/app:ref:refs/heads/main`; credentials are temporary (1 hour by default).
 
 ## Trade-offs
 - **Central manager vs startup dependency.** One place to rotate and audit, but a runtime dependency on

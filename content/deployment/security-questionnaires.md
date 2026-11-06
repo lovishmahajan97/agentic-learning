@@ -247,9 +247,6 @@ LIBRARY = [
     {"id": "ENC-03", "q": "is data encrypted at rest with customer managed keys",
      "answer": "Partially. Provider-managed keys; customer-managed keys on the dedicated tier.",
      "owner": "infra", "evidence": "SOC 2 report, tier matrix", "reviewed": date(2025, 9, 15)},
-    {"id": "RET-02", "q": "do you retain prompts and responses",
-     "answer": "Yes, 30 days for debugging, access-restricted, deletable on request.",
-     "owner": "security", "evidence": "retention policy, trace config", "reviewed": date(2026, 8, 20)},
 ]
 
 def words(text):

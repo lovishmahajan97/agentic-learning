@@ -219,35 +219,23 @@ Group every attempt by task ID, charge failed runs, escalations and silent error
 accepted tasks. The rows are illustrative; in production they come from your trace export.
 
 ```python
-from collections import defaultdict
-
-# One row per agent attempt, exported from traces (illustrative values).
+# One row per agent attempt, exported from traces: (task, cost, outcome). Illustrative values.
 attempts = [
-    {"task": "T1", "cost": 0.31, "verifier_pass": True,  "accepted": True},
-    {"task": "T2", "cost": 0.95, "verifier_pass": False, "accepted": False},  # looped, caught
-    {"task": "T2", "cost": 0.40, "verifier_pass": True,  "accepted": True},   # retry worked
-    {"task": "T3", "cost": 2.10, "verifier_pass": False, "accepted": False},  # hit step cap
-    {"task": "T4", "cost": 0.28, "verifier_pass": True,  "accepted": False},  # silent error
+    ("T1", 0.31, "accepted"),
+    ("T2", 0.95, "caught"),     # looped, verifier rejected it
+    ("T2", 0.40, "accepted"),   # retry worked
+    ("T3", 2.10, "caught"),     # hit step cap; escalated, a human finished it
+    ("T4", 0.28, "silent"),     # passed the verifier but was wrong
 ]
-HUMAN, ERROR = 4.00, 20.00                     # $ per escalation, $ per silent error
+HUMAN, ERROR = 4.00, 20.00      # $ per escalation, $ per silent error
 
-tasks = defaultdict(list)
-for a in attempts:
-    tasks[a["task"]].append(a)
+final = list({t: o for t, _, o in attempts}.values())  # last outcome per task
+ai = sum(cost for _, cost, _ in attempts)              # every attempt counts, failed ones too
+total = ai + HUMAN * final.count("caught") + ERROR * final.count("silent")
+successes = len(final) - final.count("silent")         # escalated tasks count once a human finishes
 
-total = successes = 0.0
-for rows in tasks.values():
-    total += sum(r["cost"] for r in rows)      # every attempt counts, failed ones too
-    last = rows[-1]
-    if last["accepted"]:
-        successes += 1
-    elif last["verifier_pass"]:
-        total += ERROR                         # passed the verifier but was wrong
-    else:
-        total += HUMAN; successes += 1         # escalated, a human finished it
-
-print(f"AI spend ${sum(a['cost'] for a in attempts):.2f}, fully loaded ${total:.2f}")
-print(f"cost per successful task ${total / successes:.2f} over {successes:.0f} successes")
+print(f"AI spend ${ai:.2f}, fully loaded ${total:.2f}")
+print(f"cost per successful task ${total / successes:.2f} over {successes} successes")
 # AI spend $4.04, fully loaded $28.04
 # cost per successful task $9.35 over 3 successes
 ```

@@ -166,46 +166,34 @@ a step budget bounds the loop. `db` and `payments` stand for your own services.
 
 ```python
 import json, anthropic
-
 client = anthropic.Anthropic()
-TOOLS = [
-    {"name": "get_order", "strict": True,
-     "description": "Look up an order by id. Call this before answering any question about an order's status, items or refund eligibility.",
-     "input_schema": {"type": "object", "properties": {"order_id": {"type": "string", "description": "e.g. ORD-10422"}},
-                      "required": ["order_id"], "additionalProperties": False}},
-    {"name": "issue_refund", "strict": True,
-     "description": "Refund an order. Only call after get_order shows the order is eligible.",
-     "input_schema": {"type": "object", "properties": {"order_id": {"type": "string"}, "amount_cents": {"type": "integer"}},
-                      "required": ["order_id", "amount_cents"], "additionalProperties": False}},
-]
+def schema(**props):    # strict mode needs additionalProperties: False
+    return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
+TOOLS = [{"name": "get_order", "strict": True, "input_schema": schema(order_id={"type": "string"}),
+          "description": "Look up an order by id. Call this before answering any question about an order."},
+         {"name": "issue_refund", "strict": True,
+          "input_schema": schema(order_id={"type": "string"}, amount_cents={"type": "integer"}),
+          "description": "Refund an order. Only call after get_order shows the order is eligible."}]
 
-def run_tool(name, args):                                   # your code: validation, policy, side effects
-    if name == "get_order":
-        return json.dumps(db.get_order(args["order_id"]))
-    if name == "issue_refund":
-        if args["amount_cents"] > 50_00:                    # policy lives here, where a prompt cannot override it
-            return {"error": "amount above auto-approval limit; escalate to a human"}
-        return json.dumps(payments.refund(args["order_id"], args["amount_cents"]))
-    return {"error": f"unknown tool {name}"}               # never return None as a tool result
+def run_tool(b):                       # your code; b.input is parsed JSON already
+    if b.name == "issue_refund" and b.input["amount_cents"] > 50_00:   # policy lives here, not in the prompt
+        return {"type": "tool_result", "tool_use_id": b.id, "is_error": True,
+                "content": "amount above auto-approval limit; escalate to a human"}
+    out = db.get_order(b.input["order_id"]) if b.name == "get_order" else payments.refund(**b.input)
+    return {"type": "tool_result", "tool_use_id": b.id, "content": json.dumps(out)}
 
 def chat(user_text, max_steps=6):
     messages = [{"role": "user", "content": user_text}]
-    for _ in range(max_steps):
-        r = client.messages.create(model="claude-opus-5-5", max_tokens=4096,  # thinking counts too
-                                   system="You are a support agent for Acme.", tools=TOOLS, messages=messages)
+    for _ in range(max_steps):                                          # step budget bounds the loop
+        r = client.messages.create(model="claude-opus-5-5", max_tokens=4096, tools=TOOLS,
+                                   system="You are a support agent for Acme.", messages=messages)
         messages.append({"role": "assistant", "content": r.content})   # keep tool_use blocks verbatim
         if r.stop_reason == "end_turn":
             return next((b.text for b in r.content if b.type == "text"), "")
-        if r.stop_reason != "tool_use":                                    # max_tokens, refusal, ...
-            raise RuntimeError(f"unusable stop: {r.stop_reason}")          # never treat as success
-        results = []
-        for b in r.content:
-            if b.type == "tool_use":
-                out = run_tool(b.name, b.input)                            # b.input is parsed JSON already
-                err = isinstance(out, dict) and "error" in out
-                results.append({"type": "tool_result", "tool_use_id": b.id,
-                                "content": json.dumps(out) if err else out, "is_error": err})
-        messages.append({"role": "user", "content": results})             # all results in ONE user message
+        if r.stop_reason != "tool_use":                                 # max_tokens, refusal: never success
+            raise RuntimeError(f"unusable stop: {r.stop_reason}")
+        results = [run_tool(b) for b in r.content if b.type == "tool_use"]
+        messages.append({"role": "user", "content": results})          # all results in ONE user message
     raise RuntimeError("step budget exhausted")
 ```
 
@@ -237,27 +225,25 @@ REFUND_LIMIT_CENTS = 50_00
 _refunds = {}                     # order_id -> record; stands in for a DB unique constraint
 
 def execute(call: dict, seen_ids: set) -> dict:
-    """Run one tool_use block; always return a tool_result, never raise into the loop."""
-    try:
-        if call["name"] != "issue_refund":
-            raise LookupError(f"unknown tool {call['name']}")
-        oid, amt = call["input"]["order_id"].strip(), call["input"]["amount_cents"]
-        if oid not in seen_ids:
-            raise ValueError(f"{oid} never appeared in the conversation; ask the user for the id")
-        if not isinstance(amt, int) or amt <= 0:
-            raise ValueError("amount_cents must be a positive integer")
-        if amt > REFUND_LIMIT_CENTS:
-            raise PermissionError("amount above auto-approval limit; escalate to a human")
+    """Run one issue_refund tool_use block; every path returns a tool_result, never an exception."""
+    args = call.get("input", {})
+    oid, amt = str(args.get("order_id", "")).strip(), args.get("amount_cents")
+    if oid not in seen_ids:
+        err = f"{oid} never appeared in the conversation; ask the user for the id"
+    elif not isinstance(amt, int) or amt <= 0:
+        err = "amount_cents must be a positive integer"
+    elif amt > REFUND_LIMIT_CENTS:
+        err = "amount above auto-approval limit; escalate to a human"
+    else:
         record = _refunds.setdefault(oid, {"order_id": oid, "amount_cents": amt})  # one refund per order
         return {"type": "tool_result", "tool_use_id": call["id"], "content": json.dumps(record)}
-    except (KeyError, LookupError, ValueError, PermissionError) as e:
-        return {"type": "tool_result", "tool_use_id": call["id"], "content": str(e), "is_error": True}
+    return {"type": "tool_result", "tool_use_id": call["id"], "content": err, "is_error": True}
 
 seen = {"ORD-10422"}
 for i, (oid, amt) in enumerate([("ORD-10422", 3999), ("ORD-10422 ", 3999),
                                 ("ORD-10422", 7500), ("ORD-00001", 1000)], 1):
-    print(execute({"id": f"toolu_0{i}", "name": "issue_refund",
-                   "input": {"order_id": oid, "amount_cents": amt}}, seen))
+    r = execute({"id": f"toolu_0{i}", "input": {"order_id": oid, "amount_cents": amt}}, seen)
+    print(r.get("is_error", False), r["content"][:40])   # False, False (replay), True, True
 print(len(_refunds), "refund(s) issued")   # 1: duplicate replayed, 7500 escalated, ORD-00001 rejected
 ```
 
@@ -279,6 +265,8 @@ print(len(_refunds), "refund(s) issued")   # 1: duplicate replayed, 7500 escalat
   budget-exhausted runs.
 - **Sanitised error results.** Return a short, actionable message ("amount above auto-approval limit")
   and keep stack traces and secrets in server logs only.
+- **Every call gets a result.** Answer unknown tool names with an `is_error` result rather than `None`
+  or an exception, and leave `max_tokens` headroom (for example 4096), since thinking counts toward it.
 
 ## Trade-offs
 - **Native calling vs portability.** Reliable structure, parallel calls and a distinct stop reason, but a

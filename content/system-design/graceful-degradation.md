@@ -215,98 +215,40 @@ stateDiagram-v2
 ```
 
 ## Examples
-### Agent configuration per degradation level
-The level is read once at run start and mapped to a config the agent loop obeys. Write tools go first;
-the user always gets a labelled result. Model aliases and tool names are placeholders.
-
-```python
-from dataclasses import dataclass
-
-@dataclass(frozen=True)
-class AgentMode:
-    model: str
-    max_steps: int
-    tools: frozenset
-    label: str | None
-
-READ = frozenset({"search_kb", "get_order"})
-WRITE = frozenset({"issue_refund", "send_email"})
-MODES = {
-    0: AgentMode("strong", 15, READ | WRITE, None),
-    1: AgentMode("fast", 5, READ | WRITE, "Reduced-quality answer"),
-    2: AgentMode("fast", 3, READ, "Read-only mode: actions are drafted for a human to approve"),
-}
-
-def mode_for_run(level):
-    return MODES.get(level)            # None: levels 3-4, no agent; show search results or a handoff
-
-def on_budget_exhausted(findings, mode):
-    """Never return nothing: return what the run gathered, labelled, with a way to continue."""
-    return {"answer": None, "partial": findings[-5:],
-            "label": f"Stopped after {mode.max_steps} steps; here is what was found so far",
-            "actions": ["continue later", "hand off to a human"]}
-```
-
-### Worked scenario: a research agent under budget pressure
-Illustrative: strong-model step ~$0.06, fast-model step ~$0.01; 2,000 runs a day; daily cap $1,500.
-
-| Mode | Steps per run | Cost per run | Daily cost at 2,000 runs |
-|---|---|---|---|
-| Level 0, full | 15 | 15 × $0.06 = $0.90 | $1,800, over the cap |
-| Level 1, reduced | 5 | 5 × $0.01 = $0.05 | $100 |
-| Mixed: paying users full (1,200 runs), free users reduced (800 runs) | | | $1,080 + $40 = $1,120, under the cap |
-
-- **Lesson:** priority shedding by tier keeps paying users at full quality all day, instead of a cliff for
-  everyone when the cap is hit.
-
 ### Support-answer endpoint with a degradation ladder
-A background task refreshes `h`, a health snapshot, every few seconds; the handler picks a level, enforces a
-deadline, and steps down rather than raising when a stage fails. `keyword_or_vector_search`, `generate`,
-`semantic_cache_lookup` and `ModelError` are your adapters.
+A background task refreshes `h`, a health snapshot, every few seconds; the handler picks a level and steps
+down rather than raising when a stage fails. `generate`, the cache dict and `docs` stand in for your model
+client, semantic cache and search results.
 
 ```python
-import asyncio, time
 from enum import IntEnum
 
 class Level(IntEnum):
-    FULL = 0; REDUCED = 1; CACHED = 2; NON_AI = 3; UNAVAILABLE = 4
+    FULL = 0; REDUCED = 1; CACHED = 2; NON_AI = 3
 
 def current_level(h):                            # h: health snapshot refreshed by a background task
-    if h.kill_switch:                                           return Level.NON_AI
-    if h.budget_used >= 1.0 or h.llm_breaker_open:              return Level.CACHED
-    if h.budget_used >= 0.8 or h.llm_p95_ms > 4000 or h.queue_depth > 200:
-        return Level.REDUCED
+    if h["kill_switch"]:                                return Level.NON_AI
+    if h["budget_used"] >= 1.0 or h["breaker_open"]:    return Level.CACHED
+    if h["budget_used"] >= 0.8 or h["p95_ms"] > 4000:   return Level.REDUCED
     return Level.FULL
 
-async def answer(q, user, h, deadline_s=6.0):
+def answer(q, h, generate, cache, docs):
     level = current_level(h)
-    if user.tier == "free" and h.queue_depth > 50:              # shed low priority first
-        level = max(level, Level.REDUCED)
-    t0 = time.monotonic()
-    try:
-        docs = await keyword_or_vector_search(q, k=20 if level == Level.FULL else 5)
-    except Exception:                                           # even the non-AI path is down
-        docs, level = [], Level.UNAVAILABLE
     if level <= Level.REDUCED:
-        full = level == Level.FULL
         try:
-            remaining = deadline_s - (time.monotonic() - t0)
-            text = await asyncio.wait_for(
-                generate("strong" if full else "small", q, docs if full else docs[:3],
-                         max_tokens=600 if full else 200), remaining)
-            return {"level": int(level), "answer": text, "sources": docs[:5],
-                    "label": None if full else "Reduced-quality answer"}
-        except (asyncio.TimeoutError, ModelError):
-            level = Level.CACHED                                # step down, do not raise
-    if level == Level.CACHED:
-        hit = await semantic_cache_lookup(q, tenant=user.tenant)
-        if hit:
-            return {"level": 2, "answer": hit.answer, "sources": hit.sources, "label": "Cached answer"}
-        level = Level.NON_AI
-    if level == Level.NON_AI:
-        return {"level": 3, "answer": None, "sources": docs[:5],
-                "label": "AI assistant unavailable; showing matching documents"}
-    return {"level": 4, "answer": None, "sources": [], "label": "Search is temporarily unavailable"}
+            return {"level": int(level), "answer": generate("strong" if level == 0 else "small", q),
+                    "label": None if level == 0 else "Reduced-quality answer"}
+        except TimeoutError:
+            level = Level.CACHED                     # step down, do not raise
+    if level == Level.CACHED and q in cache:
+        return {"level": 2, "answer": cache[q], "label": "Cached answer"}
+    return {"level": 3, "answer": None, "sources": docs[:5],
+            "label": "AI assistant unavailable; showing matching documents"}
+
+def timing_out(model, q): raise TimeoutError
+h = {"kill_switch": False, "budget_used": 0.85, "breaker_open": False, "p95_ms": 1200}
+print(answer("reset password", h, timing_out, {"reset password": "Settings > Security"}, []))
+# {'level': 2, 'answer': 'Settings > Security', 'label': 'Cached answer'}
 ```
 
 - **The `level` field in every response is the metric:** a histogram of it over time shows whether the
@@ -346,6 +288,18 @@ print(" ".join(h.update(p, 60 * i)[0] for i, p in enumerate(samples)))
 
 A single 4 s threshold on the same samples would flip F R F R F F F, which users read as randomness.
 
+### Worked scenario: a research agent under budget pressure
+Illustrative: strong-model step ~$0.06, fast-model step ~$0.01; 2,000 runs a day; daily cap $1,500.
+
+| Mode | Steps per run | Cost per run | Daily cost at 2,000 runs |
+|---|---|---|---|
+| Level 0, full | 15 | 15 × $0.06 = $0.90 | $1,800, over the cap |
+| Level 1, reduced | 5 | 5 × $0.01 = $0.05 | $100 |
+| Mixed: paying users full (1,200 runs), free users reduced (800 runs) | | | $1,080 + $40 = $1,120, under the cap |
+
+- **Lesson:** priority shedding by tier keeps paying users at full quality all day, instead of a cliff for
+  everyone when the cap is hit.
+
 ### Worked scenario: projected-burn budget trigger
 Illustrative: daily cap $500, a heavy day where spend reaches $150 by 10:00 and runs at $40 per hour.
 
@@ -374,6 +328,18 @@ Illustrative: daily cap $500, a heavy day where spend reaches $150 by 10:00 and 
 - **Level-mix SLO.** Emit the served level as a metric label on every response and agent run, and set an
   SLO on the share of sessions at Level 0, alerting on burn rate. Monitor the level histogram per tenant,
   so one noisy tenant's degradation is visible.
+- **Agent mode per level, read once at run start.** Map the level to a config the agent loop obeys, for
+  example Full: strong model, 15 steps, read and write tools; Reduced: fast model, 5 steps, labelled
+  "Reduced-quality answer"; Level 2: fast model, 3 steps, read-only with actions drafted for a human;
+  Levels 3 and 4: no agent, search results or a handoff.
+- **Never return nothing when a run hits its step budget.** Return the findings gathered so far, labelled,
+  with "continue later" and "hand off to a human" actions.
+- **Shape each request by level.** Enforce a per-request deadline (for example 6 s, with
+  `asyncio.wait_for` on the model call), retrieve fewer documents and cap output tokens below Full (for
+  example k=20 and 600 tokens at Full, 3 to 5 documents and 200 tokens at Reduced).
+- **Queue-depth triggers and a last rung.** Enter Reduced when the queue depth passes about 200, push
+  free-tier users to Reduced first once it passes about 50, and keep a Level 4 "search temporarily
+  unavailable" response for when even the non-AI path fails.
 
 ## Trade-offs
 - **Survival vs code-path cost.** The product survives incidents, but you maintain several code paths and

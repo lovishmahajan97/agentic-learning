@@ -263,9 +263,7 @@ spec:
       nodeSelector:
         nvidia.com/gpu.product: NVIDIA-L4        # label written by GPU feature discovery
       tolerations:
-      - key: nvidia.com/gpu
-        operator: Exists
-        effect: NoSchedule
+      - { key: nvidia.com/gpu, operator: Exists, effect: NoSchedule }
       initContainers:
       - name: gpu-check
         image: nvidia/cuda:12.4.1-base-ubuntu22.04   # same CUDA version as the server image
@@ -279,9 +277,8 @@ spec:
           requests: { cpu: "4", memory: 16Gi }    # CPU for tokenisation, RAM to stage weights
         volumeMounts:
         - { name: weights, mountPath: /models, readOnly: true }
-      volumes:
-      - name: weights
-        persistentVolumeClaim: { claimName: model-weights }   # NVMe-backed, not object storage
+      volumes:   # NVMe-backed, not object storage
+      - { name: weights, persistentVolumeClaim: { claimName: model-weights } }
 ```
 
 ### Cold-start calculator: storage decides ready-time

@@ -331,10 +331,8 @@ key derives from run, step and call index so a resumed step reproduces it. Stand
 on Python 3.9.
 
 ```python
-import contextvars, hashlib, logging, uuid
+import contextvars, hashlib, uuid
 from dataclasses import asdict, dataclass, replace
-
-log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Ids:
@@ -345,11 +343,9 @@ class Ids:
     run_id: str = ""                      # minted by the server per attempt
     attempt: int = 1
     step: int = 0
-    trace_id: str = ""
 
     def idem_key(self, call_index: int) -> str:     # identical on resume of this step
-        raw = f"{self.run_id}:{self.step}:{call_index}"
-        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+        return hashlib.sha256(f"{self.run_id}:{self.step}:{call_index}".encode()).hexdigest()[:32]
 
     def fields(self) -> dict:
         return {k: v for k, v in asdict(self).items() if v != ""}   # keep step=0
@@ -361,19 +357,10 @@ def start_run(ids: Ids, attempt: int = 1) -> Ids:
     CURRENT.set(run)
     return run
 
-def next_step() -> Ids:
-    ids = replace(CURRENT.get(), step=CURRENT.get().step + 1)
-    CURRENT.set(ids)
-    return ids
-
 def call_tool(tool, name, args, call_index):
-    ids = CURRENT.get()
-    headers = {"X-Run-Id": ids.run_id,             # correlation only, never authorization
-               "Idempotency-Key": ids.idem_key(call_index)}
-    # the trace context travels as the W3C `traceparent` header; let the OpenTelemetry
-    # propagator inject it (propagate.inject(headers)) rather than inventing a header
-    log.info("tool_call", extra={"tool": name, **ids.fields()})
-    return tool(name, args, headers=headers)
+    ids = CURRENT.get()    # OpenTelemetry's propagate.inject(headers) would add W3C traceparent
+    headers = {"X-Run-Id": ids.run_id, "Idempotency-Key": ids.idem_key(call_index)}
+    return tool(name, args, headers=headers)    # X-Run-Id is for correlation, never authorization
 ```
 
 ### Worked trace: retry, resume, regenerate

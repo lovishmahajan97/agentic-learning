@@ -234,19 +234,18 @@ gate is in the code path, not in a wiki.
 
 ```python
 from dataclasses import dataclass
-from typing import Optional
 
 @dataclass(frozen=True)
 class Policy:
     blocked_topics: frozenset = frozenset()
     redact_pii: frozenset = frozenset()
-    allowed_tools: Optional[frozenset] = None     # None = no restriction at this layer
+    allowed_tools: "frozenset | None" = None      # None = no restriction at this layer
     max_refund: float = float("inf")
     requested_exceptions: frozenset = frozenset() # e.g. {"dosage"}; inert until approved
 
 APPROVED = {"pharma-co": frozenset({"dosage"})}   # owned by platform policy, change-controlled
 
-def merge(tenant: str, *layers: Policy) -> Policy:
+def merge(tenant, *layers):
     tools = [l.allowed_tools for l in layers if l.allowed_tools is not None]
     asked = frozenset().union(*(l.requested_exceptions for l in layers))
     granted = asked & APPROVED.get(tenant, frozenset())          # unapproved asks are ignored
@@ -254,20 +253,16 @@ def merge(tenant: str, *layers: Policy) -> Policy:
         blocked_topics=frozenset().union(*(l.blocked_topics for l in layers)) - granted,
         redact_pii=frozenset().union(*(l.redact_pii for l in layers)),   # blocklists union
         allowed_tools=frozenset.intersection(*tools) if tools else None,  # allowlists intersect
-        max_refund=min(l.max_refund for l in layers),                     # limits take the min
-    )
+        max_refund=min(l.max_refund for l in layers))                     # limits take the min
 
 PLATFORM = Policy(blocked_topics=frozenset({"weapons", "dosage"}), redact_pii=frozenset({"ssn"}))
-ACME     = Policy(redact_pii=frozenset({"iban"}), max_refund=50.0,
-                  allowed_tools=frozenset({"lookup_order", "issue_refund", "escalate_to_human"}),
-                  requested_exceptions=frozenset({"dosage"}))   # asks, but is not approved
+ACME = Policy(redact_pii=frozenset({"iban"}), max_refund=50.0, requested_exceptions=frozenset({"dosage"}),
+              allowed_tools=frozenset({"lookup_order", "issue_refund", "escalate_to_human"}))
 ACME_FAQ = Policy(allowed_tools=frozenset({"lookup_order"}), max_refund=100.0)
-
 p = merge("acme", PLATFORM, ACME, ACME_FAQ)
 print(sorted(p.blocked_topics), p.allowed_tools, p.max_refund)
 # ['dosage', 'weapons'] frozenset({'lookup_order'}) 50.0
-print(sorted(merge("pharma-co", PLATFORM, Policy(requested_exceptions=frozenset({"dosage"}))).blocked_topics))
-# ['weapons']
+print(sorted(merge("pharma-co", PLATFORM, Policy(requested_exceptions=frozenset({"dosage"}))).blocked_topics))  # ['weapons']
 ```
 
 Read the output against the rules:

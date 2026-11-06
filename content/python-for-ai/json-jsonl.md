@@ -306,9 +306,9 @@ flowchart TD
 ```
 
 ## Examples
-### Parse tool-call arguments, run the tool, log the step as JSONL
-The model's arguments are untrusted JSON; validate them, feed errors back to the model, and append each
-step to a trace file.
+### Parse tool-call arguments, return errors to the model
+The model's arguments are untrusted JSON; validate them and turn any failure into a JSON tool result the
+model can retry from.
 
 ```python
 import json
@@ -316,110 +316,53 @@ from pydantic import BaseModel, ValidationError
 
 class LookupOrder(BaseModel):
     order_id: str            # string, not int: IDs above 2^53 break JS consumers
-    include_items: bool = False
 
 def run_tool(raw_args: str) -> str:
     try:
         args = LookupOrder.model_validate_json(raw_args)   # parse + validate in one step
     except ValidationError as e:
         return json.dumps({"error": e.errors(include_url=False)}, default=str)  # model retries
-    row = {"order_id": args.order_id, "status": "shipped", "total": 42.5}
-    return json.dumps(row, ensure_ascii=False, allow_nan=False)
+    return json.dumps({"order_id": args.order_id, "status": "shipped"})
 
-def log_step(f, step: int, name: str, raw_args: str, result: str) -> None:
-    rec = {"step": step, "tool": name, "args": raw_args, "result": result}
-    f.write(json.dumps(rec, ensure_ascii=False, allow_nan=False) + "\n")
-    f.flush()                                           # a crash loses at most this line
-
-with open("trace.jsonl", "a", encoding="utf-8") as f:
-    for step, raw in enumerate(['{"order_id": "9007199254740993"}', '{"order_id": 5'], 1):
-        log_step(f, step, "lookup_order", raw, run_tool(raw))   # 2nd is malformed JSON
+print(run_tool('{"order_id": "9007199254740993"}'))  # {"order_id": "9007199254740993", "status": "shipped"}
+print(run_tool('{"order_id": 5')[:30])                # {"error": [{"type": "json_inva
 ```
-
-- **The malformed second call** becomes a JSON error string that goes back to the model as the tool
-  result, and the trace still gets a complete line for step 2.
 
 ### Write an eval set safely, read it as a stream
-Writing an eval set safely and reading it back as a stream, with failures pinned to a line.
-
-```python
-import json, math
-from pathlib import Path
-
-cases = [
-    {"id": "q1", "messages": [{"role": "user", "content": "Refund policy?\nAsk twice."}],
-     "expected": "policy", "score": 0.9},
-    {"id": "q2", "messages": [{"role": "user", "content": "Café opening hours"}],
-     "expected": "hours", "score": math.nan},          # a bad value we must catch
-]
-
-def write_jsonl(path: Path, rows) -> None:
-    with path.open("w", encoding="utf-8") as f:
-        for row in rows:
-            # allow_nan=False refuses to emit the invalid token NaN
-            f.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
-
-def read_jsonl(path: Path):
-    with path.open(encoding="utf-8") as f:
-        for lineno, line in enumerate(f, 1):
-            if not line.strip():
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"{path}:{lineno}: {e.msg}") from e
-
-cases[1]["score"] = None                               # fix: null is valid JSON
-p = Path("eval.jsonl")
-write_jsonl(p, cases)
-print(p.read_text(encoding="utf-8").count("\n"))       # 2: the embedded newline was escaped
-for case in read_jsonl(p):                             # one record in memory at a time
-    print(case["id"], len(case["messages"]))
-```
-
-- **Without the fix,** `write_jsonl` raises `ValueError: Out of range float values are not JSON compliant`
-  on the second record, at write time, instead of producing a file a TypeScript dashboard later refuses
-  to parse.
-
-### Worked scenario: a resumable agent eval run that survives a torn last line
-A worker runs the agent on each case, appends one result per `custom_id`, and can be killed at any time.
-On restart it drops a torn tail, skips finished IDs and appends the rest.
+One record per line, strict on write, failures pinned to a line number on read.
 
 ```python
 import json
 from pathlib import Path
 
-def resume(path: Path) -> set[str]:
-    done, good_bytes = set(), 0
-    if not path.exists():
-        return done
-    with path.open("rb") as f:
-        for raw in f:                          # binary iteration splits on b"\n" only
-            if not raw.endswith(b"\n"):        # torn last line: writer died mid-record
-                break
-            if raw.strip():                    # a bad *complete* line is real corruption: let it raise
-                done.add(json.loads(raw)["custom_id"])
-            good_bytes += len(raw)
-    with path.open("r+b") as f:
-        f.truncate(good_bytes)                 # cut the torn tail before appending again
-    return done
+cases = [{"id": "q1", "prompt": "Refund policy?\nAsk twice."}, {"id": "q2", "prompt": "Café hours"}]
+p = Path("eval.jsonl")
+with p.open("w", encoding="utf-8") as f:
+    for row in cases:      # allow_nan=False raises on NaN instead of writing an invalid token
+        f.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
 
-def run_eval(cases, out: Path, run_agent):
-    done = resume(out)
-    with out.open("a", encoding="utf-8") as f:
-        for case in cases:
-            if case["custom_id"] in done:
-                continue                       # finished: do not pay for it twice
-            result = run_agent(case)           # several model and tool calls
-            f.write(json.dumps({"custom_id": case["custom_id"], **result},
-                               ensure_ascii=False, allow_nan=False) + "\n")
-            f.flush()                          # durability matches progress
+def read_jsonl(path: Path):
+    with path.open(encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            try:
+                yield json.loads(line)                 # one record in memory at a time
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path}:{lineno}: {e.msg}") from e
+
+print(p.read_text(encoding="utf-8").count("\n"))      # 2: the embedded newline was escaped
+print([c["id"] for c in read_jsonl(p)])                # ['q1', 'q2']
 ```
+
+- **Write `math.nan` instead,** and `json.dumps` raises `ValueError: Out of range float values are not
+  JSON compliant` at write time, instead of producing a file a TypeScript dashboard later refuses.
+
+### Worked scenario: a resumable agent eval run that survives a torn last line
+A worker appends one result per `custom_id` and flushes after each, and can be killed at any time.
 
 | Event | Effect on `results.jsonl` |
 |---|---|
 | Pod killed while writing record 1,800,001 | 1,800,000 complete lines plus a partial one |
-| Restart calls `resume` | Partial line truncated; 1,800,000 IDs marked done |
+| Restart reads the file in binary | A last line without `\n` is torn: truncate it; 1,800,000 IDs marked done |
 | Job continues | Only the remaining cases are sent, so it is idempotent |
 
 - **Why it matters for agent evals:** each case may cost several model and tool calls, so re-running
@@ -441,6 +384,8 @@ def run_eval(cases, out: Path, run_agent):
 - **Promote to Parquet for analytics.** Keep JSONL as the append and interchange format for traces and
   evals, and convert finished files (for example `pd.read_json(path, lines=True).to_parquet(...)`) before
   repeated queries. Watch query latency and file size; a gzip-compressed `.jsonl.gz` is the cheaper archive.
+- **Flush after every appended line.** Call `f.flush()` after each trace or result record so a crash loses
+  at most the line being written, and on resume iterate the file in binary (splits on `b"\n"` only).
 
 ## Trade-offs
 - **Streaming vs document guarantees.** JSONL streams and appends record by record but has no enclosing

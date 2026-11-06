@@ -302,55 +302,6 @@ sequenceDiagram
 ```
 
 ## Examples
-### A streaming agent loop as an async generator
-The loop yields typed events (tokens, tool start and end, final answer) that a UI or SSE endpoint renders
-as they happen. The model and tool are stubs so it runs offline.
-
-```python
-import asyncio
-from contextlib import aclosing
-
-async def model_stream(messages):              # stub for a provider's streaming call
-    if messages[-1]["role"] == "tool":
-        for tok in ["Your order", " shipped", " today."]:
-            await asyncio.sleep(0.01); yield {"type": "token", "text": tok}
-    else:
-        yield {"type": "tool_call", "name": "lookup_order", "args": {"id": 42}}
-
-async def lookup_order(id):
-    await asyncio.sleep(0.05); return f"order {id}: shipped"
-
-async def run_agent(question, max_steps=4):
-    messages = [{"role": "user", "content": question}]
-    for step in range(max_steps):
-        call, text = None, []
-        async with aclosing(model_stream(messages)) as stream:   # closed even if our consumer stops
-            async for ev in stream:
-                if ev["type"] == "token":
-                    text.append(ev["text"]); yield ev            # stream tokens straight through
-                else:
-                    call = ev
-        if call is None:
-            yield {"type": "final", "text": "".join(text), "steps": step + 1}
-            return
-        yield {"type": "tool_start", "name": call["name"]}
-        result = await lookup_order(**call["args"])
-        yield {"type": "tool_end", "name": call["name"], "result": result}
-        messages.append({"role": "tool", "content": result})
-
-async def main():
-    async with aclosing(run_agent("Where is order 42?")) as events:
-        async for ev in events:
-            print(ev)
-
-asyncio.run(main())
-```
-
-- **One generator, many consumers.** The same `run_agent` feeds a CLI, an SSE endpoint
-  (`StreamingResponse` over formatted events) or an eval harness that collects only `final` events.
-- **Stopping is closing.** If the client disconnects, closing `run_agent` runs `aclosing` on the inner
-  model stream, so the upstream connection is released at a known point.
-
 ### A lazy embedding pipeline for the agent's index
 ```python
 import itertools, json

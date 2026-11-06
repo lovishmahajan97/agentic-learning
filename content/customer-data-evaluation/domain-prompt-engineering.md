@@ -225,7 +225,6 @@ components so each piece can be tested separately, and the final-answer tool for
 the rule that fired so failures can be sorted into precedence errors and definition errors.
 
 ```python
-import json
 GLOSSARY = {
     "late": "Delivered after the promised window. The window moves only if the consignee requested a "
             "reschedule (reschedule_by == 'consignee'). Carrier reschedules do NOT move it.",
@@ -242,19 +241,24 @@ FINAL_ANSWER_TOOL = {   # the agent ends every run by calling this; enums make t
     "description": "Submit the final triage label. Call exactly once, after any lookups.",
     "input_schema": {"type": "object", "required": ["label", "rule"], "properties": {
         "label": {"type": "string", "enum": ["on_time", "late", "damaged", "needs_review"]},
-        "rule": {"type": "string", "enum": [rid for rid, _ in RULES]},
-        "reason": {"type": "string"}}},
+        "rule": {"type": "string", "enum": [rid for rid, _ in RULES]}}},
 }
 
-def build_system_prompt(version="acme-freight-v7", examples=()):
+def build_system_prompt(version="acme-freight-v7"):
     terms = "\n".join(f"- {k}: {v}" for k, v in GLOSSARY.items())
     rules = "\n".join(f"{rid}. {text}" for rid, text in RULES)
-    shots = "\n".join(f"Input: {json.dumps(x)}\nOutput: {json.dumps(y)}" for x, y in examples)
     return (f"[prompt {version}]\nYou triage shipment exceptions. Use these definitions, not general "
             f"meanings:\n{terms}\nRules, in priority order:\n{rules}\n"
-            "Never infer a delivery time. Finish by calling submit_triage.\n"
-            f"Examples:\n{shots}")
+            "Never infer a delivery time. Finish by calling submit_triage.")
 
+print(build_system_prompt().splitlines()[0])                  # [prompt acme-freight-v7]
+print(FINAL_ANSWER_TOOL["input_schema"]["properties"]["rule"]["enum"])  # ['R1', 'R2', 'R3', 'R4']
+```
+
+With the SME's deciding rule on each gold case, `diagnose` sorts failures by shape. Boundary pairs that
+differ in one field (consignee vs carrier reschedule) go in the prompt as examples, never in the golden set.
+
+```python
 def diagnose(results):
     """results: dicts with the SME's gold_label and gold_rule, and the agent's label and rule."""
     out = {"correct": 0, "precedence": 0, "definition": 0}
@@ -267,26 +271,11 @@ def diagnose(results):
             out["definition"] += 1      # right rule, wrong reading of a term: fix the glossary
     return out
 
-results = [
+print(diagnose([
     {"gold_label": "late",    "gold_rule": "R4", "label": "late", "rule": "R4"},  # correct
     {"gold_label": "damaged", "gold_rule": "R3", "label": "late", "rule": "R4"},  # wrong rule fired
     {"gold_label": "on_time", "gold_rule": "R4", "label": "late", "rule": "R4"},  # term misread
-]
-print(diagnose(results))   # {'correct': 1, 'precedence': 1, 'definition': 1}
-print(json.dumps(FINAL_ANSWER_TOOL["input_schema"]["properties"]["rule"]))
-```
-
-The boundary pair below goes in the prompt as examples and is excluded from the golden set: it differs
-only in who rescheduled.
-
-```python
-EXAMPLES = [
-    ({"promised_end": "10:00", "delivery_ts": "10:20", "reschedule_by": "consignee",
-      "new_end": "12:00"}, {"label": "on_time", "rule": "R4"}),
-    ({"promised_end": "10:00", "delivery_ts": "10:20", "reschedule_by": "carrier",
-      "new_end": "12:00"}, {"label": "late", "rule": "R4"}),
-]
-system_prompt = build_system_prompt(examples=EXAMPLES)   # stable prefix: cache it, log its version
+]))  # {'correct': 1, 'precedence': 1, 'definition': 1}
 ```
 
 ### Worked iteration: v6 to v7 of the triage agent (numbers illustrative)

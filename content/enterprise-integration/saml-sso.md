@@ -232,23 +232,17 @@ The key design point: all values are read from `signed`, the element the verifie
 raw document.
 
 ```python
+# pip install signxml lxml
 from datetime import datetime, timedelta, timezone
-from lxml import etree
 from signxml import XMLVerifier
-
 NS = {"saml": "urn:oasis:names:tc:SAML:2.0:assertion"}
 SKEW = timedelta(minutes=2)
-
-def ts(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-
+ts = lambda s: datetime.fromisoformat(s.replace("Z", "+00:00"))
 def consume(xml: bytes, tenant: dict, pending_ids: set, seen_ids: set) -> dict:
     # pending_ids: request IDs started by THIS browser session; seen_ids: shared, kept until expiry
     signed = XMLVerifier().verify(xml, x509_cert=tenant["idp_cert_pem"]).signed_xml
-    a = signed if etree.QName(signed).localname == "Assertion" else signed.find("saml:Assertion", NS)
-    if a is None:
-        raise PermissionError("no signed assertion")
-    now = datetime.now(timezone.utc)
+    a = signed if signed.tag.endswith("}Assertion") else signed.find("saml:Assertion", NS)
+    now = datetime.now(timezone.utc)                          # a is None -> AttributeError: fails closed
     if a.findtext("saml:Issuer", namespaces=NS) != tenant["idp_entity_id"]:
         raise PermissionError("wrong issuer")
     cond = a.find("saml:Conditions", NS)
@@ -279,11 +273,9 @@ allow-list; unknown role values grant nothing.
 
 ```python
 from dataclasses import dataclass
-
-ROLE_MAP = {  # per tenant, reviewed: IdP attribute value -> agent capabilities
-    "acme": {"grp-support-agents": {"search_kb", "read_ticket", "draft_reply"},
-             "grp-support-leads":  {"search_kb", "read_ticket", "draft_reply", "refund_under_100"}},
-}
+ROLE_MAP = {"acme": {  # per tenant, reviewed: IdP attribute value -> agent capabilities
+    "grp-support-agents": {"search_kb", "read_ticket", "draft_reply"},
+    "grp-support-leads":  {"search_kb", "read_ticket", "draft_reply", "refund_under_100"}}}
 
 @dataclass(frozen=True)
 class AgentPrincipal:
@@ -291,8 +283,7 @@ class AgentPrincipal:
     tools: frozenset
 
 def principal_from_assertion(tenant: str, idp_entity_id: str, validated: dict) -> AgentPrincipal:
-    groups = validated["attrs"].get("groups", [])
-    tools = set().union(*(ROLE_MAP[tenant].get(g, set()) for g in groups)) if groups else set()
+    tools = set().union(*(ROLE_MAP[tenant].get(g, set()) for g in validated["attrs"].get("groups", [])))
     return AgentPrincipal((tenant, idp_entity_id, validated["name_id"]), frozenset(tools))
 
 p = principal_from_assertion("acme", "http://www.okta.com/exk1",
@@ -300,19 +291,10 @@ p = principal_from_assertion("acme", "http://www.okta.com/exk1",
 print(p.tools)               # search_kb, read_ticket, draft_reply: no refund tool, 'everyone' grants nothing
 ```
 
-### RelayState allow-list and an expiring replay cache
-Pure standard library, runnable on Python 3.10+. Both are small, and both are commonly missing.
+### An expiring replay cache
+Pure standard library, runnable on Python 3.10+. Small, and commonly missing.
 
 ```python
-from urllib.parse import urlsplit
-
-def safe_relay_state(rs: str | None, default: str = "/") -> str:
-    """Accept only same-site relative paths; anything else falls back to the home page."""
-    if not rs or "\\" in rs or rs.startswith("//") or not rs.startswith("/"):
-        return default
-    parts = urlsplit(rs)
-    return default if parts.scheme or parts.netloc else rs
-
 class ReplayCache:
     """Remember assertion IDs until their NotOnOrAfter; reject a second use."""
     def __init__(self):
@@ -323,10 +305,6 @@ class ReplayCache:
             return False
         self.seen[assertion_id] = not_on_or_after
         return True
-
-for rs in ["/reports/42?tab=q3", "https://evil.example", "//evil.example", "/\\evil.example", None]:
-    print(repr(rs), "->", safe_relay_state(rs))          # only the first survives
-
 cache = ReplayCache()
 print(cache.first_use("_a1", not_on_or_after=1300, now=1000))   # True: first use
 print(cache.first_use("_a1", not_on_or_after=1300, now=1200))   # False: replay inside window
@@ -366,6 +344,8 @@ last column is what a miss would mean for the agent.
   sessions with an empty tool set, which usually means a renamed attribute.
 - **Login failures by reason, per tenant.** Emit a reason code (audience, signature, expiry, recipient,
   unsolicited, replay) for each rejection so FDEs can tell a customer metadata mistake from an attack.
+- **RelayState allow-list.** Accept only a same-site relative path that starts with a single `/`; reject
+  `//`, backslashes and anything with a scheme or host, and fall back to the home page.
 
 ## Trade-offs
 - **Ubiquity vs implementation risk.** SAML works with nearly every enterprise IdP and corporate policy, but

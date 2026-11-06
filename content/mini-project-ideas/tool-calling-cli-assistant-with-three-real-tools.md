@@ -281,25 +281,20 @@ flowchart TD
 Uses the Anthropic Messages API tool-use format; set `MODEL` to a current model ID from the provider docs.
 
 ```python
-import json, os, pathlib, anthropic
+# pip install anthropic   (set ANTHROPIC_API_KEY and MODEL)
+import os, pathlib, sys, anthropic
 
-client = anthropic.Anthropic()
-MODEL = os.environ["MODEL"]            # a current tool-capable model ID; check the docs
-ROOT = pathlib.Path(os.environ.get("WORKSPACE", ".")).resolve()
-MAX_STEPS, MAX_CHARS = 8, 4000
+client, MODEL = anthropic.Anthropic(), os.environ["MODEL"]   # a current tool-capable model ID
+ROOT, MAX_STEPS = pathlib.Path(".").resolve(), 8
 
 def read_file(path: str) -> str:
     p = (ROOT / path).resolve()
     if not p.is_relative_to(ROOT):
         return "error: path is outside the workspace"
-    if not p.is_file():
-        return f"error: no such file: {path}"
-    return p.read_text(errors="replace")[:MAX_CHARS]
+    return p.read_text(errors="replace")[:4000] if p.is_file() else f"error: no such file: {path}"
 
 TOOLS = [{"name": "read_file", "description": "Read a text file inside the workspace.",
-          "input_schema": {"type": "object", "properties": {"path": {"type": "string"}},
-                           "required": ["path"]}}]
-IMPL = {"read_file": read_file}
+          "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}]
 
 def run(question: str) -> str:
     messages = [{"role": "user", "content": question}]
@@ -308,20 +303,12 @@ def run(question: str) -> str:
         messages.append({"role": "assistant", "content": resp.content})
         if resp.stop_reason != "tool_use":
             return "".join(b.text for b in resp.content if b.type == "text")
-        results = []
-        for b in resp.content:
-            if b.type == "tool_use":
-                fn = IMPL.get(b.name)
-                try:
-                    out = fn(**b.input) if fn else f"error: unknown tool {b.name}"
-                except Exception as e:     # bad arguments or a tool bug: report, do not crash
-                    out = f"error: {type(e).__name__}: {e}"
-                results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
-        messages.append({"role": "user", "content": results})
+        messages.append({"role": "user", "content": [      # one message, each result keyed by its call id
+            {"type": "tool_result", "tool_use_id": b.id, "content": read_file(**b.input)}
+            for b in resp.content if b.type == "tool_use"]})
     return "stopped: step budget reached"
 
-if __name__ == "__main__":
-    import sys; print(run(" ".join(sys.argv[1:])))
+print(run(" ".join(sys.argv[1:])))   # python cli.py "When do we deploy?"
 ```
 
 ### Milestone plan with time estimates
@@ -351,6 +338,8 @@ never said it returns file paths.
   a run id. This is the seed of tracing; see the tracing lesson before adding a backend.
 - **A scripted eval of 10-20 questions.** Record the expected tool sequence for each and report tool-selection
   accuracy and steps per task in CI. It turns "seems to work" into a number you can put in the README.
+- **Dispatch defensively.** Look tools up by name and wrap each call in `try/except Exception`, so an unknown
+  tool name or a wrong argument (a `TypeError`) becomes an `error: ...` result instead of crashing the CLI.
 
 ## Trade-offs
 - **Hand-written loop vs a framework.** You gain full visibility and zero dependencies, and pay in features

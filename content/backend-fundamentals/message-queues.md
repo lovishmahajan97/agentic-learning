@@ -417,10 +417,10 @@ sequenceDiagram
 
 ## Examples
 ### An SQS consumer for an embedding job
-- **Long-polls** for up to five messages at a time.
+- **Long-polls** for one message at a time.
 - **Processes idempotently:** the job id is the dedup key stored with the result.
-- **Heartbeats every message in the batch,** extending visibility while they wait and while the slow model
-  call runs, so none is redelivered mid-flight.
+- **Heartbeats while the slow model call runs,** extending visibility so the message is not redelivered
+  mid-flight.
 - **Deletes only after success;** failures expire and retry, and the redrive policy sends repeat offenders
   to a DLQ.
 
@@ -430,43 +430,33 @@ import json, threading, boto3
 sqs = boto3.client("sqs")
 QUEUE = "https://sqs.us-east-1.amazonaws.com/123456789012/embed-jobs"
 
-def extend_visibility(receipt, stop, every=30, extra=60):
-    while not stop.wait(every):                        # heartbeat while work is in flight
-        sqs.change_message_visibility(QueueUrl=QUEUE, ReceiptHandle=receipt,
-                                      VisibilityTimeout=extra)
-
-def process(job):
-    if results.exists(job["job_id"]):                  # idempotent: seen this job already
-        return
-    vectors = embed(load_chunks(job["document_id"]))   # the slow call
-    results.store(job["job_id"], vectors)              # write result keyed by job id
+def extend_visibility(receipt, stop):
+    while not stop.wait(30):                           # every 30 s, push the timeout out 60 s
+        sqs.change_message_visibility(QueueUrl=QUEUE, ReceiptHandle=receipt, VisibilityTimeout=60)
 
 while True:
-    resp = sqs.receive_message(QueueUrl=QUEUE, MaxNumberOfMessages=5,
+    resp = sqs.receive_message(QueueUrl=QUEUE, MaxNumberOfMessages=1,
                                WaitTimeSeconds=20, VisibilityTimeout=60)
-    batch = resp.get("Messages", [])
-    stops = [threading.Event() for _ in batch]          # heartbeat all, not just the current one
-    for msg, stop in zip(batch, stops):
-        threading.Thread(target=extend_visibility,
-                         args=(msg["ReceiptHandle"], stop), daemon=True).start()
-    for msg, stop in zip(batch, stops):
+    for msg in resp.get("Messages", []):
+        stop = threading.Event()
+        threading.Thread(target=extend_visibility, args=(msg["ReceiptHandle"], stop), daemon=True).start()
         try:
-            process(json.loads(msg["Body"]))
+            job = json.loads(msg["Body"])
+            if not results.exists(job["job_id"]):       # idempotent: seen this job already
+                results.store(job["job_id"], embed(job["document_id"]))   # the slow call
             sqs.delete_message(QueueUrl=QUEUE, ReceiptHandle=msg["ReceiptHandle"])
         except Exception as e:
-            log.warning("job failed, will be redelivered: %s", e)   # no delete: retry later
+            print("job failed, will be redelivered:", e)   # no delete: retry later
         finally:
             stop.set()
 ```
 
-- **App-supplied names:** `results`, `embed`, `load_chunks` and `log` are the application's own; the shape
-  of the loop is what matters.
-- **Why the batch-wide heartbeat:** without it, messages two to five would sit unprocessed while message
-  one ran, their 60-second timeout would lapse, and another worker would receive them too.
+- **App-supplied names:** `results` and `embed` are the application's own; the shape of the loop is what
+  matters.
 - **Same loop elsewhere:** with Kafka, poll, process, then commit the offset; with RabbitMQ, set
   `basic_qos(prefetch_count=5)`, `basic_consume`, and `basic_ack` after success.
 
-### Runnable: backlog drain and consumer sizing
+### Runnable: backlog drain time
 Pure Python for the λ/μ arithmetic above; use it to set autoscaling targets.
 
 ```python
@@ -478,15 +468,13 @@ def drain_seconds(backlog, arrival_per_s, service_per_s):
         return math.inf                      # λ ≥ μ: the queue is accumulating debt, not levelling load
     return backlog / (service_per_s - arrival_per_s)
 
-def consumers_needed(backlog, arrival_per_s, per_consumer_per_s, target_s):
-    """Smallest consumer count that drains the backlog within target_s."""
-    return math.ceil((backlog / target_s + arrival_per_s) / per_consumer_per_s)
-
 print(drain_seconds(120_000, 400, 500))      # 1200.0 s, twenty minutes
 print(drain_seconds(120_000, 400, 1_000))    # 200.0 s after doubling consumers
 print(drain_seconds(120_000, 600, 500))      # inf: shed load or slow the producer
-print(consumers_needed(120_000, 400, per_consumer_per_s=50, target_s=300))   # 16
 ```
+
+- **Sizing from a target:** consumers = ⌈(backlog / target + λ) / per-consumer rate⌉, so draining 120,000
+  messages in 300 s at λ = 400 with 50 messages/s per consumer needs ⌈(400 + 400) / 50⌉ = 16.
 
 ### Agent scenario: a long tool call handed to a queue
 A research agent decides to call `transcribe_video`, which takes 2-6 minutes. The agent service records
@@ -516,34 +504,22 @@ payload for object storage.
 
 ### Production SQL: the transactional outbox
 The business row and the event commit together; the relay publishes and marks rows, and several relays
-can run safely because of `SKIP LOCKED`.
+can run safely because of `SKIP LOCKED`. The table is `outbox(id uuid, topic text, key text, payload jsonb,
+created_at timestamptz, sent_at timestamptz)`, where `id` defaults to `gen_random_uuid()`, `created_at` to
+`now()`, `key` is the partition key and `sent_at` is null until published.
 
 ```sql
-CREATE TABLE outbox (
-  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  topic      text NOT NULL,
-  key        text NOT NULL,                 -- partition key, e.g. document id
-  payload    jsonb NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  sent_at    timestamptz
-);
-
 -- In the request handler: one transaction for the change and its event.
 BEGIN;
-INSERT INTO documents (id, tenant_id, status) VALUES ($1, $2, 'uploaded');
+INSERT INTO documents (id, status) VALUES ($1, 'uploaded');
 INSERT INTO outbox (topic, key, payload)
-VALUES ('document.uploaded', $1, jsonb_build_object('document_id', $1::uuid, 'tenant_id', $2::uuid));
+VALUES ('document.uploaded', $1, jsonb_build_object('document_id', $1::uuid));
 COMMIT;
 
 -- In the relay: lock a batch, publish each row to the broker, then mark them sent.
--- The transaction stays open while publishing, so keep batches small and the broker timeout short.
 BEGIN;
-SELECT id, topic, key, payload FROM outbox
-WHERE  sent_at IS NULL
-ORDER  BY created_at
-LIMIT  100
-FOR UPDATE SKIP LOCKED;
--- ... publish every row; a crash here means they are published again later ...
+SELECT id, topic, key, payload FROM outbox WHERE sent_at IS NULL
+ORDER BY created_at LIMIT 100 FOR UPDATE SKIP LOCKED;
 UPDATE outbox SET sent_at = now() WHERE id = ANY($1);   -- $1: ids of the rows just published
 COMMIT;
 ```
@@ -571,6 +547,12 @@ COMMIT;
 - **Failed runs surface from the DLQ.** When a tool-call message dead-letters, a consumer marks the agent
   run failed with the error, so the user and the agent see a final state instead of waiting forever.
   Monitor DLQ inflow per tool name.
+- **Heartbeat every message in a batch.** With `MaxNumberOfMessages` above 1, start a visibility heartbeat
+  for every received message, not just the one being processed, or messages waiting behind a slow one
+  exceed their timeout and another worker receives them too.
+- **Small relay batches, short broker timeouts.** The outbox relay holds its transaction open while
+  publishing, and a crash before `UPDATE ... sent_at` republishes the batch, so keep batches small, set a
+  short broker timeout and make consumers idempotent.
 
 ## Trade-offs
 - **Decoupling vs visibility.** Producers gain availability and burst tolerance, but the caller no longer

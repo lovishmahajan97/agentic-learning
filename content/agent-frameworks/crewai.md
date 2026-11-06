@@ -270,7 +270,6 @@ def fetch_pricing(company: str) -> str:
     return {"Acme": "Starter $29/mo, Pro $99/mo", "Globex": "Team $49/user/mo"}.get(company, "no data")
 
 class Brief(BaseModel):
-    summary: str
     price_points: list[str]
     recommendation: str
 
@@ -279,17 +278,16 @@ researcher = Agent(role="Pricing researcher", goal="Collect accurate competitor 
                    backstory="You only report prices returned by your tool.", tools=[fetch_pricing],
                    llm=llm, allow_delegation=False, max_iter=5)
 analyst = Agent(role="Pricing analyst", goal="Turn price data into one clear recommendation",
-                backstory="You write short, sourced briefs.", llm=llm, allow_delegation=False)
+                backstory="You write short briefs.", llm=llm, allow_delegation=False)
 
-research = Task(description="Collect pricing for {companies}, calling the tool once per company.",
+research = Task(description="Collect pricing for {companies}, one tool call per company.",
                 expected_output="Each company with its price points", agent=researcher)
-brief = Task(description="Write a pricing brief for our {product}.",
-             expected_output="Summary, price points and one recommendation",
-             agent=analyst, context=[research], output_pydantic=Brief)
+brief = Task(description="Recommend a price for our {product}.", agent=analyst, context=[research],
+             expected_output="Price points and one recommendation", output_pydantic=Brief)
 
 crew = Crew(agents=[researcher, analyst], tasks=[research, brief], process=Process.sequential)
 out = crew.kickoff(inputs={"companies": "Acme, Globex", "product": "analytics add-on"})
-print(out.pydantic)          # Brief(...)
+print(out.pydantic)          # Brief(price_points=[...], recommendation='...')
 print(out.token_usage)       # log this per run
 ```
 

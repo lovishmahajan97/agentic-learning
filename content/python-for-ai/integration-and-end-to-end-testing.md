@@ -368,72 +368,6 @@ flowchart TD
 ```
 
 ## Examples
-### Agent scenario: real SDK, real HTTP, scripted model
-A local server speaks the chat-completions shape and replays a script: one tool call, then a final
-answer. The real OpenAI SDK, the agent loop and the tool run unmodified, so a tool result dropped or
-mis-shaped in serialisation fails here. Runnable with `pip install openai pytest`.
-
-```python
-import json, threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import pytest
-from openai import OpenAI
-
-TOOLS = [{"type": "function", "function": {"name": "search_docs", "parameters": {
-    "type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}]
-SCRIPT = [{"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function",
-           "function": {"name": "search_docs", "arguments": '{"query": "refund window"}'}}]},
-          {"role": "assistant", "content": "Refunds take 14 days [d1]."}]
-
-class FakeModel(BaseHTTPRequestHandler):
-    seen = []                                           # every request body the SDK sent
-    def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        FakeModel.seen.append(body)
-        msg = SCRIPT[len(FakeModel.seen) - 1]
-        data = json.dumps({"id": "x", "object": "chat.completion", "created": 0, "model": body["model"],
-            "choices": [{"index": 0, "message": msg,
-                         "finish_reason": "tool_calls" if msg.get("tool_calls") else "stop"}]}).encode()
-        self.send_response(200); self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
-    def log_message(self, *args): pass
-
-@pytest.fixture
-def model_url():
-    srv = HTTPServer(("127.0.0.1", 0), FakeModel)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield f"http://127.0.0.1:{srv.server_port}/v1"
-    srv.shutdown()
-
-def search_docs(query):                                 # in a real suite: the container-backed retriever
-    return [{"doc_id": "d1", "text": "Refunds are issued within 14 days."}]
-
-def run_agent(client, question, max_steps=4):
-    messages, trace = [{"role": "user", "content": question}], []
-    for _ in range(max_steps):
-        msg = client.chat.completions.create(model="any", messages=messages, tools=TOOLS).choices[0].message
-        if not msg.tool_calls:
-            return msg.content, trace
-        messages.append(msg.model_dump(exclude_none=True))
-        for tc in msg.tool_calls:
-            trace.append(tc.function.name)
-            result = search_docs(**json.loads(tc.function.arguments))
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
-    raise RuntimeError("step budget exhausted")
-
-def test_agent_trajectory_over_real_http(model_url):
-    client = OpenAI(base_url=model_url, api_key="test", max_retries=0)
-    answer, trace = run_agent(client, "How long do refunds take?")
-    assert trace == ["search_docs"]                                 # trajectory
-    assert "[d1]" in answer                                         # structure, not wording
-    assert FakeModel.seen[1]["messages"][-1]["role"] == "tool"      # result went back to the model
-```
-
-- **What it catches that a unit test cannot:** the assistant message re-sent in the wrong shape, a
-  missing `tool_call_id`, or an SDK upgrade that changes how tool calls parse.
-- **Scale it up** by swapping `search_docs` for the container-backed retriever below and scripting one
-  `SCRIPT` per journey.
-
 ### Integration test: a pgvector retriever against the real extension
 The embedder is a deterministic fake so results are reproducible; everything else (SQL, index,
 migrations, tenant filter) is real. `PgRetriever` and `HashEmbedder` stand for the application's own code.
@@ -445,8 +379,6 @@ from testcontainers.postgres import PostgresContainer
 from app.retriever import PgRetriever     # code under test: migrate(), add(), search()
 from app.embed import HashEmbedder        # deterministic fake: hashes text into an 8-dim vector
 
-pytestmark = pytest.mark.integration      # run with: pytest -m integration
-
 @pytest.fixture(scope="session")
 def retriever():
     with PostgresContainer("pgvector/pgvector:0.8.0-pg16", driver=None) as pg:  # pin both versions
@@ -454,48 +386,29 @@ def retriever():
         r.migrate()                       # the real migrations: extension, table, HNSW index
         yield r
 
-@pytest.fixture
-def tenant():
-    return f"t-{uuid.uuid4().hex[:8]}"    # unique namespace per test: no cleanup, no cross-talk
-
-def test_search_never_crosses_tenants(retriever, tenant):
-    retriever.add(tenant, "d1", "refunds are issued within 14 days")
-    retriever.add(tenant + "-other", "d2", "refunds are issued within 14 days")
-    hits = retriever.search(tenant, "refund window", k=5)
-    assert [h.doc_id for h in hits] == ["d1"]
-
-def test_wrong_dimension_is_rejected_by_the_database(retriever, tenant):
-    with pytest.raises(ValueError):       # adapter maps the DB error to a domain error
-        retriever.add_vector(tenant, "d3", [0.1] * 7)
-
-def test_filtered_search_returns_all_matches(retriever, tenant):
+@pytest.mark.integration                  # run with: pytest -m integration
+def test_filtered_search_returns_all_matches(retriever):
+    tenant = f"t-{uuid.uuid4().hex[:8]}"  # unique namespace per test: no cleanup, no cross-talk
     for i in range(50):
         retriever.add(tenant, f"doc{i}", f"policy section {i}")
     assert len(retriever.search(tenant, "policy", k=20)) == 20
 ```
 
-- **The last test is the one doubles cannot write.** With a shared approximate index and a selective
-  tenant filter, a naive query can return fewer than *k* rows, which is a property of the real engine and
-  its settings, not of your Python.
+- **A test doubles cannot write.** With a shared approximate index and a selective tenant filter, a naive
+  query can return fewer than *k* rows: a property of the real engine and its settings, not your Python.
 - **Why it happens.** pgvector's HNSW scan gathers a bounded candidate list (`hnsw.ef_search`, 40 by
   default) and the `WHERE` filter is applied afterwards; version 0.8.0 added iterative index scans that keep
   searching when too few rows survive, but they are off until you set `hnsw.iterative_scan`.
 - **Make the test meaningful.** Seed enough rows for other tenants that the planner actually uses the
   index; on a near-empty table Postgres may choose an exact sequential scan and the test passes for the
   wrong reason.
-- **Pin both versions.** The image tag pins pgvector as well as Postgres: a bare `pg16` tag moves when
-  pgvector releases.
 
 ### End-to-end journey: poll with a deadline, report what you saw
-A smoke test against a deployed stack. The URL comes from the environment and the endpoints are the
-application's own API; the polling helper is plain Python and replaces every guessed sleep.
+A smoke test against a deployed stack. The polling helper replaces every guessed sleep.
 
 ```python
 import os, time, uuid
 import httpx
-import pytest
-
-pytestmark = pytest.mark.e2e
 
 def wait_for(check, *, timeout: float, interval: float = 0.5):
     """Call check() until it returns (True, value); fail with the last value seen."""
@@ -508,14 +421,9 @@ def wait_for(check, *, timeout: float, interval: float = 0.5):
     raise AssertionError(f"not done after {timeout}s; last seen: {last!r}")
 
 def test_upload_then_ask_cites_the_document():
-    base = os.environ["E2E_BASE_URL"]
     tenant = f"e2e-{uuid.uuid4().hex[:8]}"              # unique per run, never shared
-    req_ids = []
-    with httpx.Client(base_url=base, timeout=30, headers={"X-Tenant": tenant}) as http:
-        wait_for(lambda: (http.get("/ready").status_code == 200, None), timeout=60)
-        r = http.post("/documents", json={"text": "Refunds are issued within 14 days."})
-        req_ids.append(r.headers.get("x-request-id"))
-        doc_id = r.json()["id"]
+    with httpx.Client(base_url=os.environ["E2E_BASE_URL"], timeout=30, headers={"X-Tenant": tenant}) as http:
+        doc_id = http.post("/documents", json={"text": "Refunds are issued within 14 days."}).json()["id"]
 
         def indexed():
             s = http.get(f"/documents/{doc_id}").json()["status"]
@@ -523,8 +431,7 @@ def test_upload_then_ask_cites_the_document():
 
         wait_for(indexed, timeout=120)
         r = http.post("/ask", json={"question": "How long do refunds take?"})
-        req_ids.append(r.headers.get("x-request-id"))
-        assert doc_id in r.json()["citations"], f"request ids: {req_ids}"   # structure, not exact text
+        assert doc_id in r.json()["citations"], r.headers.get("x-request-id")  # structure, not text
 ```
 
 The assertion checks a cited document ID, not the answer text, so a model or prompt change cannot break
@@ -561,6 +468,11 @@ Illustrative indexing times on a shared CI runner: about 4 s typically, up to 25
 - **Trajectory assertions from traces.** Have the agent service return or log a trace per run (tools
   called, step count, request IDs) and assert on it in e2e tests: expected tools ran, no tool errored, the
   step budget held. Monitor step count per journey; a jump means the agent is looping.
+- **Wait on readiness before the first e2e call.** Poll the service's `/ready` endpoint with the same
+  deadline helper (60 s is a reasonable budget) instead of assuming the stack is up.
+- **Assert the tool result went back to the model.** In fake-model-server tests, check the recorded second
+  request ends with a `role: tool` message; this catches a mis-shaped assistant message, a missing
+  `tool_call_id`, or an SDK upgrade that changes how tool calls parse.
 
 ## Trade-offs
 - **Real dependencies vs startup cost.** They catch dialect, index and migration bugs that fakes hide, but

@@ -164,88 +164,53 @@ sequenceDiagram
 ### A harness function for one turn
 Safe calls run concurrently with a semaphore and a timeout, unsafe calls run in order, every call gets
 exactly one result, and all results go back in one message. `HANDLERS` maps tool names to async functions;
-`PARALLEL_SAFE` comes from the tool contracts.
+`PARALLEL_SAFE` comes from the tool contracts. Inside the loop, append the assistant message
+(`response.content`) and then `await execute_turn(response)`.
 
 ```python
 import asyncio, json
 
 PARALLEL_SAFE = {"get_order", "search_docs", "get_weather"}   # read-only tools, from the contracts
 sem = asyncio.Semaphore(5)                                      # protect upstream rate limits
-TIMEOUT_S = 10
 
 async def run_one(block) -> dict:
     """Execute one tool_use block and always return a tool_result for it."""
     try:
         async with sem:
-            out = await asyncio.wait_for(HANDLERS[block.name](**block.input), timeout=TIMEOUT_S)
+            out = await asyncio.wait_for(HANDLERS[block.name](**block.input), timeout=10)
         return {"type": "tool_result", "tool_use_id": block.id, "content": json.dumps(out)}
-    except asyncio.TimeoutError:
-        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
-                "content": f"timed out after {TIMEOUT_S}s; outcome unknown, check before retrying"}
     except Exception as e:                                      # isolate: one failure, one error result
-        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True,
-                "content": f"{type(e).__name__}: {e}"}
+        return {"type": "tool_result", "tool_use_id": block.id, "is_error": True, "content": repr(e)}
 
 async def execute_turn(response) -> dict:
     calls = [b for b in response.content if b.type == "tool_use"]
     safe = [b for b in calls if b.name in PARALLEL_SAFE]
-    unsafe = [b for b in calls if b.name not in PARALLEL_SAFE]
-    results = {}
-    for r in await asyncio.gather(*(run_one(b) for b in safe)):   # concurrent; run_one never raises
-        results[r["tool_use_id"]] = r
-    for b in unsafe:                                              # writes: sequential, model's order
-        r = await run_one(b)
-        results[r["tool_use_id"]] = r
+    results = {r["tool_use_id"]: r for r in await asyncio.gather(*(run_one(b) for b in safe))}
+    for b in calls:
+        if b.name not in PARALLEL_SAFE:                         # writes: sequential, model's order
+            results[b.id] = await run_one(b)
     return {"role": "user", "content": [results[b.id] for b in calls]}   # one message, every call answered
+```
 
-# inside the loop:
-#   messages.append({"role": "assistant", "content": response.content})
-#   messages.append(await execute_turn(response))
+### Try it offline: the speedup and the isolation
+Standard library only (Python 3.10+), with fake blocks shaped like SDK `tool_use` blocks. Each simulated
+call takes 1 s and one of them fails; the turn still returns all three results.
 
-# try it offline (Python 3.10+): fake blocks shaped like SDK tool_use blocks
+```python
+import time
 from types import SimpleNamespace as NS
 
-async def get_order(order_id):  await asyncio.sleep(0.2); return {"order_id": order_id, "status": "open"}
-async def get_weather(city):    raise LookupError(f"no station for {city}")
-async def refund(order_id):     return {"order_id": order_id, "refunded": True}
+async def get_order(order_id):  await asyncio.sleep(1); return {"order_id": order_id, "status": "open"}
+async def get_weather(city):    await asyncio.sleep(1); raise LookupError(f"no station for {city}")
+async def refund(order_id):     await asyncio.sleep(1); return {"order_id": order_id, "refunded": True}
 HANDLERS = {"get_order": get_order, "get_weather": get_weather, "refund": refund}
 
 resp = NS(content=[NS(type="tool_use", id="t1", name="get_order", input={"order_id": "A1"}),
                    NS(type="tool_use", id="t2", name="get_weather", input={"city": "Oslo"}),
                    NS(type="tool_use", id="t3", name="refund", input={"order_id": "A1"})])
-print(asyncio.run(execute_turn(resp)))   # t1 ok, t2 is_error, t3 ok; one message, model's order
-```
-
-### See the speedup and the isolation locally
-Runnable with only the standard library: four simulated 1 s calls, one of which fails. Sequential takes
-about 4 s; concurrent takes about 1 s and still returns all four results.
-
-```python
-import asyncio, time
-
-async def fetch(name: str, delay: float, fail: bool = False) -> str:
-    await asyncio.sleep(delay)                       # stands in for a 1 s upstream call
-    if fail:
-        raise LookupError(f"{name}: 404")
-    return f"{name}: ok"
-
-async def safe(coro) -> str:                         # isolate: an exception becomes a value
-    try:
-        return await coro
-    except Exception as e:
-        return f"error: {e}"
-
-async def main():
-    jobs = [("A", 1.0, False), ("B", 1.0, True), ("C", 1.0, False), ("D", 1.0, False)]
-    t = time.perf_counter()
-    for j in jobs:
-        await safe(fetch(*j))
-    print(f"sequential: {time.perf_counter() - t:.1f}s")       # ~4.0s
-    t = time.perf_counter()
-    results = await asyncio.gather(*(safe(fetch(*j)) for j in jobs))
-    print(f"concurrent: {time.perf_counter() - t:.1f}s", results)   # ~1.0s, B is an error value
-
-asyncio.run(main())
+t = time.perf_counter()
+print(asyncio.run(execute_turn(resp)))   # t1 ok, t2 is_error, t3 ok; one message, in the model's order
+print(f"{time.perf_counter() - t:.1f}s")  # 2.0s: the two reads overlap (1s), then the write (1s); 3s in series
 ```
 
 ## Production patterns
@@ -265,6 +230,9 @@ asyncio.run(main())
   `parallel_tool_calls=False` on OpenAI. Monitor wall-clock per task to confirm the cost is acceptable.
 - **Declined calls still get a result.** When policy refuses a call; return an `is_error` result saying it
   was declined, never drop it. Monitor declined calls per tool.
+- **A timeout on every call, inside the isolation.** In every harness; wrap each handler in
+  `asyncio.wait_for` (for example 10 s) inside the `try`, so a timeout becomes an `is_error` result that
+  says the outcome is unknown and to check before retrying. Monitor timeouts per tool.
 
 ## Trade-offs
 - **Latency vs downstream burst.** Independent calls finish sooner with fewer model turns, but downstream

@@ -215,132 +215,61 @@ flowchart TD
 ```
 
 ## Examples
-### Postgres outbox, relay and inbox
-Tables and the three code paths: the producer writes order and outbox row in one transaction, a polling
-relay publishes with `SKIP LOCKED`, and a consumer deduplicates through the inbox. Uses psycopg 3; the
-`broker.publish` call stands in for a Kafka or SQS client.
-
-```sql
-CREATE TABLE outbox (
-  id BIGSERIAL PRIMARY KEY, aggregate_id TEXT NOT NULL, event_type TEXT NOT NULL,
-  payload JSONB NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), published_at TIMESTAMPTZ);
-CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
-CREATE TABLE inbox (event_id UUID PRIMARY KEY, handled_at TIMESTAMPTZ DEFAULT now());
-```
-
-```python
-import json, uuid, psycopg
-
-def place_order(conn, order):                       # producer: one transaction, two inserts
-    with conn.transaction():
-        conn.execute("INSERT INTO orders (id, total) VALUES (%s, %s)", (order["id"], order["total"]))
-        conn.execute("INSERT INTO outbox (aggregate_id, event_type, payload) VALUES (%s, %s, %s)",
-                     (order["id"], "OrderPlaced",
-                      json.dumps({"event_id": str(uuid.uuid4()), **order})))
-
-def relay_once(conn, broker, batch=100):            # N copies won't double-claim, but can reorder
-    with conn.transaction():
-        rows = conn.execute("""SELECT id, aggregate_id, event_type, payload FROM outbox
-                               WHERE published_at IS NULL ORDER BY id LIMIT %s
-                               FOR UPDATE SKIP LOCKED""", (batch,)).fetchall()
-        for id_, agg, etype, payload in rows:
-            broker.publish(topic="orders", key=agg, value=json.dumps({"type": etype, **payload}))
-            conn.execute("UPDATE outbox SET published_at = now() WHERE id = %s", (id_,))
-    return len(rows)   # crash after publish, before commit => republish: at-least-once
-
-def handle_order_placed(conn, msg):                 # consumer: effect + inbox in one transaction
-    with conn.transaction():
-        cur = conn.execute("INSERT INTO inbox (event_id) VALUES (%s) ON CONFLICT DO NOTHING",
-                           (msg["event_id"],))
-        if cur.rowcount == 0:
-            return "duplicate"                      # already handled: commit nothing new
-        conn.execute("INSERT INTO revenue_ledger (order_id, amount) VALUES (%s, %s)",
-                     (msg["id"], msg["total"]))
-    return "handled"
-```
-
-- **Relay crash:** kill the relay between `broker.publish` and the `UPDATE` and the row is published twice;
-  the consumer's second `INSERT INTO inbox` conflicts, `rowcount` is zero, and the ledger is written
-  exactly once.
-- **Glossed detail 1, locks during publish:** the relay publishes while holding row locks, so a slow broker
-  stretches the transaction, which is why real relays use small batches and a short publish timeout.
-- **Glossed detail 2, ordering:** with several relays running, two events for the same order can be claimed
-  by different relays and published in the wrong order, so either run one relay per partition of
-  aggregates or use CDC.
-
 ### Runnable: relay crash and inbox dedupe with SQLite
-The same three paths with the standard library only (SQLite 3.24+ for `ON CONFLICT DO NOTHING`). The relay
-"crashes" after publishing, the restart republishes, and the ledger still has one row.
+The three code paths with the standard library only (SQLite 3.24+ for `ON CONFLICT DO NOTHING`): the
+producer writes order and outbox row in one transaction, the relay "crashes" after publishing, the restart
+republishes, and the inbox keeps the ledger at one row. The `broker` list stands in for Kafka or SQS.
 
 ```python
 import sqlite3, json, uuid
-
-db = sqlite3.connect(":memory:", isolation_level=None)
-db.executescript("""
-CREATE TABLE orders (id TEXT PRIMARY KEY, total INT);
-CREATE TABLE outbox (id INTEGER PRIMARY KEY, aggregate_id TEXT, payload TEXT, published_at TEXT);
-CREATE TABLE inbox (event_id TEXT PRIMARY KEY);
-CREATE TABLE ledger (order_id TEXT, amount INT);
-""")
+db = sqlite3.connect(":memory:")          # `with db:` commits on success, rolls back on error
+db.executescript("""CREATE TABLE orders (id TEXT PRIMARY KEY, total INT);
+CREATE TABLE outbox (id INTEGER PRIMARY KEY, payload TEXT, published_at TEXT);
+CREATE TABLE inbox (event_id TEXT PRIMARY KEY); CREATE TABLE ledger (order_id TEXT, amount INT);""")
 
 def place_order(oid, total):                        # both rows or neither
     with db:
-        db.execute("BEGIN")
         db.execute("INSERT INTO orders VALUES (?, ?)", (oid, total))
         ev = {"event_id": str(uuid.uuid4()), "id": oid, "total": total}
-        db.execute("INSERT INTO outbox (aggregate_id, payload) VALUES (?, ?)", (oid, json.dumps(ev)))
+        db.execute("INSERT INTO outbox (payload) VALUES (?)", (json.dumps(ev),))
 
 def relay(broker, crash_before_mark=False):         # at-least-once publication
-    for id_, payload in db.execute("SELECT id, payload FROM outbox WHERE published_at IS NULL ORDER BY id").fetchall():
-        broker.append(payload)
-        if crash_before_mark:
-            return                                  # simulated crash: row stays unpublished
-        db.execute("UPDATE outbox SET published_at = datetime('now') WHERE id = ?", (id_,))
-
-def handle(payload):                                # inbox insert first, then effect, one transaction
-    msg = json.loads(payload)
     with db:
-        db.execute("BEGIN")
-        cur = db.execute("INSERT INTO inbox VALUES (?) ON CONFLICT DO NOTHING", (msg["event_id"],))
-        if cur.rowcount == 0:
+        for id_, payload in db.execute("SELECT id, payload FROM outbox WHERE published_at IS NULL").fetchall():
+            broker.append(payload)
+            if not crash_before_mark:               # a crash here leaves the row unpublished
+                db.execute("UPDATE outbox SET published_at = datetime('now') WHERE id = ?", (id_,))
+
+def handle(msg):                                    # inbox insert + effect, one transaction
+    with db:
+        if db.execute("INSERT INTO inbox VALUES (?) ON CONFLICT DO NOTHING", (msg["event_id"],)).rowcount == 0:
             return "duplicate"
         db.execute("INSERT INTO ledger VALUES (?, ?)", (msg["id"], msg["total"]))
         return "handled"
 
-broker = []
-place_order("o1", 30)
-relay(broker, crash_before_mark=True)              # published, then "crashed"
-relay(broker)                                      # restart republishes the same row
-print([handle(m) for m in broker])                 # ['handled', 'duplicate']
+broker = []; place_order("o1", 30)
+relay(broker, crash_before_mark=True); relay(broker)   # publish, "crash", restart republishes
+print([handle(json.loads(m)) for m in broker])     # ['handled', 'duplicate']
 print(db.execute("SELECT count(*), sum(amount) FROM ledger").fetchone())   # (1, 30)
 ```
 
+In Postgres the relay claims a batch with `FOR UPDATE SKIP LOCKED` so several relays never double-claim a
+row, but they can still reorder events for one aggregate.
+
 ### Agent scenario: committing an agent's decision to act
-The agent decided, at step 7, to email a customer. The checkpoint and the pending action commit together;
-a separate executor performs the send with the outbox row's id as the provider's idempotency key.
-`email_api` stands in for any provider that accepts such a key.
+The agent decided, at step 7, to email a customer. The checkpoint and the pending action commit together
+(psycopg 3); a separate executor later sends it with the outbox row's id as the provider's idempotency key.
 
 ```python
-import json, psycopg
+import json
 
 def commit_step(conn, run_id, step, state, action):    # agent runtime: one transaction
     with conn.transaction():
         conn.execute("INSERT INTO checkpoints (run_id, step, state) VALUES (%s, %s, %s)",
                      (run_id, step, json.dumps(state)))
         conn.execute("INSERT INTO outbox (aggregate_id, event_type, payload) VALUES (%s, %s, %s)",
-                     (run_id, "SendEmailPending",
-                      json.dumps({"to": action["to"], "body": action["body"], "step": step})))
-
-def execute_pending(conn, email_api, batch=20):        # action executor: at-least-once
-    with conn.transaction():
-        rows = conn.execute("""SELECT id, aggregate_id, payload FROM outbox
-                               WHERE published_at IS NULL AND event_type = 'SendEmailPending'
-                               ORDER BY id LIMIT %s FOR UPDATE SKIP LOCKED""", (batch,)).fetchall()
-        for id_, run_id, p in rows:
-            email_api.send(to=p["to"], body=p["body"],
-                           idempotency_key=f"outbox-{id_}")   # retry after a crash = same key
-            conn.execute("UPDATE outbox SET published_at = now() WHERE id = %s", (id_,))
-    return len(rows)
+                     (run_id, "SendEmailPending", json.dumps({**action, "step": step})))
+# executor: claim unsent rows, email_api.send(..., idempotency_key=f"outbox-{row_id}"), mark sent
 ```
 
 | Crash point | Naive agent (send inside the loop, then save) | Checkpoint + outbox |
@@ -351,8 +280,8 @@ def execute_pending(conn, email_api, batch=20):        # action executor: at-lea
 
 - **The provider must honour the key.** The last row holds only if it does; otherwise the executor needs
   its own record of sends, and a small duplicate window remains.
-- **Keep actions away from the event relay.** If `relay_once` above shares this table, it would publish
-  the `SendEmailPending` row and mark it published, and the email would never be sent. Use a separate
+- **Keep actions away from the event relay.** If the event relay shares this table, it would publish the
+  `SendEmailPending` row and mark it published, and the email would never be sent. Use a separate
   `pending_actions` table, or make each loop filter on its own `event_type`.
 
 ### Worked scenario: the high-water-mark relay that loses one event forever

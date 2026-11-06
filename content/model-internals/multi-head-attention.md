@@ -165,16 +165,14 @@ import torch, torch.nn as nn
 class MHA(nn.Module):
     def __init__(self, d, h):
         super().__init__()
-        assert d % h == 0
         self.h, self.dk = h, d // h
         self.qkv = nn.Linear(d, 3 * d, bias=False)      # W_Q | W_K | W_V fused into one matmul
         self.o = nn.Linear(d, d, bias=False)            # W_O: lets heads mix and land anywhere
 
     def forward(self, x, causal=True):                  # x: [B, n, d]
         B, n, d = x.shape
-        q, k, v = self.qkv(x).chunk(3, dim=-1)          # each [B, n, d]
-        split = lambda t: t.view(B, n, self.h, self.dk).transpose(1, 2)   # -> [B, h, n, dk]
-        q, k, v = split(q), split(k), split(v)
+        q, k, v = (t.view(B, n, self.h, self.dk).transpose(1, 2)          # split: [B, n, d] -> [B, h, n, dk]
+                   for t in self.qkv(x).chunk(3, dim=-1))
         scores = q @ k.transpose(-2, -1) / self.dk ** 0.5                  # [B, h, n, n]
         if causal:
             future = torch.triu(torch.ones(n, n, dtype=torch.bool), 1)
@@ -187,8 +185,8 @@ x = torch.randn(2, 10, 512)
 for h in (1, 8, 64):
     m = MHA(512, h)
     y, attn = m(x)
-    print(f"h={h:2d} head_dim={512 // h:3d} params={sum(p.numel() for p in m.parameters()):,} "
-          f"attn={tuple(attn.shape)} out={tuple(y.shape)}")
+    n_params = sum(p.numel() for p in m.parameters())
+    print(f"h={h:2d} head_dim={512 // h:3d} params={n_params:,} attn={tuple(attn.shape)} out={tuple(y.shape)}")
 # h= 1 head_dim=512 params=1,048,576 attn=(2, 1, 10, 10) out=(2, 10, 512)
 # h= 8 head_dim= 64 params=1,048,576 attn=(2, 8, 10, 10) out=(2, 10, 512)
 # h=64 head_dim=  8 params=1,048,576 attn=(2, 64, 10, 10) out=(2, 10, 512)

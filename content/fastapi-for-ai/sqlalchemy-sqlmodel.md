@@ -308,141 +308,72 @@ flowchart TD
 ```
 
 ## Examples
-### SQLModel conversations and messages with the table/schema split
-Two sync endpoints. Sync endpoints run on the thread pool, which is fine for CRUD; the async session is
-a drop-in for the pattern in the async database lesson.
+### SQLModel: one table class, separate Create and Read schemas
+The request schema validates, the table class adds server-owned fields, and the Read schema decides what
+leaves the API. Runnable against in-memory SQLite.
 
 ```python
-from datetime import datetime, timezone
 from typing import Optional
-from fastapi import Depends, FastAPI
-from sqlalchemy import JSON, Column
-from sqlmodel import Field, Relationship, Session, SQLModel, create_engine, select
+from sqlmodel import Field, Session, SQLModel, create_engine, select
 
-class Conversation(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: str = Field(index=True)
-    messages: list["Message"] = Relationship(back_populates="conversation")
-
-class MessageBase(SQLModel):                        # fields the API and the table agree on
+class MessageBase(SQLModel):                   # fields the API and the table agree on
     role: str
     content: str
-    tool_calls: Optional[dict] = Field(default=None, sa_column=Column(JSON))
 
-class Message(MessageBase, table=True):
+class Message(MessageBase, table=True):        # the table adds server-owned fields
     id: Optional[int] = Field(default=None, primary_key=True)
-    conversation_id: int = Field(foreign_key="conversation.id", index=True)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    conversation: Conversation = Relationship(back_populates="messages")
+    conversation_id: int = Field(index=True)
 
-class MessageCreate(MessageBase): pass               # clients may not set id or timestamps
-class MessageRead(MessageBase):
+class MessageCreate(MessageBase): pass         # request body: clients cannot set id
+class MessageRead(MessageBase):                # response_model: what leaves the API
     id: int
-    created_at: datetime
 
-engine = create_engine("postgresql+psycopg://app:pw@db/app", pool_pre_ping=True)
-app = FastAPI()
+engine = create_engine("sqlite://")
+SQLModel.metadata.create_all(engine)
 
-def get_session():
-    with Session(engine) as session:
-        yield session
-
-@app.post("/conversations/{conv_id}/messages", response_model=MessageRead)
-def add_message(conv_id: int, body: MessageCreate, session: Session = Depends(get_session)):
-    msg = Message.model_validate(body, update={"conversation_id": conv_id})   # validated via the schema
-    session.add(msg); session.commit(); session.refresh(msg)
-    return msg
-
-@app.get("/conversations/{conv_id}/messages", response_model=list[MessageRead])
-def list_messages(conv_id: int, session: Session = Depends(get_session)):
-    stmt = select(Message).where(Message.conversation_id == conv_id).order_by(Message.id)
-    return session.exec(stmt).all()
+body = MessageCreate(role="user", content="hi")            # validated here, not in the table model
+with Session(engine) as session:
+    msg = Message.model_validate(body, update={"conversation_id": 1})
+    session.add(msg); session.commit()
+    rows = session.exec(select(Message).where(Message.conversation_id == 1)).all()
+    print([MessageRead.model_validate(m) for m in rows])
+# [MessageRead(role='user', content='hi', id=1)]
 ```
 
 ### Counting the N+1 and fixing it (plain SQLAlchemy 2.0)
-Self-contained against in-memory SQLite: a statement counter shows 51 queries for 50 conversations with
-lazy loading, and 2 with `selectinload`.
+A statement counter shows 51 queries for 50 conversations with lazy loading, and 2 with `selectinload`.
 
 ```python
 from sqlalchemy import ForeignKey, create_engine, event, select
-from sqlalchemy.orm import (DeclarativeBase, Mapped, Session, mapped_column, raiseload,
-                            relationship, selectinload)
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, selectinload
 
 class Base(DeclarativeBase): pass
-
 class Conversation(Base):
     __tablename__ = "conversation"
     id: Mapped[int] = mapped_column(primary_key=True)
-    messages: Mapped[list["Message"]] = relationship(back_populates="conversation")
+    messages: Mapped[list["Message"]] = relationship()
 
 class Message(Base):
     __tablename__ = "message"
     id: Mapped[int] = mapped_column(primary_key=True)
     conversation_id: Mapped[int] = mapped_column(ForeignKey("conversation.id"), index=True)
-    content: Mapped[str]
-    conversation: Mapped[Conversation] = relationship(back_populates="messages")
 
 engine = create_engine("sqlite://")
 Base.metadata.create_all(engine)
-with Session(engine) as s:
-    s.add_all([Conversation(messages=[Message(content=f"m{i}.{j}") for j in range(3)])
-               for i in range(50)])
-    s.commit()
-
-statements = 0
-@event.listens_for(engine, "before_cursor_execute")
-def _count(*args):
-    global statements; statements += 1
+with Session(engine) as s, s.begin():                        # commits on exit
+    s.add_all([Conversation(messages=[Message(), Message()]) for _ in range(50)])
+statements = []
+event.listen(engine, "before_cursor_execute", lambda *args: statements.append(1))
 
 def queries_for(*options) -> int:
-    global statements
-    statements = 0
+    statements.clear()
     with Session(engine) as s:
         for conv in s.scalars(select(Conversation).options(*options)):
-            len(conv.messages)                       # what a response serialiser does
-    return statements
+            len(conv.messages)                               # what a response serialiser does
+    return len(statements)
 
-print(queries_for())                                 # 51: 1 + one lazy load per conversation
+print(queries_for())                                     # 51: 1 + one lazy load per conversation
 print(queries_for(selectinload(Conversation.messages)))  # 2: one SELECT + one IN (...)
-# queries_for(raiseload("*")) raises instead of querying: use it in tests to lock the fix in.
-```
-
-### A safe DB tool for an agent (Core, bound parameters)
-The model picks the filter arguments; Core turns them into bound parameters, the schema bounds them,
-and a row cap keeps the tool result small enough for the context window. Runnable against in-memory SQLite.
-- **The tenant never comes from the model.** The customer is taken from the caller's auth context,
-  because bound parameters stop SQL injection but not a prompt that asks for another customer's rows.
-
-```python
-from pydantic import BaseModel, Field
-from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, insert, select
-
-meta = MetaData()
-orders = Table("orders", meta, Column("id", Integer, primary_key=True), Column("customer", String),
-               Column("item", String), Column("status", String))
-engine = create_engine("sqlite://")
-meta.create_all(engine)
-with engine.begin() as c:
-    c.execute(insert(orders), [{"customer": "acme", "item": "laptop", "status": "shipped"},
-                               {"customer": "acme", "item": "mouse", "status": "pending"},
-                               {"customer": "globex", "item": "laptop", "status": "shipped"}])
-
-class FindOrders(BaseModel):                       # the tool's JSON schema, shown to the model
-    item: str | None = Field(default=None, max_length=64)
-    status: str | None = Field(default=None, pattern="^(pending|shipped|cancelled)$")
-
-def find_orders(args: dict, customer: str) -> list[dict]:   # customer: from auth, not the model
-    a = FindOrders.model_validate(args)            # reject malformed model output
-    stmt = select(orders.c.id, orders.c.item, orders.c.status).where(orders.c.customer == customer)
-    if a.item:
-        stmt = stmt.where(orders.c.item == a.item)
-    if a.status:
-        stmt = stmt.where(orders.c.status == a.status)
-    with engine.connect() as c:                    # in production: a read-only DB role
-        return [dict(r._mapping) for r in c.execute(stmt.limit(20))]   # cap rows for the context
-
-print(find_orders({}, customer="acme"))                        # acme's 2 orders, never globex's
-print(find_orders({"item": "x' OR '1'='1"}, customer="acme"))  # [] : a bound value, never SQL
 ```
 
 ### Worked scenario: the list endpoint that slowed down in production
@@ -478,6 +409,11 @@ Same response body, same code path; only the loading strategy changed.
 - **Index every foreign key.** Set `index=True` on each foreign-key field (`Field(foreign_key=...,
   index=True)` or `mapped_column(ForeignKey(...), index=True)`), because Postgres does not create them.
   Monitor `seq_scan` counts in `pg_stat_user_tables` for child tables.
+- **The tenant never comes from the model.** A DB tool takes the customer or tenant from the caller's
+  auth context and ignores any tenant argument in the tool call, because bound parameters stop SQL
+  injection but not a prompt that asks for another customer's rows.
+- **Pre-ping pooled connections.** Create the engine with `pool_pre_ping=True` so a connection the
+  database or a proxy dropped while idle is replaced before use instead of failing the request.
 
 ## Trade-offs
 - **Unit of work vs per-object overhead.** The identity map and unit of work remove whole classes of bugs,

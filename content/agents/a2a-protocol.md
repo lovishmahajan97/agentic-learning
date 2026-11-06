@@ -209,45 +209,31 @@ compatibility layer.
 ```python
 import httpx, time, uuid
 
-BASE = "https://billing-agent.example.com"
-TOKEN = "..."                                             # obtained per the card's securitySchemes
+BASE, TOKEN = "https://billing-agent.example.com", "..."   # token per the card's securitySchemes
 card = httpx.get(f"{BASE}/.well-known/agent-card.json").json()
-print(card["name"], "skills:", [s["id"] for s in card["skills"]])
-can_stream = card.get("capabilities", {}).get("streaming", False)  # if True, prefer message/stream
 
 def rpc(method, params):
-    r = httpx.post(card["url"], timeout=30,
-                   headers={"Authorization": f"Bearer {TOKEN}"},
-                   json={"jsonrpc": "2.0", "id": str(uuid.uuid4()),
-                         "method": method, "params": params})
-    r.raise_for_status()
-    body = r.json()
-    if "error" in body:
-        raise RuntimeError(body["error"])
-    return body["result"]
+    body = httpx.post(card["url"], headers={"Authorization": f"Bearer {TOKEN}"}, timeout=30,
+                      json={"jsonrpc": "2.0", "id": str(uuid.uuid4()),
+                            "method": method, "params": params}).json()
+    return body["result"]                                   # a JSON-RPC "error" key means failure
 
-def user_message(text, task_id=None, context_id=None):
-    msg = {"role": "user", "messageId": str(uuid.uuid4()),
-           "parts": [{"kind": "text", "text": text}]}
-    if task_id:
-        msg["taskId"], msg["contextId"] = task_id, context_id  # continue the same task
-    return {"message": msg}
+def send(text, task=None):
+    msg = {"role": "user", "messageId": str(uuid.uuid4()), "parts": [{"kind": "text", "text": text}]}
+    if task:                                                # continue the same task
+        msg["taskId"], msg["contextId"] = task["id"], task["contextId"]
+    return rpc("message/send", {"message": msg})
 
-task = rpc("message/send", user_message("Refund invoice INV-2291, duplicate charge"))
-if task.get("kind") == "message":                        # answered directly, no task created
+task = send("Refund invoice INV-2291, duplicate charge")
+if task.get("kind") == "message":                           # answered directly, no task created
     raise SystemExit(task["parts"][0]["text"])
-while True:
-    state = task["status"]["state"]
-    if state in ("submitted", "working"):
+while (state := task["status"]["state"]) in ("submitted", "working", "input-required"):
+    if state == "input-required":                           # e.g. "Which card ending?"
+        task = send(input(task["status"]["message"]["parts"][0]["text"] + " "), task)
+    else:
         time.sleep(2)
         task = rpc("tasks/get", {"id": task["id"]})
-    elif state == "input-required":
-        question = task["status"]["message"]["parts"][0]["text"]  # e.g. "Which card ending?"
-        answer = input(question + " ")                   # surface it to the human
-        task = rpc("message/send", user_message(answer, task["id"], task["contextId"]))
-    else:                                                # completed, failed, canceled, rejected...
-        break
-print(state, [a.get("name") for a in task.get("artifacts", [])])
+print(state, [a.get("name") for a in task.get("artifacts", [])])  # completed, failed, canceled...
 ```
 
 A real client would stream instead of polling and persist `task["id"]` and `contextId` (see Production
@@ -308,6 +294,9 @@ belong on push.
 - **Quarantine peer artifacts.** Pass remote artifacts to your model as clearly delimited data, and require
   confirmation for any side effect that traces back to them. Monitor actions whose provenance is a peer
   agent's output.
+- **Fail fast on transport and protocol errors.** Set an HTTP timeout (30 s in the example) on every
+  JSON-RPC call, raise on non-2xx status, and treat an `error` member in the response body as a failure even
+  on HTTP 200. Check `capabilities.streaming` in the Agent Card and prefer `message/stream` when it is true.
 
 ## Trade-offs
 - **Vendor opacity vs debuggability.** Opaque agents cooperate without exposing internals, but the caller

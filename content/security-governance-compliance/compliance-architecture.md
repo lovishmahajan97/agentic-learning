@@ -263,12 +263,9 @@ regions.
 Every step of the agent loop goes through `route`, not only the first call.
 
 ```python
-from dataclasses import dataclass
+from collections import namedtuple
 
-@dataclass(frozen=True)
-class Endpoint:
-    name: str; region: str; baa: bool; dpa: bool; zero_retention: bool
-
+Endpoint = namedtuple("Endpoint", "name region baa dpa zero_retention")
 ENDPOINTS = [
     Endpoint("vendor-a-eu", "eu-central", baa=False, dpa=True, zero_retention=True),
     Endpoint("vendor-a-us", "us-east", baa=True, dpa=True, zero_retention=True),

@@ -274,47 +274,36 @@ for kf in (10, 100, 1_000, 10_000):
   tenth-nearest row ranked outside the unfiltered top-1,000, beyond any post-processing.
 
 ### Agent tool: a validated filter builder for model-chosen arguments
-The model proposes filters as tool arguments; code decides which survive. Security fields come only from
-the authenticated session. The filter is a Qdrant-style `must` list; adapt the shape to your engine.
+The model proposes filters as tool arguments; code decides which survive. The tool schema exposes only the
+`ALLOWED` enums and the range field; security fields come only from the authenticated session. The filter
+is a Qdrant-style `must` list; adapt the shape to your engine.
 
 ```python
-SEARCH_TOOL = {                                   # schema the agent sees: enums, no tenant field
-    "name": "search_docs",
-    "input_schema": {"type": "object", "properties": {
-        "query": {"type": "string"},
-        "doc_type": {"enum": ["contract", "email", "policy"]},
-        "language": {"enum": ["en", "fr", "de"]},
-        "created_at": {"type": "object", "properties": {"gte": {"type": "integer"}, "lt": {"type": "integer"}}},
-    }, "required": ["query"]},
-}
-ALLOWED = {"doc_type": {"contract", "email", "policy"}, "language": {"en", "fr", "de"}}
-RANGE_FIELDS = {"created_at"}                 # integer epoch seconds, never strings
-SECURITY = {"tenant_id", "allowed", "denied"}
+ALLOWED = {"doc_type": {"contract", "email", "policy"}, "language": {"en", "fr", "de"}}  # schema enums
+RANGE_FIELDS = {"created_at"}            # integer epoch seconds, never strings; no tenant field anywhere
 
 def build_filter(llm_filter, tenant_id):
     must = [{"key": "tenant_id", "match": {"value": tenant_id}}]   # from auth, never from the model
     for field, value in llm_filter.items():
-        if field in SECURITY:
-            continue                                               # model may not set security fields
         if field in ALLOWED and value in ALLOWED[field]:
             must.append({"key": field, "match": {"value": value}})
         elif (field in RANGE_FIELDS and isinstance(value, dict) and set(value) <= {"gte", "lt"}
-              and all(type(v) is int for v in value.values())):  # "2025-01-01" is dropped, not a crash
-            must.append({"key": field, "range": value})
-    return {"must": must}                                          # unknown fields are dropped, not guessed
+              and all(type(v) is int for v in value.values())):
+            must.append({"key": field, "range": value})            # "2025-01-01" is dropped, not a crash
+    return {"must": must}                                          # unknown and security fields dropped
 
 def handle_search_docs(run, args, session, k=10):                  # called from the agent loop
-    query, llm_filter = args["query"], {f: v for f, v in args.items() if f != "query"}
+    llm_filter = {f: v for f, v in args.items() if f != "query"}
     flt = build_filter(llm_filter, session.tenant_id)
-    hits = run(query, flt, k)
+    hits = run(args["query"], flt, k)
     applied = flt["must"][1:]                                      # only model filters that passed validation
     if not hits and applied:                                       # empty: likely misparse, relax, keep tenant
-        hits = run(query, build_filter({}, session.tenant_id), k)
+        hits = run(args["query"], build_filter({}, session.tenant_id), k)
         return {"results": hits, "note": f"no match for filters {applied}; showing unfiltered results"}
     return {"results": hits}
 
-f = build_filter({"doc_type": "contract", "tenant_id": "evil", "year": "2025"}, "acme")
-print(f)  # tenant stays 'acme'; unknown 'year' dropped; doc_type kept
+print(build_filter({"doc_type": "contract", "tenant_id": "evil", "year": "2025"}, "acme"))
+# {'must': [{'key': 'tenant_id', 'match': {'value': 'acme'}}, {'key': 'doc_type', 'match': {'value': 'contract'}}]}
 ```
 
 - **The `note` field matters.** It tells the model the filter was relaxed, so it can say "no contracts
@@ -354,6 +343,8 @@ or filtered traversal step 1 returns 10 correct hits, and the run ends in two ca
 - **Filtered recall in the eval gate.** Bucket labeled queries by selectivity, replay them with the
   filters your agent actually generated, and block deploys on recall@k drops in the 0.1% to 10% band.
   Monitor the same buckets in production traces.
+- **Strict range arguments.** Accept only known range operators (such as `gte` and `lt`) with integer
+  values, and drop anything else rather than passing it to the engine.
 
 ## Trade-offs
 - **Pre-filtering: exact vs scan cost.** Exact with respect to the predicate, but cost scales with the

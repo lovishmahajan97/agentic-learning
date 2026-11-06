@@ -198,37 +198,34 @@ of 12 queues for human handling. The gate compares the running config to the car
 when a slice fails, is under-sampled, is unmeasured, or the agent holds a tool the card never declared.
 
 ```python
-import hashlib, json
+import hashlib
 
-system_prompt = "You are the claims intake agent. Route claims to a queue. Never approve payouts."
-running = {"model": "vendor-model-2026-09", "tools": {"lookup_policy": "read", "route_claim": "write",
-           "send_email": "write"}, "prompt_sha256": hashlib.sha256(system_prompt.encode()).hexdigest()}
+prompt_sha = hashlib.sha256(b"You are the claims intake agent. Never approve payouts.").hexdigest()
+running = {"model": "vendor-model-2026-09", "prompt_sha256": prompt_sha,
+           "tools": ["lookup_policy", "route_claim", "send_email"]}
+card = {"model": "vendor-model-2026-09", "prompt_sha256": prompt_sha,
+        "tools": ["lookup_policy", "route_claim"],
+        "out_of_scope": ["Deciding claim approval or payout", "Non-English emails"],
+        "release_threshold": 0.85, "min_slice_n": 200,
+        "factors": ["language_variant", "channel", "attachment_present"]}
+# (score, n) per slice from the eval pipeline on the frozen task set. Illustrative numbers.
+results = {("channel", "web_form"): (0.91, 1800), ("channel", "email"): (0.89, 950),
+           ("channel", "broker_portal"): (0.78, 240), ("channel", "fax_scan"): (0.88, 40),
+           ("attachment_present", True): (0.86, 1100), ("attachment_present", False): (0.90, 1930)}
 
-card = {
-    "system": "claims-intake-agent", "version": "2026.10.1", "owner": "claims-ml@corp",
-    "model": "vendor-model-2026-09", "prompt_sha256": running["prompt_sha256"],
-    "tools": {"lookup_policy": "read", "route_claim": "write"},
-    "out_of_scope": ["Deciding claim approval or payout", "Non-English emails", "Voice transcripts"],
-    "metric": "task_success", "release_threshold": 0.85, "min_slice_n": 200,
-    "factors": ["language_variant", "channel", "attachment_present"],
-}
-# From the eval pipeline on the frozen task set: (score, n). Illustrative numbers.
-results = {
-    ("channel", "web_form"): (0.91, 1800), ("channel", "email"): (0.89, 950),
-    ("channel", "broker_portal"): (0.78, 240), ("channel", "fax_scan"): (0.88, 40),
-    ("attachment_present", True): (0.86, 1100), ("attachment_present", False): (0.90, 1930),
-}
-caveats = [f"Model drift: running {running['model']}"] if running["model"] != card["model"] else []
-if running["prompt_sha256"] != card["prompt_sha256"]: caveats.append("Prompt changed since card was signed")
+caveats = [f"{k} drifted from card" for k in ("model", "prompt_sha256") if running[k] != card[k]]
 caveats += [f"Undeclared tool: {t}" for t in running["tools"] if t not in card["tools"]]
 for (f, v), (s, n) in results.items():
     if n < card["min_slice_n"]: caveats.append(f"Too few examples to judge {f}={v} (n={n})")
     elif s < card["release_threshold"]: caveats.append(f"Below threshold on {f}={v} ({s:.2f}, n={n})")
-caveats += [f"No evaluation results for declared factor {f}" for f in card["factors"]
-            if f not in {f for f, _ in results}]
-print(json.dumps(caveats, indent=1))
-if caveats:
-    raise SystemExit("Release blocked: drift, undeclared tool, or a failing, small or unmeasured slice")
+measured = {f for f, _ in results}
+caveats += [f"No results for declared factor {f}" for f in card["factors"] if f not in measured]
+print("Release blocked" if caveats else "Release allowed", *caveats, sep="\n")
+# Release blocked
+# Undeclared tool: send_email
+# Below threshold on channel=broker_portal (0.78, n=240)
+# Too few examples to judge channel=fax_scan (n=40)
+# No results for declared factor language_variant
 ```
 
 - **The undeclared tool is the agent-specific catch.** Someone added `send_email` to the agent; the card

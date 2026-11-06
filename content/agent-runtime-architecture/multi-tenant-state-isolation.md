@@ -222,10 +222,8 @@ from contextlib import contextmanager
 DDL = """
 alter table agent_steps enable row level security;
 alter table agent_steps force row level security;   -- the table owner is not exempt
-create policy tenant_rows on agent_steps            -- FOR ALL; USING also acts as WITH CHECK on writes
-  using (tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid);
--- missing_ok=true plus nullif: an unset or reset ('') setting compares as NULL, so an unscoped request
--- sees zero rows and cannot insert any, instead of erroring or seeing everything: it fails closed.
+create policy tenant_rows on agent_steps            -- USING also acts as WITH CHECK on writes
+  using (tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid);  -- unset -> NULL -> 0 rows
 """
 
 @contextmanager
@@ -233,25 +231,19 @@ def tenant_tx(pool, ctx):
     with pool.connection() as conn, conn.transaction():
         # is_local=True: the setting dies with the transaction, so a pooled connection cannot carry it over
         conn.execute("select set_config('app.tenant_id', %s, true)", (ctx.tenant_id,))
-        yield conn                                                 # every query here is tenant-scoped by Postgres
+        yield conn
 
-def recall(vdb, ctx, query_vec, k=8):
-    # Qdrant-style filter built from ctx, never from tool arguments; applied inside the ANN search
+def recall(vdb, ctx, query_vec, k=8):           # Qdrant-style; filter from ctx, never tool args, inside the ANN search
     return vdb.search(collection_name="memory", query_vector=query_vec, limit=k,
-                      query_filter={"must": [{"key": "tenant_id", "match": {"value": ctx.tenant_id}},
-                                             {"key": "user_id",   "match": {"value": ctx.user_id}}]})
+                      query_filter={"must": [{"key": "tenant_id", "match": {"value": ctx.tenant_id}}]})
 
-def semantic_cache_key(ctx, model, normalised_prompt):
-    h = hashlib.sha256(normalised_prompt.encode()).hexdigest()
-    return f"semcache:{ctx.tenant_id}:{model}:{h}"                # tenant in the key, not the value
+def semantic_cache_key(ctx, model, prompt):     # tenant in the key, not the value
+    return f"semcache:{ctx.tenant_id}:{model}:{hashlib.sha256(prompt.encode()).hexdigest()}"
 
 def test_no_cross_tenant_leak(run_agent, ctx_a, ctx_b, stores):
-    marker = "zx-" + hashlib.sha256(b"canary-2026-10").hexdigest()[:10]
-    run_agent(ctx_a, f"Remember that our internal project codename is {marker}.")
-    answer = run_agent(ctx_b, "What is our internal project codename? Check memory and documents.")
-    assert marker not in answer
-    for store in stores:                                           # memory, cache, traces, step log
-        assert not store.contains(ctx_b.tenant_id, marker)
+    run_agent(ctx_a, "Remember that our internal project codename is zx-canary-7.")
+    assert "zx-canary-7" not in run_agent(ctx_b, "What is our internal project codename?")
+    assert not any(s.contains(ctx_b.tenant_id, "zx-canary-7") for s in stores)  # memory, cache, traces, log
 ```
 
 ### Worked numbers: why the vector filter placement matters
@@ -311,6 +303,10 @@ print(f"in-search filter returned {len(inside)}")   # 8
 - **Inventory-driven offboarding job** — when a tenant leaves or a deletion request arrives. Drive deletion
   from the surface inventory (rows, vectors, objects, cache keys by tenant prefix, traces, eval sets), then
   re-run the canary search to verify. Monitor per-surface deletion completeness in drills.
+- **Fail-closed RLS setting** — always. Read the tenant with `current_setting('app.tenant_id', true)` wrapped
+  in `nullif(..., '')`, so an unset or reset setting compares as NULL and an unscoped request sees and
+  inserts zero rows instead of erroring or seeing everything. Scope memory recall by `user_id` as well as
+  `tenant_id` when memories are per user.
 
 ## Trade-offs
 - **Shared stores vs dedicated ones.** Shared stores with enforced scoping are cheap and operationally simple,

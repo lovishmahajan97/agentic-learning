@@ -340,11 +340,6 @@ def save_safe(db: sqlite3.Connection, user: str, answer: str) -> None:
 
 cfg_safe = yaml.safe_load(open("agent.yaml"))
 # Weights: store as safetensors; for any pickle-based checkpoint, load only from trusted, pinned sources.
-
-# CI (fails the build on findings):
-#   uv export --format requirements-txt --no-hashes --no-emit-project > req.txt
-#   pip-audit -r req.txt --no-deps --disable-pip   # export is already fully resolved; skip pip install
-#   bandit -r src -ll                              # medium+ only: hides B105/B101, so run -l periodically
 ```
 
 - **Expect low-severity noise on the safe version too:** Bandit still reports `B603` (subprocess without a
@@ -416,6 +411,9 @@ pip-audit on the exported lock reports an advisory in `jinja2`, pulled in by a w
   B105 misses names like `API_KEY`. Rotate any key a scanner finds; deleting the commit is not enough.
 - **Model-artifact policy.** Accept only safetensors, pin model revisions, allowlist sources and keep
   `trust_remote_code=True` behind review, since no dependency scanner looks inside model files.
+- **CI command order.** `uv export --format requirements-txt --no-hashes --no-emit-project > req.txt`,
+  then `pip-audit -r req.txt --no-deps --disable-pip` (the export is already fully resolved, so skip the
+  pip install), then `bandit -r src -ll`; the `-ll` floor hides B105 and B101, so also run `-l` periodically.
 
 ## Trade-offs
 - **Current dependencies vs blocked work.** Failing CI on any pip-audit finding keeps dependencies current but

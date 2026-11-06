@@ -251,14 +251,10 @@ flowchart TD
 Pure Python; the numbers match the worked month below.
 
 ```python
+import math
+
 MINUTES = 30 * 24 * 60  # 43,200 in a 30-day month
 TIERS = [(0.95, 0.50), (0.99, 0.25), (0.995, 0.10)]  # (below this, credit share of fee)
-
-def allowance(target, minutes=MINUTES):
-    return (1 - target) * minutes
-
-def attainment(bad_minutes, minutes=MINUTES):
-    return 1 - bad_minutes / minutes
 
 def credit(avail, fee):
     for floor, pct in TIERS:          # most severe tier first
@@ -266,25 +262,16 @@ def credit(avail, fee):
             return pct * fee
     return 0.0
 
-def ceiling(own, *deps):
-    out = own
-    for d in deps:
-        out *= d
-    return out
-
 for t in (0.99, 0.995, 0.999, 0.9995, 0.9999):
-    print(f"{t:.2%} -> {allowance(t):.1f} min/month")   # 432.0, 216.0, 43.2, 21.6, 4.3
+    print(f"{t:.2%} -> {(1 - t) * MINUTES:.1f} min/month")   # 432.0, 216.0, 43.2, 21.6, 4.3
 
-incidents = {"provider outage": 140, "bad deploy": 95}
-for exclude_provider in (False, True):
-    bad = sum(m for name, m in incidents.items()
-              if not (exclude_provider and name.startswith("provider")))
-    a = attainment(bad)
-    print(f"exclude_provider={exclude_provider}: {bad} min, {a:.3%}, credit ${credit(a, 40_000):,.0f}")
-# exclude_provider=False: 235 min, 99.456%, credit $4,000
-# exclude_provider=True: 95 min, 99.780%, credit $0
+for bad in (140 + 95, 95):            # all downtime, then excluding the provider outage
+    a = 1 - bad / MINUTES
+    print(f"{bad} min, {a:.3%}, credit ${credit(a, 40_000):,.0f}")
+# 235 min, 99.456%, credit $4,000
+# 95 min, 99.780%, credit $0
 
-print(f"ceiling = {ceiling(0.999, 0.999, 0.9995):.4%}")   # 99.7502%
+print(f"ceiling = {math.prod([0.999, 0.999, 0.9995]):.4%}")   # 99.7502%
 ```
 
 ### Worked month: two incidents and a breach

@@ -284,11 +284,7 @@ Safe to run while the old code still serves traffic: the new column is nullable 
 code that never writes it keeps working.
 
 ```python
-"""chunks: add embedding_model (expand step)
-
-Revision ID: 7c1e2a9b4f10
-Revises: 3d5f0e8a1b22
-"""
+"""chunks: add embedding_model (expand step)"""
 from alembic import op
 import sqlalchemy as sa
 
@@ -297,65 +293,20 @@ down_revision = "3d5f0e8a1b22"
 
 
 def upgrade() -> None:
-    # Fail fast instead of queueing behind a long query and blocking every reader.
-    op.execute("SET lock_timeout = '5s'")
-    # Nullable, no default: a catalog-only change in PostgreSQL, no table rewrite
-    # (since PostgreSQL 11 a constant default is catalog-only too; a volatile one rewrites the table).
+    op.execute("SET lock_timeout = '5s'")      # fail fast instead of queueing every reader
+    # Nullable, no default: a catalog-only change in PostgreSQL, no table rewrite.
     op.add_column("chunks", sa.Column("embedding_model", sa.Text(), nullable=True))
-    # CREATE INDEX CONCURRENTLY is rejected inside a transaction block.
-    with op.get_context().autocommit_block():
-        op.create_index(
-            "ix_chunks_embedding_model",
-            "chunks",
-            ["embedding_model"],
-            postgresql_concurrently=True,
-        )
+    with op.get_context().autocommit_block():  # CONCURRENTLY is rejected inside a transaction
+        op.create_index("ix_chunks_embedding_model", "chunks", ["embedding_model"],
+                        postgresql_concurrently=True)
 
 
 def downgrade() -> None:
     with op.get_context().autocommit_block():
-        op.drop_index(
-            "ix_chunks_embedding_model",
-            table_name="chunks",
-            postgresql_concurrently=True,
-        )
+        op.drop_index("ix_chunks_embedding_model", table_name="chunks",
+                      postgresql_concurrently=True)
     op.drop_column("chunks", "embedding_model")
 ```
-
-### Expand step for an embedding-model switch (pgvector)
-The agent's retrieval tool keeps querying the old column while a batch job fills the new one. The
-dimension and index operator class are illustrative; match them to your new embedding model.
-
-```python
-"""chunks: add embedding_v2 for the new embedding model (expand step)"""
-from alembic import op
-import sqlalchemy as sa
-from pgvector.sqlalchemy import Vector          # autogenerate will not add this import for you
-
-revision = "9a4b6c1d2e33"
-down_revision = "7c1e2a9b4f10"
-
-
-def upgrade() -> None:
-    op.execute("CREATE EXTENSION IF NOT EXISTS vector")      # no-op where it already exists
-    op.execute("SET lock_timeout = '5s'")
-    op.add_column("chunks", sa.Column("embedding_v2", Vector(1024), nullable=True))   # catalog-only
-    # Shown here for brevity; on a big table put this in a later revision, after the backfill.
-    with op.get_context().autocommit_block():
-        op.execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_chunks_embedding_v2 "
-                   "ON chunks USING hnsw (embedding_v2 vector_cosine_ops)")
-
-
-def downgrade() -> None:
-    with op.get_context().autocommit_block():
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_chunks_embedding_v2")
-    op.drop_column("chunks", "embedding_v2")
-```
-
-- **Order matters for build time.** Building the vector index after the re-embed backfill is usually
-  faster than maintaining it row by row during the backfill; either way, check `pg_index.indisvalid`.
-- **Contract later.** Drop the old embedding column only after the retrieval tool, eval jobs and every
-  worker read `embedding_v2`.
 
 ### The three-release rollout
 | Release | Schema | Code | Notes |
@@ -373,18 +324,17 @@ Safe `NOT NULL` on a large table, because a plain `SET NOT NULL` scans the whole
 4. Drop the redundant check.
 
 ### Release 2 as a migration
-The sequence above, with each statement in its own transaction so the brief `ACCESS EXCLUSIVE` lock of
-the `ADD CONSTRAINT` is not still held while `VALIDATE` scans. The price: a failure midway leaves the
-earlier steps applied (a `NOT VALID` constraint), so drop it before rerunning.
+The sequence above, each statement committed on its own so the brief `ACCESS EXCLUSIVE` lock of the
+`ADD CONSTRAINT` is not still held while `VALIDATE` scans. If it fails midway, drop the `NOT VALID`
+constraint before rerunning.
 
 ```python
 def upgrade() -> None:
-    # autocommit_block: every statement commits on its own, so no lock is carried into the next step.
-    with op.get_context().autocommit_block():
-        op.execute("SET lock_timeout = '5s'")                      # session-level: applies to each step
+    with op.get_context().autocommit_block():                      # one commit per statement
+        op.execute("SET lock_timeout = '5s'")
         op.execute("ALTER TABLE chunks ADD CONSTRAINT ck_chunks_embedding_model_nn "
-                   "CHECK (embedding_model IS NOT NULL) NOT VALID")          # instant, brief lock
-        op.execute("ALTER TABLE chunks VALIDATE CONSTRAINT ck_chunks_embedding_model_nn")  # scans; reads/writes continue
+                   "CHECK (embedding_model IS NOT NULL) NOT VALID")          # instant
+        op.execute("ALTER TABLE chunks VALIDATE CONSTRAINT ck_chunks_embedding_model_nn")  # reads/writes continue
         op.execute("ALTER TABLE chunks ALTER COLUMN embedding_model SET NOT NULL")         # PG 12+: no re-scan
         op.execute("ALTER TABLE chunks DROP CONSTRAINT ck_chunks_embedding_model_nn")
 
@@ -424,6 +374,12 @@ alembic downgrade base && alembic upgrade head   # optional: downgrades are at l
 - **Offline SQL for customer DBAs.** For VPC installs where every statement is reviewed, ship the output of
   `alembic upgrade <from>:<to> --sql` with the release and keep data migrations expressible as plain SQL.
   Verify afterwards with `alembic current` against their database.
+- **Defaults and table rewrites.** Since PostgreSQL 11, adding a column with a constant default is
+  catalog-only too; a volatile default (such as `now()` or `random()`) still rewrites the whole table.
+- **pgvector column for an embedding-model switch.** Add the new `Vector(dim)` column nullable, with
+  `op.execute("CREATE EXTENSION IF NOT EXISTS vector")` and a hand-added
+  `from pgvector.sqlalchemy import Vector` (autogenerate omits it). Build its HNSW index `CONCURRENTLY`
+  after the re-embed backfill, which is usually faster than maintaining it during the backfill.
 
 ## Trade-offs
 - **Less typing vs destructive drafts.** Autogenerate saves typing and catches forgotten columns, but

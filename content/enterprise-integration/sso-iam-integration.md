@@ -250,16 +250,13 @@ def jwks_client(issuer: str) -> jwt.PyJWKClient:
 def validate_id_token(tenant_slug: str, token: str, expected_nonce: str) -> dict:
     t = TENANTS[tenant_slug]                       # routed by home realm discovery, never by the token
     key = jwks_client(t["issuer"]).get_signing_key_from_jwt(token).key
-    claims = jwt.decode(
-        token, key, algorithms=["RS256"],
-        audience=t["client_id"], issuer=t["issuer"],  # rejects tokens from any other tenant
-        leeway=60, options={"require": ["exp", "iat", "iss", "aud", "sub"]},
-    )
+    claims = jwt.decode(token, key, algorithms=["RS256"], audience=t["client_id"],
+                        issuer=t["issuer"],        # rejects tokens from any other tenant
+                        leeway=60, options={"require": ["exp", "iat", "iss", "aud", "sub"]})
     if claims.get("nonce") != expected_nonce:
         raise PermissionError("nonce mismatch (possible replay)")
     user_key = (claims["iss"], claims.get("oid") or claims["sub"])  # stable, not email
-    return {"user_key": user_key, "email": claims.get("email"),
-            "roles": claims.get("roles", []), "groups": claims.get("groups", [])}
+    return {"user_key": user_key, "roles": claims.get("roles", []), "groups": claims.get("groups", [])}
 ```
 
 - **The crucial line is `issuer=t["issuer"]`**, chosen from the tenant the user was routed to. A valid
@@ -275,22 +272,18 @@ ISSUER_TEMPLATE = "https://login.microsoftonline.com/{tenantid}/v2.0"  # as /org
 
 def home_realm(email: str) -> str:
     """Route by verified-domain table before login; the token never picks the tenant."""
-    domain = email.rsplit("@", 1)[-1].lower()
-    if domain not in TENANT_BY_DOMAIN:
-        raise LookupError(f"no SSO configured for {domain}")
-    return TENANT_BY_DOMAIN[domain]
-
-def expected_entra_issuer(tenant: str) -> str:
-    return ISSUER_TEMPLATE.replace("{tenantid}", ONBOARDED_ENTRA[tenant])  # exact compare, never skip
+    return TENANT_BY_DOMAIN[email.rsplit("@", 1)[-1].lower()]   # KeyError: no SSO for this domain
 
 def check_entra_claims(tenant: str, claims: dict) -> tuple:
     tid = ONBOARDED_ENTRA[tenant]
-    if claims.get("tid") != tid or claims.get("iss") != expected_entra_issuer(tenant):
+    if claims.get("tid") != tid or claims.get("iss") != ISSUER_TEMPLATE.replace("{tenantid}", tid):
         raise PermissionError("token from a tenant this workspace did not onboard")
     return (tid, claims["oid"])                                     # stable user key
 
-t = home_realm("Ana@ACME.com")
-print(expected_entra_issuer(t))   # .../11111111-2222-3333-4444-555555555555/v2.0
+tid = ONBOARDED_ENTRA["acme"]
+good = {"tid": tid, "iss": ISSUER_TEMPLATE.replace("{tenantid}", tid), "oid": "u-42"}
+print(check_entra_claims(home_realm("Ana@ACME.com"), good))  # ('11111111-2222-3333-4444-555555555555', 'u-42')
+check_entra_claims("acme", good | {"tid": "another-tenant"})  # PermissionError: ... did not onboard
 ```
 
 ### An agent tool calling Microsoft Graph on behalf of the user
@@ -300,11 +293,8 @@ on-behalf-of grant, so Graph enforces the user's own permissions. Uses MSAL for 
 ```python
 import msal, requests
 
-app = msal.ConfidentialClientApplication(
-    client_id="<agent-backend-client-id>",
-    authority="https://login.microsoftonline.com/<acme-tenant-id>",   # the user's tenant, not /common
-    client_credential="<secret-or-certificate>",
-)
+app = msal.ConfidentialClientApplication("<agent-backend-client-id>", client_credential="<secret-or-certificate>",
+    authority="https://login.microsoftonline.com/<acme-tenant-id>")   # the user's tenant, not /common
 
 def list_my_recent_files(user_access_token: str) -> list[str]:
     """Tool: runs as the signed-in user; the model never sees either token."""

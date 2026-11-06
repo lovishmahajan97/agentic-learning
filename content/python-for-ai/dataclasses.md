@@ -308,13 +308,13 @@ flowchart TD
 ```
 
 ## Examples
-### An agent run trace: immutable steps, a budget, loop detection
+### An agent run trace: immutable steps and loop detection
 Steps are frozen records, the run owns a fresh list, a retry is a `replace` rather than a mutation, and
-the hashable step fields make a repeated identical tool call visible. Passes `mypy --strict`.
+the hashable step fields make a repeated identical tool call visible.
 
 ```python
 import json
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ToolStep:                                  # one immutable entry in the agent's trace
@@ -323,120 +323,52 @@ class ToolStep:                                  # one immutable entry in the ag
     args_json: str                               # canonical JSON text, so the step stays hashable
     output: str = field(repr=False)              # can be huge: keep out of logs
     input_tokens: int
-    output_tokens: int
 
-@dataclass(slots=True)
+@dataclass
 class Run:
     task: str
-    max_steps: int = 8
     steps: list[ToolStep] = field(default_factory=list)   # fresh list per run
-
-    def record(self, step: ToolStep) -> None:
-        if len(self.steps) >= self.max_steps:
-            raise RuntimeError("step budget exhausted")
-        self.steps.append(step)
-
-    @property
-    def tokens(self) -> int:
-        return sum(s.input_tokens + s.output_tokens for s in self.steps)
 
 run = Run("Find the refund policy")
 s = ToolStep(index=0, tool="search", args_json=json.dumps({"q": "refund"}, sort_keys=True),
-             output="...40 KB of HTML...", input_tokens=1800, output_tokens=60)
-run.record(s)
-run.record(replace(s, index=1, input_tokens=2400))     # a retry: new record, original untouched
-print(run.steps[0])            # ToolStep(index=0, tool='search', args_json='{"q": "refund"}', input_tokens=1800, output_tokens=60)
-print(run.tokens)              # 4320
-seen = {(st.tool, st.args_json) for st in run.steps}
-print(len(seen))               # 1: the same call twice, a loop signal
-trace = asdict(run)            # deep copy, ready for json.dumps to a trace store
-print(sorted(trace))           # ['max_steps', 'steps', 'task']
+             output="...40 KB of HTML...", input_tokens=1800)
+run.steps += [s, replace(s, index=1, input_tokens=2400)]  # a retry: new record, original untouched
+print(run.steps[0])    # ToolStep(index=0, tool='search', args_json='{"q": "refund"}', input_tokens=1800)
+print(len({(st.tool, st.args_json) for st in run.steps}))  # 1: the same call twice, a loop signal
 ```
 
 - **Why `args_json` and not `args: dict`:** a dict field would make the frozen step unhashable, so it
-  could not go in the `seen` set; canonical JSON text (`sort_keys=True`) keeps equal calls equal.
+  could not go in a set; canonical JSON text (`sort_keys=True`) keeps equal calls equal.
 - **The repr hides the 40 KB output**, so printing the step in a log line stays one line.
 
-### Frozen config as a cache key, mutable step record
-A frozen, slotted config works as a cache key; the step record gets a per-instance default list; `replace`
-produces a varied config without touching the original.
+### Frozen config as a cache key
+A frozen config with tuple-typed collections works as an `lru_cache` key, and `replace` produces a
+variant without touching the original.
 
 ```python
-import time
-from dataclasses import dataclass, field, replace, asdict
+from dataclasses import dataclass, replace
 from functools import lru_cache
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class GenConfig:
     model: str
     temperature: float = 0.0
-    max_tokens: int = 256
     stop: tuple[str, ...] = ()            # tuple, not list, so the instance stays hashable
 
-    def __post_init__(self) -> None:
-        if not 0.0 <= self.temperature <= 2.0:
-            raise ValueError(f"temperature out of range: {self.temperature}")
-
-@dataclass(slots=True)
-class Step:
-    tool: str
-    args: dict[str, object]
-    started: float = field(default_factory=time.time)
-    output: str | None = field(default=None, repr=False)   # keep big payloads out of logs
-    notes: list[str] = field(default_factory=list)         # a fresh list per instance
-
 @lru_cache(maxsize=1024)
-def completion(prompt: str, cfg: GenConfig) -> str:        # cfg is hashable, so it can be a key
-    return f"<{cfg.model}@{cfg.temperature}> {prompt[:24]}"
+def completion(prompt: str, cfg: GenConfig) -> str:   # cfg is hashable, so it can be a key
+    return f"<{cfg.model}@{cfg.temperature}> {prompt}"
 
-base = GenConfig(model="gpt-4o-mini")
-hot = replace(base, temperature=0.9)                       # new object; base unchanged
-completion("Summarise the KV cache", base)
-completion("Summarise the KV cache", GenConfig("gpt-4o-mini"))
-print(completion.cache_info().hits)                        # 1: equal configs are the same key
-try:
-    base.temperature = 1.0
-except Exception as e:
-    print(type(e).__name__)                                # FrozenInstanceError
-
-s1, s2 = Step("search", {"q": "a"}), Step("search", {"q": "b"})
-s1.notes.append("retried"); print(s2.notes)                # []: default_factory did its job
-print(s1)                                                  # Step(tool='search', args={'q': 'a'}, started=..., notes=['retried'])
-print(asdict(s1)["notes"] is s1.notes)                     # False: asdict deep-copies
+base = GenConfig("gpt-4o-mini")
+hot = replace(base, temperature=0.9)                  # new object; base unchanged
+completion("Hi", base)
+completion("Hi", GenConfig("gpt-4o-mini"))
+print(completion.cache_info().hits, base.temperature, hot.temperature)  # 1 0.0 0.9
 ```
 
 - **Break it on purpose:** change `stop` to `list[str]` with a `default_factory` and `lru_cache` raises
   `TypeError: unhashable type`, because a frozen dataclass's hash is built from its fields and a list
   has none.
-
-### Derived field on a frozen class, plus a required subclass field
-The `object.__setattr__` escape hatch sets `n_tokens`, and `KW_ONLY` lets a subclass add a required
-`tenant` after a defaulted base field. Passes `mypy --strict`.
-
-```python
-from dataclasses import KW_ONLY, dataclass, field, fields
-
-@dataclass(frozen=True)
-class Chunk:
-    text: str
-    score: float = 0.0
-    n_tokens: int = field(init=False)          # derived, not a constructor argument
-
-    def __post_init__(self) -> None:
-        # self.n_tokens = ... would raise FrozenInstanceError here
-        object.__setattr__(self, "n_tokens", len(self.text.split()))
-
-@dataclass(frozen=True)
-class TenantChunk(Chunk):
-    _: KW_ONLY
-    tenant: str                                # required, yet after a defaulted base field
-
-c = TenantChunk("kv cache stores keys and values", 0.82, tenant="acme")
-print(c.n_tokens, c.tenant)                    # 6 acme
-print([f.name for f in fields(c)])             # ['text', 'score', 'n_tokens', 'tenant']
-print(c == TenantChunk("kv cache stores keys and values", 0.82, tenant="acme"))  # True
-print(len({c, c}))                             # 1: frozen + eq gives a hash
-```
 
 ## Production patterns
 - **Immutable step records, append-only runs.** Record each model turn and tool call as a frozen

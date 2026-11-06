@@ -227,8 +227,7 @@ judge only the final reply, then the reply plus every tool call and result. Numb
 | With tool results | 0.95 × 0.75 + 0.15 × 0.25 = 75% | 79% | 4 points |
 
 ```python
-def judge_view(trace, include_tools=True):
-    """Render the slice of an agent trace the judge sees. trace: list of step dicts."""
+def judge_view(trace, include_tools=True):     # the slice of an agent trace the judge sees
     lines = []
     for step in trace:
         if step["type"] == "tool_call" and include_tools:
@@ -249,9 +248,7 @@ function wraps whatever LLM call you use and returns `"A"` or `"B"`.
 ```python
 import statistics as st
 
-def judge(question, first, second) -> str:
-    """Show `first` as A and `second` as B; return 'A' or 'B'. Wrap your LLM call here."""
-    raise NotImplementedError
+def judge(question, first, second) -> str: ...  # wrap your LLM call: `first` shown as A; returns "A" or "B"
 
 def calibrate(pairs, human):
     """pairs: [(q, x, y)]; human: [1 or 2] = which of x, y the human majority preferred."""
@@ -302,20 +299,17 @@ def corrected(p_obs, tpr, tnr):
 def bootstrap(judge, human, p_obs, n=2000, seed=0):
     """judge, human: parallel 0/1 lists on the human-labeled calibration set."""
     rng, pairs, out = random.Random(seed), list(zip(judge, human)), []
-    for _ in range(n):
-        s = [rng.choice(pairs) for _ in pairs]
+    for _ in range(n):                    # resample the calibration set, re-estimate TPR and TNR
+        s = rng.choices(pairs, k=len(pairs))
         pos = [j for j, h in s if h == 1]; neg = [j for j, h in s if h == 0]
-        tpr = sum(pos) / len(pos); tnr = 1 - sum(neg) / len(neg)
-        try: out.append(corrected(p_obs, tpr, tnr))
-        except ValueError: pass
+        out.append(corrected(p_obs, sum(pos) / len(pos), 1 - sum(neg) / len(neg)))
     out.sort()
-    return out[int(0.025 * len(out))], out[int(0.975 * len(out))]
+    return out[int(0.025 * n)], out[int(0.975 * n)]
 
 # Calibration set: 200 human-pass items (judge passes 190), 100 human-fail (judge fails 70)
 human = [1] * 200 + [0] * 100
 judge = [1] * 190 + [0] * 10 + [0] * 70 + [1] * 30
 print(round(corrected(0.82, 0.95, 0.70), 3))   # 0.8: the 82% headline is really ~80%
-print(round(corrected(0.755, 0.95, 0.70), 3))  # 0.7
 print(bootstrap(judge, human, p_obs=0.82))     # roughly (0.75, 0.85) on this set
 ```
 

@@ -262,147 +262,90 @@ flowchart TD
 ## Examples
 ### Agent scenario: a tool-argument parser that never crashes the loop
 The model's tool call arrives as a JSON string. The parser must return `{"ok": args}` or
-`{"error": message}` for any input, so the agent can feed errors back instead of crashing; valid
-arguments must survive unchanged.
+`{"error": message}` for any input, so the agent can feed errors back instead of crashing.
 
 ```python
 import json
 from hypothesis import given, strategies as st
-
-SCHEMA = {"city": str, "days": int}
 
 def parse_tool_args(raw: str) -> dict:
     try:
         args = json.loads(raw)
     except json.JSONDecodeError as e:
         return {"error": f"arguments are not valid JSON: {e.msg}"}
-    if not isinstance(args, dict):
-        return {"error": "arguments must be a JSON object"}
-    missing = [k for k in SCHEMA if k not in args]
-    if missing:
-        return {"error": f"missing: {', '.join(missing)}"}
-    bad = [k for k, t in SCHEMA.items() if type(args[k]) is not t]   # rejects True for int
-    if bad:
-        return {"error": f"wrong type: {', '.join(bad)}"}
-    return {"ok": {k: args[k] for k in SCHEMA}}
-
-scalars = st.none() | st.booleans() | st.integers() | st.text()
+    if not isinstance(args, dict) or type(args.get("days")) is not int:   # rejects True for int
+        return {"error": "need a JSON object with an integer 'days'"}
+    return {"ok": {"days": args["days"]}}
 
 @given(st.text())
 def test_any_text_gives_result_or_error(raw):
     assert set(parse_tool_args(raw)) in ({"ok"}, {"error"})
-
-@given(st.dictionaries(st.text(), scalars))
-def test_any_object_gives_result_or_error(args):
-    assert set(parse_tool_args(json.dumps(args))) in ({"ok"}, {"error"})
-
-@given(city=st.text(), days=st.integers(), extra=st.dictionaries(st.text(), scalars))
-def test_valid_args_pass_through(city, days, extra):
-    raw = json.dumps({**extra, "city": city, "days": days})
-    assert parse_tool_args(raw) == {"ok": {"city": city, "days": days}}
 ```
 
-- **Total, not just correct:** the first two properties encode "the loop never crashes on model output",
-  which is the property agent incidents usually violate.
-- **Extra keys on purpose:** models add fields you did not ask for; the third property states that they
-  are dropped, not that they break the call.
+- **Total, not just correct:** the property encodes "the loop never crashes on model output", which is
+  the property agent incidents usually violate. Hypothesis feeds empty strings, whitespace, control
+  characters and non-ASCII text you would never type by hand.
 
-### Chunker and tool-argument round-trip
-A retrieval chunker with overlap. The contract: no chunk exceeds `size`, only the last may be short,
-consecutive chunks really share `overlap` characters, and dropping each later chunk's overlap rejoins
-the text exactly.
+### Chunker with overlap
+A retrieval chunker. The contract: only the last chunk may be short, consecutive chunks really share
+`overlap` characters, and dropping each later chunk's overlap rejoins the text exactly.
 
 An earlier version used `range(0, len(text), step)`; Hypothesis failed it at once and shrank the
 counterexample to `text=''`, where that version returned no chunks at all.
 
 ```python
-import json
 from hypothesis import given, strategies as st
 
 def chunk(text: str, size: int, overlap: int) -> list[str]:
-    if not 0 <= overlap < size:
-        raise ValueError("need 0 <= overlap < size")
-    step = size - overlap
-    return [text[i:i + size] for i in range(0, max(len(text) - overlap, 1), step)]
+    return [text[i:i + size] for i in range(0, max(len(text) - overlap, 1), size - overlap)]
 
 @given(text=st.text(max_size=2000), size=st.integers(1, 200), data=st.data())
 def test_chunk_properties(text, size, data):
     overlap = data.draw(st.integers(0, size - 1), label="overlap")
     chunks = chunk(text, size, overlap)
-    assert chunks, "always at least one chunk"
-    assert all(len(c) <= size for c in chunks)
     assert all(len(c) == size for c in chunks[:-1])           # only the last chunk may be short
     assert all(a[len(a) - overlap:] == b[:overlap] for a, b in zip(chunks, chunks[1:]))
     assert chunks[0] + "".join(c[overlap:] for c in chunks[1:]) == text
-
-json_values = st.recursive(
-    st.none() | st.booleans() | st.integers() | st.text(),        # no floats: NaN != NaN
-    lambda inner: st.lists(inner) | st.dictionaries(st.text(), inner),
-)
-
-@given(st.dictionaries(st.text(min_size=1), json_values))
-def test_tool_args_round_trip(args):
-    assert json.loads(json.dumps(args)) == args
 
 def test_empty_text_regression():          # the shrunk counterexample, pinned as a plain test
     assert chunk("", size=4, overlap=1) == [""]
 ```
 
-- **Five assertions encode the spec.** The full-length and shared-overlap checks matter: without them a
+- **The assertions encode the spec.** The full-length and shared-overlap checks matter: without them a
   chunker emitting one character per chunk would still rejoin correctly and pass whenever `overlap` is 0.
 - **Coverage no example set gives:** size 1, overlap `size - 1`, empty text and non-ASCII text, all at once.
-- **Floats excluded on purpose** from the round-trip, because `NaN` breaks equality; property tests force
-  you to decide such facts explicitly.
 
-### Stateful: an LRU cache against a dict-and-list model
+### Stateful: an LRU cache against a list model
 Runnable with `pip install hypothesis pytest`; pytest collects `TestLRU`.
 
 ```python
 from collections import OrderedDict
 from hypothesis import strategies as st
-from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
+from hypothesis.stateful import RuleBasedStateMachine, rule
 
-class LRU:                                         # the code under test
-    def __init__(self, capacity: int):
-        self.capacity, self.data = capacity, OrderedDict()
+class LRU(OrderedDict):                            # the code under test, capacity 3
     def get(self, k):
-        if k not in self.data:
-            return None
-        self.data.move_to_end(k)                   # delete this line to see the bug found
-        return self.data[k]
+        if k in self: self.move_to_end(k)          # delete this line to see the bug found
+        return super().get(k)
     def put(self, k, v):
-        self.data[k] = v
-        self.data.move_to_end(k)
-        if len(self.data) > self.capacity:
-            self.data.popitem(last=False)          # evict least recently used
+        self[k] = v
+        self.move_to_end(k)
+        if len(self) > 3:
+            self.popitem(last=False)               # evict least recently used
 
 class LRUMachine(RuleBasedStateMachine):
     def __init__(self):
         super().__init__()
-        self.cache, self.model, self.recency = LRU(3), {}, []   # model: dict + list
-
-    def _touch(self, k):
-        if k in self.recency:
-            self.recency.remove(k)
-        self.recency.append(k)
-
+        self.cache, self.model = LRU(), []         # model: (key, value) pairs, oldest first
     @rule(k=st.integers(0, 5), v=st.integers())
     def put(self, k, v):
         self.cache.put(k, v)
-        self.model[k] = v
-        self._touch(k)
-        if len(self.recency) > 3:
-            del self.model[self.recency.pop(0)]
-
+        self.model = [p for p in self.model if p[0] != k][-2:] + [(k, v)]
     @rule(k=st.integers(0, 5))
     def get(self, k):
-        assert self.cache.get(k) == self.model.get(k)
-        if k in self.model:
-            self._touch(k)
-
-    @invariant()
-    def within_capacity(self):
-        assert len(self.cache.data) <= 3
+        hit = [p for p in self.model if p[0] == k]
+        assert self.cache.get(k) == (hit[0][1] if hit else None)
+        self.model = [p for p in self.model if p[0] != k] + hit
 
 TestLRU = LRUMachine.TestCase
 ```
@@ -448,6 +391,8 @@ Rough orders of magnitude for a suite of 40 property tests at ~2 ms per example 
 - **A "never raises" property per tool.** Every tool the model can call gets one property feeding it
   arbitrary argument JSON and asserting a result or a typed error. Monitor production tool exceptions
   that escaped the dispatcher; each is a missing property.
+- **Decide float handling in round-trip properties.** `NaN != NaN` breaks equality, so leave floats out
+  of JSON round-trip strategies or use `st.floats(allow_nan=False)`.
 
 ## Trade-offs
 - **Coverage vs effort.** Properties cover far more of the input space but are harder to write; for code

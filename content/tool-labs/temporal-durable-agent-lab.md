@@ -473,60 +473,40 @@ Install with `pip install temporalio-openai-agents==1.1.0`. It pins `openai-agen
 resolved here) while openai-agents is at 0.24.0, so check your own pin first. Checked 2026-11.
 
 ```python
-# agents_step.py: the same agent on the OpenAI Agents SDK, made durable by Temporal's plugin.
-# Checked against temporalio-openai-agents 1.1.0 (openai-agents 0.22.3), 2026-11. Offline: TestModel.
+# agents_step.py: pip install temporalio-openai-agents==1.1.0 (pins openai-agents 0.22.x)
 import asyncio
 from datetime import timedelta
-
 from agents import Agent, Runner
 from temporalio import workflow
 from temporalio.openai_agents.testing import AgentEnvironment, ResponseBuilders, TestModel
 from temporalio.openai_agents.workflow import activity_as_tool
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
-
 with workflow.unsafe.imports_passed_through():
-    from refund_agent import CALLS, lookup_order
-
-
+    from refund_agent import lookup_order
 @workflow.defn
 class SdkRefundAgent:
     @workflow.run
-    async def run(self, request: str) -> str:
-        agent = Agent(
-            name="refunds",
-            instructions="Look up the order before answering.",
-            tools=[activity_as_tool(lookup_order, start_to_close_timeout=timedelta(seconds=30))],
-        )
-        result = await Runner.run(agent, request)      # each model call becomes an activity
-        return result.final_output
+    async def run(self, request: str) -> str:   # each model call runs as an activity
+        tool = activity_as_tool(lookup_order, start_to_close_timeout=timedelta(seconds=30))
+        return (await Runner.run(Agent(name="refunds", tools=[tool]), request)).final_output
 
-
-async def main() -> None:
-    model = TestModel.returning_responses([
-        ResponseBuilders.tool_call('{"order_id": "A-1001"}', "lookup_order"),
-        ResponseBuilders.output_message("Order A-1001 was delivered, so it is eligible for a refund."),
-    ])
-    async with await WorkflowEnvironment.start_time_skipping() as env:
-        async with AgentEnvironment(model=model) as agent_env:
-            client = agent_env.applied_on_client(env.client)     # adds OpenAIAgentsPlugin
-            async with Worker(client, task_queue="sdk-refunds", workflows=[SdkRefundAgent],
-                              activities=[lookup_order]):
-                h = await client.start_workflow(SdkRefundAgent.run, "Can I get a refund on A-1001?",
-                                                id="sdk-refund-A-1001", task_queue="sdk-refunds")
-                print("result:", await h.result())
-                kinds = [e.activity_task_scheduled_event_attributes.activity_type.name
-                         for e in (await h.fetch_history()).events
-                         if e.HasField("activity_task_scheduled_event_attributes")]
-                print("activities:", kinds, "| tool runs:", CALLS)
-
-
+async def main():
+    model = TestModel.returning_responses([ResponseBuilders.tool_call('{"order_id": "A-1001"}', "lookup_order"),
+                                           ResponseBuilders.output_message("A-1001 is eligible for a refund.")])
+    async with await WorkflowEnvironment.start_time_skipping() as env, AgentEnvironment(model=model) as ae:
+        client = ae.applied_on_client(env.client)  # adds OpenAIAgentsPlugin
+        async with Worker(client, task_queue="q", workflows=[SdkRefundAgent], activities=[lookup_order]):
+            h = await client.start_workflow(SdkRefundAgent.run, "Refund A-1001?", id="sdk-1", task_queue="q")
+            print(await h.result())  # A-1001 is eligible for a refund.
+            events = (await h.fetch_history()).events  # 2 model calls and 1 tool, all activities
+            print([n for e in events if (n := e.activity_task_scheduled_event_attributes.activity_type.name)])
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-It prints the answer and `activities: ['invoke_model_activity', 'lookup_order',
-'invoke_model_activity']`, plus a note that trace export is skipped without `OPENAI_API_KEY`. In
+It prints the answer and `['invoke_model_activity', 'lookup_order', 'invoke_model_activity']`,
+plus a note that trace export is skipped without `OPENAI_API_KEY`. In
 production, add `OpenAIAgentsPlugin(model_params=ModelActivityParameters(...))` to the client. The old
 `temporalio.contrib.openai_agents` path only forwards to `temporalio.openai_agents`.
 

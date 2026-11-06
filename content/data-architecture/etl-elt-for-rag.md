@@ -230,36 +230,36 @@ reconciliation deletes orphaned chunks of re-chunked documents. The stores are s
 tables and a vector database.
 
 ```python
-import hashlib, json
+import hashlib
 
 CHUNKER_VERSION, EMBED_MODEL = "v3-semantic", "text-embedding-3-small"
+cache, index, calls = {}, {}, []      # stand-ins: cache table, vector DB, provider calls
 
 def h(*parts):
     return hashlib.sha256("|".join(map(str, parts)).encode()).hexdigest()[:24]
 
-def build_chunks(doc_id, doc_version, parsed_sections, chunker):
-    rows = []
-    for pos, (section_path, text) in enumerate(chunker(parsed_sections)):
-        rows.append({"chunk_id": h(doc_id, doc_version, CHUNKER_VERSION, pos),
-                     "doc_id": doc_id, "doc_version": doc_version,
-                     "chunker_version": CHUNKER_VERSION, "position": pos,
-                     "text": f"{section_path}\n{text}",            # cheap enrichment: section path
-                     "text_hash": h(section_path, text)})
-    return rows
+def build_chunks(doc_id, doc_version, sections):   # sections: [(section_path, text)], one chunk each
+    return [{"chunk_id": h(doc_id, doc_version, CHUNKER_VERSION, pos), "doc_id": doc_id,
+             "text": f"{path}\n{text}", "text_hash": h(path, text)}   # cheap enrichment: section path
+            for pos, (path, text) in enumerate(sections)]
 
-def embed_stage(chunks, cache, embed_fn):
-    todo = [c for c in chunks if (EMBED_MODEL, c["text_hash"]) not in cache]
-    for c, vec in zip(todo, embed_fn([c["text"] for c in todo])):   # batched, rate-limited call
-        cache[(EMBED_MODEL, c["text_hash"])] = vec
-    return [(c["chunk_id"], cache[(EMBED_MODEL, c["text_hash"])], c) for c in chunks]
+def embed_stage(chunks):
+    for c in chunks:
+        if (EMBED_MODEL, c["text_hash"]) not in cache:              # one batched call in production
+            calls.append(c["text"]); cache[(EMBED_MODEL, c["text_hash"])] = [0.1, 0.2]
+    return chunks
 
-def reconcile_index(index, doc_id, rows):
-    live = {cid for cid, _, _ in rows}
-    for cid, vec, meta in rows:
-        index.upsert(cid, vec, {k: meta[k] for k in ("doc_id", "doc_version", "position")})
-    stale = index.ids_for_doc(doc_id) - live                       # chunks from an older chunker version
-    index.delete(stale)
+def reconcile_index(doc_id, rows):
+    live = {r["chunk_id"] for r in rows}
+    for r in rows:                                                  # upsert before delete
+        index[r["chunk_id"]] = (cache[(EMBED_MODEL, r["text_hash"])], doc_id)
+    stale = {cid for cid, (_, d) in index.items() if d == doc_id} - live
+    for cid in stale: del index[cid]
     return {"upserted": len(live), "deleted": len(stale)}
+
+reconcile_index("kb/1", embed_stage(build_chunks("kb/1", "h1", [("Refunds", "5 days."), ("Contact", "Chat.")])))
+print(reconcile_index("kb/1", embed_stage(build_chunks("kb/1", "h2", [("Refunds", "3 days."), ("Contact", "Chat.")]))),
+      len(calls))   # {'upserted': 2, 'deleted': 2} 3: both ids changed, only the edited text was re-embedded
 ```
 
 Switching chunkers is now `CHUNKER_VERSION = "v4"` plus a re-run from the parsed table. Unchanged text
@@ -267,7 +267,7 @@ still hits the embedding cache, and `reconcile_index` removes the v3 chunks of e
 chunks land. Three details in the code are deliberate, plus one caveat:
 - **Upsert before delete.** A reader can briefly see old and new chunks of a document together, which is
   better than briefly seeing none of them.
-- **Source deletion needs no special path.** Calling `reconcile_index(index, doc_id, [])` deletes every chunk
+- **Source deletion needs no special path.** Calling `reconcile_index(doc_id, [])` deletes every chunk
   of that document.
 - **`text_hash` leaves out `doc_version`.** Edit one paragraph of a 40-chunk document and all 40 chunk ids
   change because the version changed, but 39 texts hash the same, so only one embedding call is made.
@@ -329,24 +329,13 @@ An agent's `search_docs` call returned a chunk that cut a refund procedure in ha
 step. Because every stage is a stored table, the trace is a few lookups, and the tool result itself carries
 the keys to start from.
 
-```python
-def trace_tool_result(result, tables):
-    """result: one item from the agent's search_docs output (payload fields from the index)."""
-    chunk = tables["chunks"].get(result["chunk_id"])
-    parser_version = chunk["metadata"]["parser_version"]          # recorded in chunk metadata at build time
-    parsed = tables["parsed"].get((chunk["doc_id"], chunk["doc_version"], parser_version))
-    raw = tables["documents"].get((chunk["doc_id"], chunk["doc_version"]))
-    return {
-        "chunker_version": chunk["chunker_version"],
-        "position": chunk["position"],
-        "chunk_chars": len(chunk["text"]),
-        "section_path": chunk["section_path"],
-        "parsed_section": parsed["sections"][chunk["section_path"]][:200],   # what the chunker saw
-        "raw_uri": raw["uri"],                                                # what the source holds
-    }
-# If the parsed section is whole but the chunk is cut, the chunker is at fault: bump CHUNKER_VERSION,
-# re-run from `parsed`, eval the agent on the refund tasks, then cut the alias over.
-```
+The lookups, from the chunk id in the tool result:
+- **`chunks[chunk_id]`** gives `chunker_version`, `position`, `section_path` and the `parser_version` recorded
+  in chunk metadata at build time.
+- **`parsed[(doc_id, doc_version, parser_version)]`** gives the section the chunker saw;
+  **`documents[(doc_id, doc_version)]`** gives the raw URI the source holds.
+- **If the parsed section is whole but the chunk is cut,** the chunker is at fault: bump `CHUNKER_VERSION`,
+  re-run from `parsed`, eval the agent on the refund tasks, then cut the alias over.
 
 | Fix | Stages re-run | Cost at 2 M documents (from the table above) |
 |---|---|---|

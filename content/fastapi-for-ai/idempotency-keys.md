@@ -325,7 +325,7 @@ flowchart TD
 
 ## Examples
 ### FastAPI dependency backed by Redis
-For an endpoint that runs a billed generation.
+For an endpoint that runs a billed generation. `SET NX` claims the key; a stored record replays.
 
 ```python
 import hashlib, json
@@ -333,14 +333,16 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 import redis.asyncio as redis
 
-app = FastAPI()
-r = redis.Redis()
+app, r = FastAPI(), redis.Redis()
 TTL, LEASE = 24 * 3600, 120     # keep results a day; an in-progress claim expires after 2 min
 
-async def idem(request: Request, tenant: str = Header(...),  # really: from the auth principal
-               idempotency_key: str = Header(...)):
-    body = await request.body()     # raw bytes; canonicalise JSON if clients re-serialise on retry
-    fp = hashlib.sha256(b"|".join([request.method.encode(), request.url.path.encode(), body])).hexdigest()
+class Replay(Exception): pass               # args: stored body, stored status
+@app.exception_handler(Replay)
+async def replay(_, e: Replay):
+    return JSONResponse(*e.args, headers={"Idempotent-Replayed": "true"})
+
+async def idem(request: Request, tenant: str = Header(...), idempotency_key: str = Header(...)):
+    fp = hashlib.sha256(request.url.path.encode() + await request.body()).hexdigest()
     k = f"idem:{tenant}:{idempotency_key}"
     if await r.set(k, json.dumps({"fp": fp, "state": "in_progress"}), nx=True, ex=LEASE):
         return k, fp                                   # we own it: do the work
@@ -348,70 +350,22 @@ async def idem(request: Request, tenant: str = Header(...),  # really: from the 
     if rec.get("fp") != fp:
         raise HTTPException(422, "Idempotency-Key reused with a different request")
     if rec.get("state") == "in_progress":
-        raise HTTPException(409, "request with this key is still processing",
-                            headers={"Retry-After": "2"})
-    raise Replay(rec["status"], rec["body"])           # completed: replay
-
-class Replay(Exception):
-    def __init__(self, status, body): self.status, self.body = status, body
-
-@app.exception_handler(Replay)
-async def replay(_, e: Replay):
-    return JSONResponse(e.body, status_code=e.status, headers={"Idempotent-Replayed": "true"})
+        raise HTTPException(409, "still processing", headers={"Retry-After": "2"})
+    raise Replay(rec["body"], rec["status"])          # completed: replay
 
 @app.post("/v1/generations", status_code=201)
 async def create(payload: dict, claim=Depends(idem)):
-    k, fp = claim
-    try:
-        result = {"id": "gen_123", "text": "..."}       # call the model, charge tokens
-    except Exception:                                   # transient failure: free the key so a retry
-        await r.delete(k); raise                        # runs again (deterministic 4xx could be stored)
-    await r.set(k, json.dumps({"fp": fp, "state": "done", "status": 201, "body": result}), ex=TTL)
+    result = {"id": "gen_123", "text": "..."}          # call the model, charge tokens
+    await r.set(claim[0], json.dumps({"fp": claim[1], "state": "done", "status": 201, "body": result}), ex=TTL)
     return result
 ```
 
+- **Expected:** first POST 201; same key and body again 201 with `Idempotent-Replayed: true` and the same
+  `gen_123`; same key with a different body 422.
 - **The `tenant` header is a stand-in.** In production take the tenant from the authenticated
   principal, or a caller can scope keys into someone else's namespace.
-- **A missing header becomes 422 here, not 400.** `Header(...)` makes FastAPI's validation reject the
-  request. To return the draft's `400`, declare `idempotency_key: str | None = Header(None)` and raise
-  400 yourself when it is `None`.
-- **No owner token here.** This version omits the compare-and-set; the Postgres example below adds it.
-
-### Agent tool executor with derived keys
-Side-effecting tools run through one wrapper; the key comes from the run and step, so a resumed run
-replays the stored observation. `store` is the Redis client above; `send_email` is your own tool.
-
-```python
-import json
-
-SIDE_EFFECT_TOOLS = {"send_email", "create_ticket", "refund"}
-
-async def execute_tool(store, run_id: str, step: int, i: int, call: dict, tools: dict) -> dict:
-    if call["name"] not in SIDE_EFFECT_TOOLS:
-        return await tools[call["name"]](**call["args"])       # reads are safe to repeat
-    # i = position of this call in the step's tool_calls, so two parallel calls don't collide
-    key = f"idem:tool:{run_id}:{step}:{i}:{call['name']}"       # stable across retries and resumes
-    fp = json.dumps(call["args"], sort_keys=True)
-    if not await store.set(key, json.dumps({"fp": fp, "state": "in_progress"}), nx=True, ex=120):
-        rec = json.loads(await store.get(key) or "{}")
-        if rec.get("fp") != fp:
-            return {"error": "step replayed with different arguments; not executed"}
-        if rec.get("state") == "in_progress":
-            return {"error": "already running; check again shortly"}
-        return rec["result"]                                     # same observation as the first time
-    try:
-        result = await tools[call["name"]](**call["args"], idempotency_key=key)  # pass it downstream
-    except Exception:
-        await store.delete(key); raise                           # transient: let the retry run
-    await store.set(key, json.dumps({"fp": fp, "state": "done", "result": result}), ex=24 * 3600)
-    return result
-```
-
-| Event | Without the wrapper | With it |
-|---|---|---|
-| Step 3 `send_email` succeeds, worker dies before checkpoint | — | result stored under `run_id:3:0` |
-| Run resumes at step 3 | second email sent | stored result replayed, no email |
-| Model sees | two "sent" observations over two runs | one, identical to the first |
+- **A missing header becomes 422 here, not 400.** `Header(...)` makes FastAPI's validation reject it; to
+  return 400, declare `idempotency_key: str | None = Header(None)` and raise 400 yourself.
 
 ### Worked timeline: a timeout during a 12-second generation
 The client posts with key `7f3c...`, has a 10 s timeout, and the model takes 12 s.
@@ -424,28 +378,18 @@ The client posts with key `7f3c...`, has a 10 s timeout, and the model takes 12 
 | 12 s | generation finishes; record stored as completed | — |
 | 13 s | retry again | stored 201 with the same `gen_123` text |
 
-- **Result:** one generation billed, one answer shown.
-- **Assumption:** the server finishes the work after the client disconnects, which is FastAPI's default
-  for a non-streaming handler.
+- **Result:** one generation billed, one answer shown. This assumes the server finishes the work after
+  the client disconnects, which is FastAPI's default for a non-streaming handler.
 - **If the pod dies mid-generation** instead, the 120 s lease expires and a later retry runs the work afresh.
 
 ### Production variant: Postgres claim with lease and owner token
 Durable, and the finish step is a compare-and-set so a stale worker cannot overwrite a newer attempt.
+Table columns: `scope_key` (primary key), `fingerprint`, `state`, `owner uuid`, `lease_until`,
+`status_code`, `response_body jsonb`, `created_at`.
 
 ```sql
-CREATE TABLE idempotency (
-  scope_key     text PRIMARY KEY,        -- tenant:user:key
-  fingerprint   text NOT NULL,
-  state         text NOT NULL,           -- in_progress | completed
-  owner         uuid NOT NULL,
-  lease_until   timestamptz NOT NULL,
-  status_code   int,
-  response_body jsonb,
-  created_at    timestamptz NOT NULL DEFAULT now()
-);
-
--- Claim: returns a row only if this attempt now owns the key.
--- A new key is inserted; an expired in-progress lease with the same fingerprint is taken over.
+-- Claim: returns a row only if this attempt now owns the key (a new key, or an
+-- expired in-progress lease with the same fingerprint).
 INSERT INTO idempotency (scope_key, fingerprint, state, owner, lease_until)
 VALUES ($1, $2, 'in_progress', $3, now() + interval '2 minutes')
 ON CONFLICT (scope_key) DO UPDATE
@@ -485,6 +429,12 @@ If the claim returns no row, read the existing record and apply steps 3-5 of the
 - **Postgres when a duplicate costs money** — for billing and agent actions. Keep the idempotency row in
   the same transaction as the side effect, and purge old rows with a scheduled
   `DELETE ... WHERE created_at < now() - interval '24 hours'`. Monitor table size and purge lag.
+- **Free the key on a transient failure.** If the work raises a transient error, delete the
+  `in_progress` claim so the client's retry runs again (a deterministic 4xx may be stored and replayed);
+  fingerprint the canonicalised JSON body if clients re-serialise on retry.
+- **One executor wrapper for side-effecting agent tools.** Key on `run_id:step:call_index:tool`, skip
+  the wrapper for read-only tools, return an "already running" observation on `in_progress` and refuse
+  to execute on a fingerprint mismatch, and pass the key to the tool's downstream API.
 
 ## Trade-offs
 - **Safety vs a round trip.** Keys make retries safe and cheap, but every mutating request costs a store

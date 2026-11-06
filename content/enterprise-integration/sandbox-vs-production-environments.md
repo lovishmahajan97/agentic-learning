@@ -248,8 +248,7 @@ flowchart TD
 ## Examples
 ### A guarded binding per environment
 A binding resolved from a single environment variable with no default, and a guard that fails loudly on
-any mismatch between the binding and the host it points at. `http` and `secrets` and `index` stand for
-your HTTP client, secret-store client and retrieval index.
+any mismatch between the binding and the host it points at.
 
 ```python
 import os
@@ -262,13 +261,10 @@ class Binding:
     theirs: str            # the customer's environment name
     base_url: str
     secret_ref: str        # name in the secret store; the value never lives in config
-    writes_allowed: bool
-    index_namespace: str   # where ingested data lands; never shared across bindings
 
 BINDINGS = {
-    "dev":     Binding("dev", "dev-sandbox", "https://dev-sandbox.crm.acme.example", "crm/dev", True, "acme-dev"),
-    "staging": Binding("staging", "uat-sandbox", "https://uat-sandbox.crm.acme.example", "crm/uat", True, "acme-uat"),
-    "prod":    Binding("prod", "production", "https://crm.acme.example", "crm/prod", True, "acme-prod"),
+    "staging": Binding("staging", "uat-sandbox", "https://uat-sandbox.crm.acme.example", "crm/uat"),
+    "prod":    Binding("prod", "production", "https://crm.acme.example", "crm/prod"),
 }
 PROD_HOSTS = {"crm.acme.example"}
 
@@ -279,52 +275,25 @@ def binding() -> Binding:
         raise RuntimeError(f"cross-wired: {b.ours} is bound to {host}")
     return b
 
-def request(method: str, path: str, body=None):
-    b = binding()
-    if method != "GET" and not b.writes_allowed:
-        raise PermissionError(f"writes are disabled in {b.ours}")
-    return http(method, b.base_url + path, token=secrets.get(b.secret_ref), json=body,
-                headers={"X-Env-Pair": f"{b.ours}->{b.theirs}"})   # tags your logs (and theirs, if logged)
-
-def ingest(record: dict):
-    b = binding()
-    index.upsert(namespace=b.index_namespace, doc={**record, "env_pair": f"{b.ours}->{b.theirs}"})
+os.environ["APP_ENV"] = "staging"
+print(binding().theirs)    # uat-sandbox
+BINDINGS["staging"] = Binding("staging", "uat-sandbox", "https://crm.acme.example", "crm/uat")
+binding()                  # RuntimeError: cross-wired: staging is bound to crm.acme.example
 ```
 
 The guard is deliberately dumb: it does not try to be clever about hostnames, it only refuses to run
 when the two facts it knows (which binding, which host) disagree.
 
-### Inbound guard: reject events from an unbound instance
-A webhook receiver that verifies a per-binding HMAC signature and the source instance id before indexing.
-The header names and the `instance_id` field are placeholders; use whatever your platform actually sends.
-
-```python
-import hmac, hashlib
-
-EXPECTED = {  # one entry per customer environment bound to THIS deployment
-    "prod": {"secret": b"from-secret-store", "instance_id": "acme-prod-instance"},
-}
-rejected = {"bad_signature": 0, "unbound_instance": 0}
-
-def receive(env: str, raw_body: bytes, signature_hex: str, payload: dict) -> bool:
-    cfg = EXPECTED[env]
-    mac = hmac.new(cfg["secret"], raw_body, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(mac, signature_hex):
-        rejected["bad_signature"] += 1          # a sandbox clone signs with a different secret
-        return False
-    if payload.get("instance_id") != cfg["instance_id"]:
-        rejected["unbound_instance"] += 1       # refreshed sandbox still pointing at prod receiver
-        return False
-    return True                                  # safe to queue for ingestion
-```
-
 ### Agent shadow mode: write tools that record instead of acting
 The same tool registry serves both modes; in shadow, write tools log the proposal and tell the model it
-was not executed, so the run continues without side effects. `request` is the guarded client above.
+was not executed, so the run continues without side effects.
 
 ```python
-SHADOW = os.environ.get("AGENT_MODE") == "shadow"
+SHADOW = True    # os.environ.get("AGENT_MODE") == "shadow" in the real service
 proposals = []   # compared later with what human agents actually did
+
+def request(method: str, path: str, body=None) -> dict:   # stand-in for the guarded client
+    return {"method": method, "path": path}
 
 def tool_update_case(case_id: str, category: str) -> dict:
     """Write tool exposed to the model. Host and secret come from the binding, never from arguments."""
@@ -334,10 +303,10 @@ def tool_update_case(case_id: str, category: str) -> dict:
     return request("PATCH", f"/cases/{case_id}", body={"category": category})
 
 def tool_get_case(case_id: str) -> dict:
-    """Read tool: runs normally in shadow mode."""
-    return request("GET", f"/cases/{case_id}")
+    return request("GET", f"/cases/{case_id}")             # read tool: runs normally in shadow mode
 
-TOOLS = {"update_case": tool_update_case, "get_case": tool_get_case}
+print(tool_update_case("C-17", "billing"))  # {'status': 'recorded_not_executed', 'case_id': 'C-17'}
+print(tool_get_case("C-17"), len(proposals))  # {'method': 'GET', 'path': '/cases/C-17'} 1
 ```
 
 ### Worked scenario: what the sandbox proved and what it missed
@@ -373,6 +342,12 @@ found them before the canary.
   the resolved binding at startup, keep base URLs and instance names out of tool schemas, and tag every
   tool-call trace with the binding pair. Monitor traces whose host does not match the binding; the count
   must be zero.
+- **Tag and partition by binding.** Give each binding its own `writes_allowed` flag and its own index
+  namespace (never shared), and tag every outbound request (for example an `X-Env-Pair: staging->uat-sandbox`
+  header) and every ingested document with the environment pair.
+- **Webhook check order.** Verify the HMAC-SHA256 over the raw body with `hmac.compare_digest` and the
+  binding's secret first, then the payload's source instance id; a refreshed sandbox clone fails one of the
+  two, and each rejection is counted by reason.
 
 ## Trade-offs
 - **Full-copy realism vs cost and exposure.** It gives the most realistic testing but costs the customer

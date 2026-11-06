@@ -213,56 +213,34 @@ representation rules baked into the fields.
 
 ```python
 import json
-from datetime import datetime
-from enum import Enum
-from typing import Annotated, Literal, Union
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
-
-class Priority(str, Enum):
-    low = "low"; high = "high"
+from pathlib import Path
+from typing import Literal
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 class CreateTicketArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")        # model -> executor: unknown fields are hallucinations
     title: str = Field(max_length=200)
-    priority: Priority = Priority.low
-    due_at: datetime | None = None                   # ISO 8601 with offset on the wire
+    due_at: AwareDatetime | None = None              # ISO 8601 and must carry a UTC offset
     account_id: str                                  # ids are strings: JS numbers are exact only to 2^53-1
 
-    @field_validator("due_at")
-    @classmethod
-    def must_have_tz(cls, v):
-        if v is not None and v.tzinfo is None:
-            raise ValueError("due_at must carry a UTC offset")
-        return v
-
-class ToolCallEvent(BaseModel):
-    model_config = ConfigDict(extra="ignore")        # service -> service: tolerant reader
-    type: Literal["tool_call"]; schema_version: Literal[2] = 2
-    run_id: str; call_id: str; name: str; args: dict
-
 class ToolResultEvent(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore")        # service -> service: tolerant reader
     type: Literal["tool_result"]; schema_version: Literal[2] = 2
     run_id: str; call_id: str; ok: bool
-    output: dict | None = None; error_code: str | None = None
-
-_Event = TypeAdapter(Annotated[Union[ToolCallEvent, ToolResultEvent], Field(discriminator="type")])
-KNOWN = {"tool_call", "tool_result"}
 
 def parse_event(raw: dict):
-    if raw.get("type") not in KNOWN:
+    if raw.get("type") != "tool_result":
         return None                                  # new event type from a newer producer: skip, don't crash
-    return _Event.validate_python(raw)
+    return ToolResultEvent.model_validate(raw)
 
-# One definition, three consumers.
-tool_spec = {"name": "create_ticket", "input_schema": CreateTicketArgs.model_json_schema()}  # to the model
-with open("contracts/agent.schema.json", "w") as f:                                          # to TypeScript
-    json.dump({"CreateTicketArgs": CreateTicketArgs.model_json_schema(),
-               "ToolResultEvent": ToolResultEvent.model_json_schema()}, f, indent=2)
-args = CreateTicketArgs.model_validate({"title": "Renewal", "account_id": "9007199254740993"})  # executor
+# One definition, three consumers: the model, TypeScript (types + ajv), and the executor.
+tool_spec = {"name": "create_ticket", "input_schema": CreateTicketArgs.model_json_schema()}
+Path("contracts").mkdir(exist_ok=True)
+Path("contracts/agent.schema.json").write_text(json.dumps({"CreateTicketArgs": tool_spec["input_schema"]}))
+args = CreateTicketArgs.model_validate({"title": "Renewal", "account_id": "9007199254740993"})
 evt = parse_event({"type": "tool_result", "run_id": "r1", "call_id": "c1", "ok": True, "cost_usd": 0.01})
-assert parse_event({"type": "approval_requested", "run_id": "r1"}) is None
-# TS side: generate types from contracts/agent.schema.json and validate the same file with ajv in CI.
+print(args.account_id, evt.ok)                                     # 9007199254740993 True
+print(parse_event({"type": "approval_requested", "run_id": "r1"})) # None
 ```
 
 ### Worked scenario: what each line defends against
@@ -321,6 +299,8 @@ for wire in ('{"title": "a"}', '{"title": "a", "due_at": null}'):
   function per provider (for example, strict modes that require every property in `required` and
   `additionalProperties: false`) and test it from the same fixtures. Monitor argument rejection rate per
   tool, provider and schema version.
+- **Discriminated event union** — when a stream carries several event types. Parse with a Pydantic
+  `TypeAdapter` over a union using `Field(discriminator="type")`, and skip unknown `type` values first.
 
 ## Trade-offs
 - **JSON Schema/OpenAPI vs Protobuf/gRPC.** JSON Schema is universal, readable and identical to what models

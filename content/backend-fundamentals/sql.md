@@ -361,8 +361,7 @@ flowchart TD
 ```
 
 ## Examples
-### Two queries an LLM backend runs constantly
-- **Spend report:** per-tenant spend with a running total, one pass, a window function over the grouped rows.
+### Inbox query: newest message per conversation, keyset-paginated
 - **Inbox view:** "newest message per conversation" via a `LATERAL` subquery (the `DISTINCT ON` form above
   is the alternative), with a keyset cursor so page depth does not change the cost.
 - **Scaling note:** each page still evaluates the lateral lookup for every conversation the user owns.
@@ -370,22 +369,7 @@ flowchart TD
   index on `(tenant_id, user_id, last_message_at, id)`, so the cursor seeks straight to the page.
 
 ```sql
--- 1. Daily token spend per tenant for the last 7 days, with a running total.
---    No tenant filter, so a (tenant_id, created_at) index gives no simple range scan;
---    an index on created_at (or a BRIN index on an append-only table) serves this.
---    Day boundaries follow the session TimeZone setting.
-SELECT tenant_id,
-       date_trunc('day', created_at) AS day,
-       SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))        AS tokens,
-       SUM(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)))   -- window over groups
-         OVER (PARTITION BY tenant_id ORDER BY date_trunc('day', created_at)) AS running_tokens
-FROM   messages
-WHERE  created_at >= now() - interval '7 days'      -- sargable: bare column vs constant
-  AND  role = 'assistant'
-GROUP  BY tenant_id, date_trunc('day', created_at)
-ORDER  BY tenant_id, day;
-
--- 2. Inbox: the newest message of each conversation for one user, 20 at a time.
+-- Inbox: the newest message of each conversation for one user, 20 at a time.
 --    Keyset pagination: pass the last row's (created_at, id) back instead of an OFFSET.
 SELECT c.id, c.title, m.content, m.created_at
 FROM   conversations c
@@ -402,7 +386,7 @@ ORDER  BY m.created_at DESC, m.id DESC
 LIMIT  20;
 ```
 
-Run each with `EXPLAIN (ANALYZE, BUFFERS)` and check:
+Run it with `EXPLAIN (ANALYZE, BUFFERS)` and check:
 1. **The scan on `messages` is an index scan,** not a sequential scan.
 2. **Estimated rows are within an order of magnitude of actual.** A large mismatch means stale statistics
    or a predicate the planner cannot estimate.
@@ -410,7 +394,6 @@ Run each with `EXPLAIN (ANALYZE, BUFFERS)` and check:
 - **The `id` tie-breaker matters** in both the `ORDER BY` and the cursor: two messages with the same
   `created_at` would otherwise have no defined order, and a page boundary between them could skip or
   repeat a row.
-- **The `COALESCE` calls** stop a single row with a NULL count from dropping out of the total.
 
 ### Runnable: NULL silently changes answers
 Standard-library SQLite follows the same three-valued logic as PostgreSQL here.
@@ -460,7 +443,6 @@ INSERT INTO tool_calls (run_id, tool, status, ms) VALUES
 db.execute("PRAGMA query_only = ON")          # the agent's connection cannot write
 
 def run_sql_tool(sql: str, params=(), max_rows=50, budget_s=2.0):
-    """Tool exposed to the agent: read-only, row-capped, time-boxed."""
     deadline = time.monotonic() + budget_s
     db.set_progress_handler(lambda: time.monotonic() > deadline, 10_000)  # nonzero aborts
     try:
@@ -504,6 +486,11 @@ In PostgreSQL the same guards are a role with only `SELECT` grants on a few view
 - **One index per agent hot path.** Loading a thread's last N messages, a run's steps in order and a
   tenant's memories by recency each get an index ending in the sort column, so context assembly stays a
   few milliseconds as history grows. Monitor context-assembly latency per agent step.
+- **Cross-tenant time-range reports need a time index.** With no tenant filter, a `(tenant_id, created_at)`
+  index gives no simple range scan; index `created_at` (or use BRIN on an append-only table), keep the
+  predicate sargable (`created_at >= now() - interval '7 days'`), and remember `date_trunc('day', ...)`
+  follows the session `TimeZone`. A running total is `SUM(SUM(x)) OVER (PARTITION BY ... ORDER BY ...)`,
+  and `COALESCE` each nullable count so one NULL does not drop a row out of the sum.
 
 ## Trade-offs
 - **Declarative vs control.** The planner adapts to data growth, but you give up control of the

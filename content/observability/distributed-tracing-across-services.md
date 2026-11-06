@@ -344,41 +344,38 @@ sequenceDiagram
 ### Inject and extract over HTTP and a queue
 - **Same two primitives,** `inject` and `extract`, cover HTTP and queues; only the carrier changes.
 - **Auto-instrumentation** for FastAPI, httpx or requests performs exactly these calls; they are written
-  out here so the mechanism is visible, including the queue hop where the carrier is a message field.
+  out here so the mechanism is visible. The HTTP hop is a direct call so the example runs locally.
 
 ```python
+# pip install opentelemetry-sdk
 from opentelemetry import trace
 from opentelemetry.propagate import inject, extract
-import httpx
+from opentelemetry.sdk.trace import TracerProvider
 
+trace.set_tracer_provider(TracerProvider())
 tracer = trace.get_tracer("orchestrator")
 
-# calling side (orchestrator)
-def call_retrieval(query: str) -> dict:
-    with tracer.start_as_current_span("retrieval.client",
-                                      kind=trace.SpanKind.CLIENT) as span:
+# receiving side (retrieval service request handler)
+def handle_search(request_headers: dict, body: dict) -> int:
+    ctx = extract(request_headers)             # remote parent becomes the context
+    with tracer.start_as_current_span("retrieval.server", context=ctx, kind=trace.SpanKind.SERVER) as span:
+        return span.get_span_context().trace_id
+
+# calling side (orchestrator); in production: httpx.post(url, json=body, headers=headers)
+def call_retrieval(query: str) -> bool:
+    with tracer.start_as_current_span("retrieval.client", kind=trace.SpanKind.CLIENT) as span:
         headers = {}
         inject(headers)                        # adds traceparent (+ tracestate, baggage)
-        span.set_attribute("retrieval.query_chars", len(query))
-        r = httpx.post("http://retrieval:8000/search",
-                       json={"q": query, "k": 5}, headers=headers, timeout=5)
-        r.raise_for_status()
-        return r.json()
-
-# receiving side (retrieval service request handler)
-def handle_search(request_headers: dict, body: dict) -> dict:
-    ctx = extract(request_headers)             # remote parent becomes the context
-    with tracer.start_as_current_span("retrieval.server", context=ctx,
-                                      kind=trace.SpanKind.SERVER) as span:
-        hits = [{"id": 11, "score": 0.81}, {"id": 42, "score": 0.77}]   # stand-in
-        span.set_attribute("retrieval.hit_ids", [h["id"] for h in hits])
-        return {"hits": hits}
+        print(headers)                         # {'traceparent': '00-<trace id>-<span id>-<flags>'}
+        return handle_search(headers, {"q": query}) == span.get_span_context().trace_id
 
 # queue hop: inject into the message instead of HTTP headers
-def enqueue_agent_step(queue, step: dict):
+def enqueue_agent_step(q, step: dict):
     carrier = {}
     inject(carrier)
-    queue.put({"step": step, "trace": carrier})   # consumer: extract(msg["trace"])
+    q.put({"step": step, "trace": carrier})    # consumer: extract(msg["trace"])
+
+print("same trace:", call_retrieval("reset password"))   # same trace: True
 ```
 
 ### Runnable: why executor threads lose context
@@ -449,6 +446,8 @@ Five hops, each keeping 10% of spans.
   server.
 - **Baggage allowlist.** Strip baggage on egress to third parties and allow only named keys internally.
   Monitor outbound headers in a staging egress proxy for unexpected baggage keys.
+- **Explicit timeouts on traced calls.** Give every cross-service client call a timeout (for example 5 s on
+  the retrieval hop) and raise on error status, so a hung hop ends its CLIENT span instead of leaving it open.
 
 ## Trade-offs
 - **W3C standard vs legacy formats.** W3C interoperates with every vendor and language, but migrating a

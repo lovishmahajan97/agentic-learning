@@ -328,25 +328,21 @@ flowchart TD
 
 ## Examples
 ### Chat-completion policy with one retry layer
-Retry only transient errors, jittered exponential backoff, a 30-second retry budget, a log line per retry,
-and the original exception re-raised. The SDK's own retries are switched off so attempts do not multiply.
+Retry only transient errors, jittered exponential backoff, a 30-second retry budget, and the original
+exception re-raised. The SDK's own retries are switched off so attempts do not multiply.
 
 ```python
-import logging
 from openai import OpenAI, RateLimitError, APITimeoutError, APIConnectionError, InternalServerError
 from tenacity import (retry, stop_after_attempt, stop_after_delay, wait_random_exponential,
-                      retry_if_exception_type, before_sleep_log)
+                      retry_if_exception_type)
 
-log = logging.getLogger("llm")
 client = OpenAI(max_retries=0, timeout=20.0)   # one retry layer only: ours
-
 TRANSIENT = (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)
 
 @retry(
     retry=retry_if_exception_type(TRANSIENT),            # 400/401/422 fail immediately
     wait=wait_random_exponential(multiplier=1, max=20),  # jittered, capped backoff
     stop=stop_after_attempt(5) | stop_after_delay(30),   # whichever comes first
-    before_sleep=before_sleep_log(log, logging.WARNING),
     reraise=True,                                        # caller sees RateLimitError, not RetryError
 )
 def summarize(text: str) -> str:
@@ -355,9 +351,6 @@ def summarize(text: str) -> str:
         messages=[{"role": "user", "content": f"Summarize:\n{text}"}],
     )
     return r.choices[0].message.content
-
-# Per-call override, e.g. a batch job that can wait longer:
-# summarize.retry_with(stop=stop_after_attempt(10))(doc)
 ```
 
 Worst-case latency of this policy, because the budget is checked between attempts:
@@ -395,41 +388,6 @@ def lookup():
     return {"ok": True}
 
 assert lookup() == {"ok": True} and calls["n"] == 3
-```
-
-### Agent scenario: transient errors retried, permanent errors handed to the model
-The tool adapter retries only transport errors; a permanent error becomes a tool result the model can act
-on, so the loop never burns attempts on a 404. Needs only `pip install tenacity`.
-
-```python
-from tenacity import retry, stop_after_attempt, stop_after_delay, wait_random_exponential
-from tenacity import retry_if_exception_type
-
-class Transient(Exception): ...          # adapters map 429, 5xx, timeouts to this
-class ToolError(Exception): ...          # adapters map 4xx to this: the model should see it
-
-attempts = {"n": 0}
-
-@retry(retry=retry_if_exception_type(Transient),
-       wait=wait_random_exponential(multiplier=0.01, max=0.05),   # tiny for the demo
-       stop=stop_after_attempt(4) | stop_after_delay(10), reraise=True)
-def get_order(order_id: str) -> str:
-    attempts["n"] += 1
-    if attempts["n"] < 3:
-        raise Transient("503 from orders API")
-    if order_id == "Z99":
-        raise ToolError("order Z99 not found")
-    return f"order {order_id}: shipped"
-
-def run_tool(name: str, args: dict) -> dict:
-    try:
-        return {"role": "tool", "name": name, "content": get_order(**args)}
-    except ToolError as e:                # permanent: hand back to the model, no retry
-        return {"role": "tool", "name": name, "content": f"error: {e}", "is_error": True}
-    # Transient that exhausted retries propagates: the step fails, the run can checkpoint and stop
-
-print(run_tool("get_order", {"order_id": "A17"}), attempts)   # succeeded on attempt 3
-print(run_tool("get_order", {"order_id": "Z99"}))             # 1 attempt, error shown to the model
 ```
 
 ### Worked scenario: stacked retry layers

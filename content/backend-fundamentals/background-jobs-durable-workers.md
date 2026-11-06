@@ -415,62 +415,43 @@ stateDiagram-v2
   `lease_until` from a timer thread.
 
 ```python
-import random, time, uuid, psycopg
-
+# pip install "psycopg[binary]"   (conn is a psycopg 3 connection)
+import random, uuid
 WORKER = str(uuid.uuid4())
 CLAIM = """
-UPDATE jobs SET state='running', locked_by=%s, attempts=attempts+1,
-                lease_until=now() + interval '5 minutes'
+UPDATE jobs SET state='running', locked_by=%s, attempts=attempts+1, lease_until=now() + interval '5 minutes'
 WHERE id = (SELECT id FROM jobs
             WHERE (state='queued' AND run_at <= now())
-               OR (state='running' AND lease_until < now()    -- orphaned by a dead worker
-                   AND attempts < 5)                          -- crash-loopers left for a sweeper
+               OR (state='running' AND lease_until < now() AND attempts < 5)  -- orphaned
             ORDER BY run_at LIMIT 1 FOR UPDATE SKIP LOCKED)
 RETURNING id, type, payload, attempts"""
 DONE = " WHERE id=%s AND locked_by=%s"     # fence: only the current lease holder may finish
 
-def backoff(attempt):                      # 2, 4, 8 ... s, capped, with jitter
+def backoff(attempt):                      # 2, 4, 8 ... s, capped at 300, with jitter
     return min(2 ** attempt, 300) * (0.5 + random.random())
-
-def embed_document(job_id, payload):       # idempotent: keyed writes, safe to re-run
-    for chunk in load_chunks(payload["document_id"]):
-        if not vectors.exists(chunk.id):   # resume: skip chunks a previous attempt finished
-            vectors.upsert(chunk.id, embed(chunk.text))
-
-HANDLERS = {"embed_document": embed_document}
 
 def run_one(conn):
     with conn.transaction():
         row = conn.execute(CLAIM, (WORKER,)).fetchone()
     if row is None:
-        return False
+        return False                       # idle: sleep 1 s, or LISTEN for a NOTIFY
     job_id, kind, payload, attempts = row
     try:
-        HANDLERS[kind](job_id, payload)
-        conn.execute("UPDATE jobs SET state='succeeded', finished_at=now()" + DONE, (job_id, WORKER))
-    except RetryableError as e:
-        if attempts >= 5:
-            conn.execute("UPDATE jobs SET state='dead', error=%s" + DONE, (str(e), job_id, WORKER))
-        else:
-            conn.execute("UPDATE jobs SET state='queued', error=%s, "
-                         "run_at=now() + %s * interval '1 second'" + DONE,
-                         (str(e), backoff(attempts), job_id, WORKER))
-    except Exception as e:                 # permanent: straight to dead, keep it inspectable
-        conn.execute("UPDATE jobs SET state='dead', error=%s" + DONE, (str(e), job_id, WORKER))
+        HANDLERS[kind](payload)            # must be idempotent: a reclaimed job runs again
+        conn.execute("UPDATE jobs SET state='succeeded'" + DONE, (job_id, WORKER))
+    except Exception as e:                 # RetryableError: back off; permanent or 5th try: dead
+        retry = isinstance(e, RetryableError) and attempts < 5
+        conn.execute("UPDATE jobs SET state=%s, error=%s, run_at=now() + %s * interval '1 second'" + DONE,
+                     ("queued" if retry else "dead", str(e), backoff(attempts) if retry else 0, job_id, WORKER))
     conn.commit()
     return True
-
-with psycopg.connect(DSN) as conn:
-    while True:
-        if not run_one(conn):
-            time.sleep(1)                  # idle poll; LISTEN/NOTIFY can wake workers instead
 ```
 
-- **App-supplied names:** `load_chunks`, `embed`, `vectors`, `RetryableError` and `DSN` belong to the application.
+- **App-supplied names:** `HANDLERS` and `RetryableError` belong to the application.
 - **Keep the claim fast:** a partial index on `(run_at) WHERE state IN ('queued','running')` keeps it fast
   as the table grows.
 - **Why the `attempts < 5` guard on orphan reclaim:** a job that kills its worker (an out-of-memory crash on
-  one huge document) never reaches the `except` branches. Without the guard it is reclaimed forever, and a
+  one huge document) never reaches the `except` branch. Without the guard it is reclaimed forever, and a
   small periodic sweeper should move such rows to `dead`.
 
 ### Runnable: lease expiry and the completion fence
@@ -482,17 +463,13 @@ from dataclasses import dataclass
 
 @dataclass
 class Job:
-    id: str
     state: str = "queued"
     locked_by: str = ""
     lease_until: float = 0.0
-    attempts: int = 0
 
 def claim(job, worker, now, lease_s=300):
-    orphaned = job.state == "running" and job.lease_until < now
-    if job.state == "queued" or orphaned:
+    if job.state == "queued" or (job.state == "running" and job.lease_until < now):
         job.state, job.locked_by, job.lease_until = "running", worker, now + lease_s
-        job.attempts += 1
         return True
     return False
 
@@ -502,12 +479,12 @@ def finish(job, worker):
     job.state = "succeeded"
     return True
 
-job = Job("embed-42")
+job = Job()
 print(claim(job, "A", now=0))              # True: A holds the lease until t=300
 print(claim(job, "B", now=100))            # False: lease still valid
 print(claim(job, "B", now=301))            # True: A looks dead (GC pause, slow call), B reclaims
 print(finish(job, "A"))                    # False: A's late completion is rejected
-print(finish(job, "B"), job.attempts)      # True 2
+print(finish(job, "B"))                    # True
 ```
 
 ### Worked scenario: sizing workers and protecting small tenants
@@ -555,6 +532,8 @@ The checkpointed design costs one row write per step; the cost of skipping it sc
   per resumed run; anything above one means checkpoints are missing or late.
 - **Separate pools for interactive and batch agents.** User-facing runs and nightly eval or backfill runs
   claim from different queues or priority classes. Monitor oldest-queued-run age per class.
+- **Make handlers resumable, not just idempotent.** Key every write (for example one vector per chunk id)
+  and skip work a previous attempt already finished, so a reclaimed embedding job does not start over.
 
 ## Trade-offs
 - **Job table vs broker.** A table in the main database gains transactional enqueue and zero new

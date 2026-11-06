@@ -218,45 +218,39 @@ flowchart TD
 
 ## Examples
 ### Routing agent tools to the right executor
-One dispatcher decides per tool: async tools are awaited, blocking tools go to a bounded thread pool, and
+One dispatcher decides per tool: async tools are awaited, blocking tools go to a thread pool, and
 CPU-heavy tools go to a process pool. Tool bodies are stand-ins.
 
 ```python
 import asyncio, time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 
 async def web_search(q):            # async client: await directly
     await asyncio.sleep(0.4); return f"results for {q}"
-
 def crm_lookup(user_id):            # sync vendor SDK: blocks, releases GIL on I/O
     time.sleep(0.3); return {"id": user_id, "tier": "gold"}
-
 def parse_attachment(text):         # pure-Python CPU: holds the GIL
     return sum(ord(c) % 7 for c in text * 2000)
 
-TOOLS = {"web_search": ("async", web_search),
-         "crm_lookup": ("thread", crm_lookup),
+TOOLS = {"web_search": ("async", web_search), "crm_lookup": ("thread", crm_lookup),
          "parse_attachment": ("process", parse_attachment)}
 
 async def run_tool(name, arg, procs):
     kind, fn = TOOLS[name]
-    loop = asyncio.get_running_loop()
     if kind == "async":
         return await fn(arg)
     if kind == "thread":
-        return await asyncio.to_thread(fn, arg)           # default executor, bounded below
-    return await loop.run_in_executor(procs, fn, arg)     # fn and arg must be picklable
+        return await asyncio.to_thread(fn, arg)
+    return await asyncio.get_running_loop().run_in_executor(procs, fn, arg)  # must be picklable
 
 async def main():
-    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=16))
     with ProcessPoolExecutor(max_workers=4) as procs:
         t = time.perf_counter()
-        calls = [("web_search", "refund policy"), ("crm_lookup", 7),
-                 ("parse_attachment", "invoice line " * 500)]
+        calls = [("web_search", "refund"), ("crm_lookup", 7), ("parse_attachment", "invoice " * 500)]
         out = await asyncio.gather(*(run_tool(n, a, procs) for n, a in calls))
-        print(f"{len(out)} tools in {time.perf_counter() - t:.2f}s; loop never blocked")
+        print(f"{len(out)} tools in {time.perf_counter() - t:.2f}s")  # 3 tools in ~0.4s, not the sum
 
-if __name__ == "__main__":
+if __name__ == "__main__":          # required under spawn (macOS, Windows)
     asyncio.run(main())
 ```
 
@@ -284,18 +278,6 @@ parser (about 0.5 s CPU), embed chunks via an API (about 0.4 s, network). 8-core
 
 The last row holds only if pickling the PDF bytes in and the extracted text back is cheap relative to
 0.5 s of work.
-
-```python
-import asyncio
-
-async def handle(pdf_key, pool, sem):                   # pool: ProcessPoolExecutor(8)
-    loop = asyncio.get_running_loop()
-    async with sem:
-        raw = await s3_get(pdf_key)                     # async I/O
-    text = await loop.run_in_executor(pool, parse, raw) # CPU in a process
-    async with sem:
-        return await embed(chunk(text))                 # async I/O
-```
 
 ### Measure it yourself: threads, processes and chunksize
 Pure Python, standard library only.

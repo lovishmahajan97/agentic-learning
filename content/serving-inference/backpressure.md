@@ -191,23 +191,20 @@ import asyncio, time
 from fastapi import FastAPI, HTTPException, Request, Response
 
 app = FastAPI()
-MAX_CONCURRENT = 32      # Little's law: ~4 req/s × ~8 s latency, trimmed to the engine's real capacity
-WAIT_BUDGET_S = 1.5      # longest an interactive request may queue before we shed it
-sem = asyncio.Semaphore(MAX_CONCURRENT)
+sem = asyncio.Semaphore(32)   # Little's law: ~4 req/s x ~8 s latency, trimmed to engine capacity
+WAIT_BUDGET_S = 1.5           # longest an interactive request may queue before we shed it
 
 @app.post("/v1/generate")
 async def generate(req: Request):
-    body = await req.json()
-    t0 = time.monotonic()
+    body, t0 = await req.json(), time.monotonic()    # read the body before is_disconnected()
     try:
         await asyncio.wait_for(sem.acquire(), timeout=WAIT_BUDGET_S)
-    except asyncio.TimeoutError:
-        # Shed at the edge: costs us microseconds, and tells the caller exactly what to do.
+    except asyncio.TimeoutError:  # shed at the edge: costs microseconds
         raise HTTPException(503, "overloaded", headers={"Retry-After": "2"})
-    queue_wait_ms = (time.monotonic() - t0) * 1000   # export as a histogram: this IS the pressure signal
+    queue_wait_ms = (time.monotonic() - t0) * 1000   # export as a histogram: the pressure signal
     try:
-        if await req.is_disconnected():               # caller gave up while queued: do no GPU work
-            return Response(status_code=499)          # nginx's "client closed request" convention
+        if await req.is_disconnected():               # caller left while queued: no GPU work
+            return Response(status_code=499)          # nginx's "client closed request"
         return await call_engine(body)               # vLLM / provider call, with its own timeout
     finally:
         sem.release()
@@ -221,28 +218,19 @@ Tuning the two numbers:
 - **In production** the semaphore is usually token-weighted and per-priority, and the same shape appears
   inside the engine as `--max-num-seqs`.
 
-### Little's law sizing and a token-weighted gate
-Size the limit, then admit by tokens rather than requests. Pure Python, runs as is.
+### Token-weighted gate
+Admit by tokens rather than requests. Pure Python, runs as is.
 
 ```python
-def littles_law(rate_per_s, latency_s):
-    return rate_per_s * latency_s                 # L = λW: requests in flight
-
-print(littles_law(4, 8))    # 32 in flight at steady state
-print(littles_law(12, 8))   # 96 needed when traffic triples
-
 class TokenGate:
     """Admit while in-flight tokens (prompt + max_tokens) stay under a budget."""
     def __init__(self, budget):
         self.budget, self.used = budget, 0
     def try_admit(self, prompt_tokens, max_tokens):
-        cost = prompt_tokens + max_tokens
-        if self.used + cost > self.budget:
+        if self.used + prompt_tokens + max_tokens > self.budget:
             return False                          # caller returns 503 + Retry-After
-        self.used += cost
+        self.used += prompt_tokens + max_tokens   # subtract again when the request finishes
         return True
-    def release(self, prompt_tokens, max_tokens):
-        self.used -= prompt_tokens + max_tokens
 
 gate = TokenGate(budget=200_000)
 print(gate.try_admit(100_000, 1_000))  # True: one long document
@@ -270,34 +258,27 @@ calls per run. `llm_step` and `run_tool` stand in for your model client and tool
 ```python
 import asyncio
 
-MAX_RUNS = 8              # runs in progress; size from Little's law on run duration, not call duration
-MAX_LLM_CALLS = 32        # shared with every run: matches the engine or provider concurrency
-MAX_TOOLS_PER_RUN = 4     # parallel tool calls one run may have in flight
-MAX_STEPS = 12            # per-run step budget keeps a looping agent bounded
-
-runs = asyncio.Semaphore(MAX_RUNS)
-llm_calls = asyncio.Semaphore(MAX_LLM_CALLS)
-
-class Busy(Exception):
-    """Mapped to 503 + Retry-After by the API layer."""
+runs = asyncio.Semaphore(8)        # runs in progress: Little's law on run duration
+llm_calls = asyncio.Semaphore(32)  # shared by every run: the engine or provider concurrency
+MAX_TOOLS_PER_RUN, MAX_STEPS = 4, 12
+class Busy(Exception): pass        # mapped to 503 + Retry-After by the API layer
 
 async def start_run(task):
-    if runs.locked():                      # admit or reject before step 1: no work wasted
+    if runs.locked():              # admit or reject before step 1: no work wasted
         raise Busy("agent capacity full")
     async with runs:
         return await agent_loop(task)
 
 async def agent_loop(task):
-    tools_gate = asyncio.Semaphore(MAX_TOOLS_PER_RUN)
-    history = [task]
-    for step in range(MAX_STEPS):
-        async with llm_calls:              # every model call passes the shared gate
+    tools_gate, history = asyncio.Semaphore(MAX_TOOLS_PER_RUN), [task]
+    async def one(call):
+        async with tools_gate:     # 20 requested searches run 4 at a time
+            return await run_tool(call)
+    for _ in range(MAX_STEPS):     # step budget keeps a looping agent bounded
+        async with llm_calls:
             action = await llm_step(history)
         if action.final:
             return action.answer
-        async def one(call):
-            async with tools_gate:         # a planner asking for 20 searches runs 4 at a time
-                return await run_tool(call)
         history += await asyncio.gather(*(one(c) for c in action.tool_calls))
     return "stopped: step budget reached"
 ```

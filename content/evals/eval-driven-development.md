@@ -199,17 +199,16 @@ WRITE_TOOLS = {"issue_refund", "update_record"}
 def confirmed_before_write(calls):
     confirmed = False
     for c in calls:
-        if c["name"] == "ask_user_confirmation":
-            confirmed = True
+        confirmed |= c["name"] == "ask_user_confirmation"
         if c["name"] in WRITE_TOOLS and not confirmed:
             return False
     return True
 
-def used_required_tools(calls, required):          # required comes from the golden task
-    return set(required) <= {c["name"] for c in calls}
-
 def within_budget(calls, max_steps=8):
     return len(calls) <= max_steps
+
+calls = [{"name": "lookup_order", "args": {}}, {"name": "issue_refund", "args": {}}]
+print(confirmed_before_write(calls), within_budget(calls))   # False True: wrote without confirming
 ```
 
 ### One iteration, concretely
@@ -246,18 +245,13 @@ def run():
     scores = {}
     for item in DATASET:
         outs = [answer(item["question"], item["context"]) for _ in range(K)]
-        passes = sum(cites_valid_source(o, item["context"]) and faithful(o, item["context"]) for o in outs)
-        scores[item["id"]] = passes / K
+        scores[item["id"]] = sum(cites_valid_source(o, item["context"]) and faithful(o, item["context"])
+                                 for o in outs) / K
     return scores
 
 def test_mean_did_not_drop():
     now, base = statistics.mean(run().values()), statistics.mean(BASELINE.values())
     assert now >= base - TOLERANCE, f"pass rate fell {base:.3f} -> {now:.3f}"
-
-def test_few_items_regressed():
-    # an item regressed if it lost at least two of its K samples versus the baseline run
-    regressed = [i for i, s in run().items() if round((BASELINE.get(i, 0) - s) * K) >= 2]  # count, not float
-    assert len(regressed) <= 0.02 * len(DATASET), f"regressed items: {regressed[:10]}"
 
 def test_every_slice_above_floor():
     for name in {i["slice"] for i in DATASET}:
@@ -287,25 +281,18 @@ be chance.
 ```python
 from math import comb
 
-def flips(base, cand):
-    """Items that went fail->pass (b) and pass->fail (c) between two runs."""
-    b = sum(1 for i in base if base[i] < 0.5 <= cand[i])
-    c = sum(1 for i in base if cand[i] < 0.5 <= base[i])
-    return b, c
-
 def sign_test(b, c):
-    """Exact two-sided sign test on the flipped items only."""
+    """Exact two-sided sign test: b items went fail->pass, c went pass->fail."""
     n, k = b + c, min(b, c)
-    if n == 0:
-        return 1.0
-    tail = sum(comb(n, j) for j in range(k + 1)) / 2 ** n
-    return min(1.0, 2 * tail)
+    return min(1.0, 2 * sum(comb(n, j) for j in range(k + 1)) / 2 ** n) if n else 1.0
 
-base = {"q1": 1.0, "q2": 0.0, "q3": 1.0, "q4": 0.0, "q5": 0.33}
-cand = {"q1": 1.0, "q2": 1.0, "q3": 0.33, "q4": 0.67, "q5": 0.0}
-print(flips(base, cand))                 # (2, 1)
-print(round(sign_test(8, 2), 3))         # 0.109: 8 up, 2 down could still be noise
-print(round(sign_test(15, 3), 3))        # 0.008: unlikely to be chance
+base = {"q1": 1, "q2": 0, "q3": 1, "q4": 0}       # per-item pass (1) or fail (0) in each run
+cand = {"q1": 1, "q2": 1, "q3": 0, "q4": 1}
+b = sum(base[i] < cand[i] for i in base)          # fail -> pass
+c = sum(base[i] > cand[i] for i in base)          # pass -> fail
+print(b, c)                                       # 2 1
+print(round(sign_test(8, 2), 3))                  # 0.109: 8 up, 2 down could still be noise
+print(round(sign_test(15, 3), 3))                 # 0.008: unlikely to be chance
 ```
 
 ## Production patterns
@@ -327,6 +314,9 @@ print(round(sign_test(15, 3), 3))        # 0.008: unlikely to be chance
 - **Offline-to-online check.** After each release, compare the offline score change with the online
   metric it should predict (task completion, escalation rate, thumbs-down rate). Monitor the correlation
   over releases; when it weakens, the golden set has drifted from real traffic.
+- **Per-item regression cap.** Beside the mean and slice checks, count an item as regressed when it
+  loses at least two of its *k* samples versus the baseline (compare counts, not floats), and fail the
+  gate when more than 2% of items regress.
 
 ## Trade-offs
 - **Evals first vs a fast first demo.** Writing evals before building delays the first demo by days but

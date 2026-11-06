@@ -197,8 +197,7 @@ def step_ms(batch, ctx):
 
 for batch, ctx in [(1, 1000), (64, 1000), (64, 6144), (256, 1000)]:
     ms = step_ms(batch, ctx)
-    print(f"batch={batch:3d} ctx={ctx:5d} step={ms:5.1f}ms "
-          f"per-user={1e3/ms:4.0f} tok/s total={batch*1e3/ms:6.0f} tok/s")
+    print(f"batch={batch:3d} ctx={ctx:5d} step={ms:5.1f}ms total={batch*1e3/ms:6.0f} tok/s")
 ```
 
 | Batch | Context | Step | Per user | Total |
@@ -213,41 +212,36 @@ reads, not the weights, now set the step time.
 
 ### Load sweep against an OpenAI-compatible endpoint
 The client-side semaphore is the concurrency limit; the script reports throughput and tail latency per
-level so you can see where the curve flattens. Streaming separates TTFT and TPOT; each streamed chunk
-counts as one token.
+level so you can see where the curve flattens. Streaming lets it time TPOT; each streamed chunk counts
+as one token.
 
 ```python
 import asyncio, time, httpx
 
 URL, MODEL = "http://localhost:8000/v1/completions", "meta-llama/Llama-3.1-8B-Instruct"
-PROMPT, MAX_TOK = "Explain why decode is memory-bandwidth bound.", 128
 
 async def one(client, sem):
     async with sem:                                        # the client-side concurrency limit
         t0, first, n = time.perf_counter(), None, 0
-        body = {"model": MODEL, "prompt": PROMPT, "max_tokens": MAX_TOK, "stream": True}
+        body = {"model": MODEL, "prompt": "Explain decode.", "max_tokens": 128, "stream": True}
         async with client.stream("POST", URL, json=body, timeout=300) as r:
             async for line in r.aiter_lines():
                 if line.startswith("data:") and "[DONE]" not in line:
                     n += 1
                     first = first or time.perf_counter() - t0
         total = time.perf_counter() - t0
-        first = total if first is None else first           # no tokens streamed: count as all wait
-        return first, (total - first) / max(n - 1, 1), n   # TTFT, TPOT, tokens
+        return n, (total - (first or total)) / max(n - 1, 1)   # tokens, TPOT
 
 async def sweep(level, requests=64):
     sem, t0 = asyncio.Semaphore(level), time.perf_counter()
     async with httpx.AsyncClient() as client:
         res = await asyncio.gather(*(one(client, sem) for _ in range(requests)))
-    wall = time.perf_counter() - t0
-    ttft = sorted(r[0] for r in res); tpot = sorted(r[1] for r in res)
-    print(f"conc={level:3d} tok/s={sum(r[2] for r in res)/wall:7.0f} "
-          f"p50 TTFT={ttft[len(ttft)//2]*1e3:6.0f}ms p95 TPOT={tpot[int(len(tpot)*.95)-1]*1e3:5.1f}ms")
+    tpot = sorted(r[1] for r in res)
+    print(f"conc={level:3d} tok/s={sum(r[0] for r in res) / (time.perf_counter() - t0):7.0f} "
+          f"p95 TPOT={tpot[int(len(tpot) * .95) - 1] * 1e3:5.1f}ms")
 
 for level in (1, 4, 16, 64):
-    asyncio.run(sweep(level))
-# Expect tok/s to climb steeply then flatten while p95 TPOT bends upward: that bend is the knee.
-# Re-run with your real prompt and output length distribution before choosing limits.
+    asyncio.run(sweep(level))  # expect tok/s to flatten while p95 TPOT bends upward: the knee
 ```
 
 ### Worked scenario: from benchmark to replica count
@@ -262,37 +256,31 @@ for level in (1, 4, 16, 64):
 ### Agent runtime: a shared call budget plus a per-run fan-out cap
 A planner fans out to subagents. A global semaphore keeps total in-flight LLM calls at the engine's
 knee; a per-run semaphore stops one run's fan-out from taking the whole budget. The model call is faked
-with a sleep so the script runs as is.
+with a one-second sleep so the script runs as is.
 
 ```python
-import asyncio, random, time
+import asyncio, time
 
-KNEE, MAX_FANOUT = 48, 4                # measured engine knee, per-run cap on parallel calls
-GLOBAL = None                           # created inside the event loop (Python 3.9 binds loops)
+KNEE, MAX_FANOUT = 48, 4      # measured engine knee, per-run cap on parallel calls
 
-async def llm_call(prompt: str) -> str:
-    async with GLOBAL:                  # every call, from every run, goes through here
-        await asyncio.sleep(random.uniform(0.5, 1.5))   # stand-in for the HTTP call
-        return f"answer to {prompt[:20]}"
+async def llm_call(gate, prompt):
+    async with gate:                                   # every call from every run passes here
+        return await asyncio.sleep(1, result=f"answer to {prompt}")  # stand-in for HTTP
 
-async def run_agent(task: str, subtasks: int = 10) -> list[str]:
-    plan = await llm_call(f"plan: {task}")
-    local = asyncio.Semaphore(MAX_FANOUT)
-    async def sub(i: int) -> str:
+async def run_agent(gate, task, subtasks=10):
+    local = asyncio.Semaphore(MAX_FANOUT)              # one run holds at most 4 of the 48 slots
+    plan = await llm_call(gate, f"plan: {task}")
+    async def sub(i):
         async with local:
-            return await llm_call(f"{plan} / step {i}")
-    results = await asyncio.gather(*(sub(i) for i in range(subtasks)))
-    return [await llm_call(f"summarize {len(results)} results")]
+            return await llm_call(gate, f"{plan} / step {i}")
+    return await asyncio.gather(*(sub(i) for i in range(subtasks)))
 
-async def main(runs: int = 30):
-    global GLOBAL
-    GLOBAL, t0 = asyncio.Semaphore(KNEE), time.perf_counter()
-    await asyncio.gather(*(run_agent(f"task {r}") for r in range(runs)))
-    print(f"{runs} runs, {runs * 12} calls, {time.perf_counter() - t0:.1f}s")
+async def main(runs=30):
+    gate, t0 = asyncio.Semaphore(KNEE), time.perf_counter()
+    await asyncio.gather(*(run_agent(gate, f"task {r}") for r in range(runs)))
+    print(f"{runs} runs, {runs * 11} calls, {time.perf_counter() - t0:.1f}s")
 
-asyncio.run(main())
-# Without MAX_FANOUT the first runs to finish planning queue 10 calls each and fill all 48 slots, so
-# later runs wait for whole fan-outs; with it, no run holds more than 4 slots at once.
+asyncio.run(main())  # 30 runs, 330 calls, ~8s
 ```
 
 ## Production patterns
@@ -314,6 +302,8 @@ asyncio.run(main())
 - **Re-sweep on every model or traffic change.** Run a load sweep (the script above, or vLLM's serving
   benchmark) with production-shaped prompts before changing limits. Track the knee as a dashboard number
   per model and GPU type.
+- **Create the shared semaphore inside the running event loop.** On Python 3.9 and earlier an
+  `asyncio.Semaphore` built at import time binds to a different loop than `asyncio.run` starts.
 
 ## Trade-offs
 - **Higher sequence limit vs per-user TPOT.** It raises throughput and lowers cost per token, but once the

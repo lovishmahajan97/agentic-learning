@@ -327,7 +327,7 @@ flowchart TD
 
 ## Examples
 ### Agent scenario: linting a tool module
-Four tools an agent can call, linted with the configuration in the next example. Findings below are
+Three tools an agent can call, linted with the configuration in the next example. Findings below are
 from `ruff check --output-format concise tools.py` on Ruff 0.17.1.
 
 ```python
@@ -339,26 +339,16 @@ import requests
 
 async def save_memory(note: str) -> None: ...
 
-
 async def run_shell(command: str) -> str:
     out = subprocess.run(command, shell=True, capture_output=True, text=True)  # ASYNC221, S602
     asyncio.create_task(save_memory(command))                                  # RUF006
     return out.stdout
 
-
 async def fetch_page(url: str) -> str:
     return requests.get(url, timeout=10).text                                  # ASYNC210
 
-
 def calculator(expression: str) -> float:
     return eval(expression)                                                    # S307
-
-
-def read_file(path: str) -> str:
-    try:
-        return open(path).read()
-    except Exception:                      # BLE001 only if you add the BLE family
-        return ""
 ```
 
 | Finding | Why it matters in an agent | Fix |

@@ -301,10 +301,10 @@ flowchart TD
 ## Examples
 ### Agent endpoint that records its trace after answering
 The task opens its own session, guards its own exceptions, and would be harmless if run twice (the run
-id is the primary key). A random 5% of runs are also copied to the eval sample table.
+id is the primary key).
 
 ```python
-import logging, random, time, uuid
+import logging, uuid
 from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel
 
@@ -313,32 +313,21 @@ app, log = FastAPI(), logging.getLogger("trace")
 class Ask(BaseModel):
     prompt: str
 
-async def run_agent(prompt: str) -> tuple[str, list[dict], int]:
-    # stand-in: (answer, tool calls made, output_tokens)
-    return f"echo: {prompt}", [{"tool": "search", "ms": 120}], 7
-
-async def record_trace(run_id: str, user_id: str, prompt: str, answer: str,
-                       steps: list[dict], tokens: int, ms: float, sample: bool):
+async def record_trace(run_id: str, prompt: str, answer: str) -> None:
     try:
         async with session_factory() as session:     # its OWN session; never the request's
-            await session.merge(Trace(id=run_id, user_id=user_id, prompt=prompt, answer=answer,
-                                      tool_calls=steps, output_tokens=tokens, latency_ms=ms))
-            if sample:
-                await session.merge(EvalSample(run_id=run_id, prompt=prompt, answer=answer))
+            await session.merge(Trace(id=run_id, prompt=prompt, answer=answer))
             await session.commit()                   # merge on run_id: a rerun overwrites, never duplicates
     except Exception:
         log.exception("trace write failed")          # client already has its answer: log, don't raise
 
 @app.post("/agent/run")
 async def answer(body: Ask, bg: BackgroundTasks):
-    t0, run_id = time.perf_counter(), str(uuid.uuid4())
-    text, steps, tokens = await run_agent(body.prompt)
-    ms = (time.perf_counter() - t0) * 1000
-    bg.add_task(record_trace, run_id, "user-123", body.prompt, text, steps, tokens, ms,
-                random.random() < 0.05)              # runs after the body is sent
+    run_id, text = str(uuid.uuid4()), f"echo: {body.prompt}"   # stand-in for the agent run
+    bg.add_task(record_trace, run_id, body.prompt, text)       # runs after the body is sent
     return {"run_id": run_id, "answer": text}
 
-# session_factory, Trace and EvalSample come from your SQLAlchemy setup (see the async database lesson).
+# session_factory and Trace come from your SQLAlchemy setup (see the async database lesson).
 ```
 
 ### If you must use `create_task`: keep a strong reference

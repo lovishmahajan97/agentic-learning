@@ -302,95 +302,68 @@ flowchart TD
 
 ## Examples
 ### A schema built for SDKs and LLM tools
-An embeddings endpoint with described fields, a constrained enum, a documented error and a stable
+An embeddings endpoint with a described field, a constrained enum, a documented error and a stable
 operation id.
 
 ```python
 from typing import Literal
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
 def op_id(route: APIRoute) -> str:
     return f"{route.tags[0]}_{route.name}" if route.tags else route.name
 
-app = FastAPI(title="retrieval-api", version="1.4.0", generate_unique_id_function=op_id)
+app = FastAPI(title="retrieval-api", generate_unique_id_function=op_id)
 
 class EmbedIn(BaseModel):
-    texts: list[str] = Field(min_length=1, max_length=256,
-                             description="Texts to embed; each is truncated to the model's limit.")
+    texts: list[str] = Field(min_length=1, description="Texts to embed.")
     model: Literal["small", "large"] = Field("small", description="Embedding size tier.")
-
-class EmbedOut(BaseModel):
-    vectors: list[list[float]]
-    model: str
-    dimensions: int
 
 class ErrorOut(BaseModel):
     code: str
     message: str
 
-@app.post("/v1/embeddings", tags=["embeddings"], response_model=EmbedOut,
-          responses={429: {"model": ErrorOut, "description": "Tenant quota exceeded"}},
-          summary="Embed a batch of texts")
-async def create(body: EmbedIn) -> EmbedOut:
-    if len(body.texts) > 200:                  # stand-in for a real per-tenant quota check
-        err = ErrorOut(code="quota_exceeded", message="Tenant quota exceeded")
-        return JSONResponse(status_code=429, content=err.model_dump())
-    return EmbedOut(vectors=[[0.0] * 8 for _ in body.texts], model=body.model, dimensions=8)
+@app.post("/v1/embeddings", tags=["embeddings"], summary="Embed a batch of texts",
+          responses={429: {"model": ErrorOut, "description": "Tenant quota exceeded"}})
+async def create(body: EmbedIn) -> dict:
+    return {"vectors": [[0.0] * 8 for _ in body.texts]}
 
-schema = app.openapi()
-print(schema["paths"]["/v1/embeddings"]["post"]["operationId"])   # embeddings_create
-print(schema["components"]["schemas"]["EmbedIn"]["properties"]["model"]["enum"])  # ['small', 'large']
+op = app.openapi()["paths"]["/v1/embeddings"]["post"]
+print(op["operationId"], list(op["responses"]))   # embeddings_create ['200', '429', '422']
 ```
 
 - **SDK method** is `embeddings_create`; **`model`** is an enum a client or LLM can pick from.
-- **The 429 shape is documented** even though FastAPI cannot infer it from the handler.
-- **The body really is an `ErrorOut`.** A plain `raise HTTPException(429, detail="quota")` would send
-  `{"detail": "quota"}`, so the declared model would be a lie unless a custom exception handler produces
-  the `code`/`message` envelope.
+- **The 429 shape is documented** even though FastAPI cannot infer it from the handler. A plain
+  `raise HTTPException(429, detail="quota")` would send `{"detail": "quota"}`, so the declared model is a
+  lie unless a custom exception handler produces the `code`/`message` envelope.
 
 ### Agent scenario: turn your own schema into tool definitions
-A minimal importer that reads `app.openapi()`, inlines `$ref` pointers and emits one tool per tagged
-operation, in the generic name, description and JSON Schema shape function-calling APIs accept.
+A minimal importer, continuing the app above: one tool per tagged operation, in the name, description
+and JSON Schema shape function-calling APIs accept.
 
 ```python
 def resolve(node, components):
     """Inline $ref pointers so each tool schema is self-contained."""
     if isinstance(node, dict):
         if "$ref" in node:
-            name = node["$ref"].split("/")[-1]
-            return resolve(components[name], components)
+            return resolve(components[node["$ref"].split("/")[-1]], components)
         return {k: resolve(v, components) for k, v in node.items()}
-    if isinstance(node, list):
-        return [resolve(v, components) for v in node]
-    return node
+    return [resolve(v, components) for v in node] if isinstance(node, list) else node
 
 def tools_from_openapi(schema: dict, tag: str) -> list[dict]:
-    components = schema.get("components", {}).get("schemas", {})
-    tools = []
-    for path, ops in schema["paths"].items():
-        for method, op in ops.items():
-            if tag not in op.get("tags", []):
-                continue                                  # only expose the tools group
-            body = op.get("requestBody", {}).get("content", {}).get("application/json", {})
-            params = resolve(body.get("schema", {"type": "object", "properties": {}}), components)
-            tools.append({
-                "name": op["operationId"],                # from generate_unique_id_function
-                "description": op.get("summary") or op.get("description", ""),
-                "input_schema": params,                   # Field descriptions and enums ride along
-                "x_route": (method.upper(), path),        # kept locally to dispatch the call
-            })
-    return tools
+    components = schema["components"]["schemas"]
+    return [{"name": op["operationId"],                     # from generate_unique_id_function
+             "description": op.get("summary", ""),
+             "input_schema": resolve(op["requestBody"]["content"]["application/json"]["schema"],
+                                     components)}         # Field descriptions and enums ride along
+            for ops in schema["paths"].values() for op in ops.values() if tag in op.get("tags", [])]
 
-tools = tools_from_openapi(app.openapi(), tag="embeddings")
-print(tools[0]["name"], tools[0]["input_schema"]["properties"]["model"]["enum"])
+tool = tools_from_openapi(app.openapi(), tag="embeddings")[0]
+print(tool["name"], tool["input_schema"]["properties"]["model"]["enum"])
 # embeddings_create ['small', 'large']
 ```
 
-- **Strip `x_route` before sending** the list to the model API; it is your dispatcher's lookup, not part of
-  the tool definition.
 - **Deliberately minimal.** It reads only the JSON body, so path and query parameters must be merged into
   the schema too, and a recursive model would loop forever in `resolve`. The argument field is
   `input_schema` in Anthropic's API and `parameters` in OpenAI's.
@@ -412,8 +385,8 @@ Illustrative orders of magnitude for an agent platform that imports a whole inte
   of 40.
 
 ### CI step: export and diff the schema
-Treat `/openapi.json` as a committed artifact. This script writes it, or with `--check` fails when the
-committed copy is stale, so every pull request shows its contract (and tool) change in the diff.
+Treat `/openapi.json` as a committed artifact: with `--check` this fails when the committed copy is
+stale, so every pull request shows its contract (and tool) change in the diff.
 
 ```python
 # scripts/export_openapi.py
@@ -423,33 +396,10 @@ from app.main import create_app
 
 path = Path("openapi.json")
 current = json.dumps(create_app().openapi(), indent=2, sort_keys=True) + "\n"
-
-if "--check" in sys.argv:
-    if not path.exists() or path.read_text() != current:
-        sys.exit("openapi.json is stale: run python scripts/export_openapi.py and commit it")
-    print("openapi.json is up to date")
-else:
+if "--check" not in sys.argv:
     path.write_text(current)
-```
-
-### Production snippet: docs off in prod, self-hosted assets for air-gapped sites
-```python
-from fastapi import FastAPI
-from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.staticfiles import StaticFiles
-
-IS_PROD = False            # read from settings in real code
-
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None if IS_PROD else "/openapi.json")
-# ./static must exist (StaticFiles raises at startup otherwise) and hold swagger-ui-bundle.js, swagger-ui.css
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-if not IS_PROD:
-    @app.get("/docs", include_in_schema=False)
-    async def docs():
-        return get_swagger_ui_html(openapi_url="/openapi.json", title="API docs",
-                                   swagger_js_url="/static/swagger-ui-bundle.js",
-                                   swagger_css_url="/static/swagger-ui.css")
+elif not path.exists() or path.read_text() != current:
+    sys.exit("openapi.json is stale: run python scripts/export_openapi.py and commit it")
 ```
 
 ## Production patterns
@@ -474,6 +424,10 @@ if not IS_PROD:
   internet-facing services, `openapi_url=None` in production, or serve them behind auth; for customer
   networks serve `get_swagger_ui_html(...)` with local `swagger_js_url` and `swagger_css_url`. Monitor:
   unauthenticated hits on `/docs` and `/openapi.json`, and a smoke test loading `/docs` on site.
+- **Strip local routing fields from tool definitions.** If your importer keeps the HTTP method and path
+  beside each tool for dispatch, remove them before sending the list to the model API.
+- **Self-hosted Swagger assets need the directory.** `StaticFiles(directory="static")` raises at startup
+  if `./static` is missing; it must hold `swagger-ui-bundle.js` and `swagger-ui.css`.
 
 ## Trade-offs
 - **Code-first vs design-first.** Code-first schemas never drift from validation, but the API design is

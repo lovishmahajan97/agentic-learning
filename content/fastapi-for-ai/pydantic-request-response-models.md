@@ -325,26 +325,18 @@ validator. A bad tool call from the model becomes an error message the agent see
 
 ```python
 from typing import Literal
-from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 class AgentRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     task: str = Field(min_length=1, max_length=20_000)
     max_steps: int = Field(default=8, ge=1, le=25)              # bounds the bill
-    tools: list[Literal["search_docs", "create_ticket"]] = Field(default=["search_docs"])
-
-class StepSummary(BaseModel):
-    step: int
-    tool: str | None
-    ok: bool
+    tools: list[Literal["search_docs", "create_ticket"]] = ["search_docs"]
 
 class AgentRunResponse(BaseModel):                              # no scratchpad, no system prompt
     answer: str
-    steps: list[StepSummary]
 
 class SearchDocsArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
     query: str = Field(min_length=3, max_length=500)
     top_k: int = Field(default=5, ge=1, le=20)
 
@@ -354,19 +346,14 @@ def validate_tool_call(raw_args: str) -> SearchDocsArgs | str:
     try:
         return SearchDocsArgs.model_validate_json(raw_args)
     except ValidationError as e:                                # feed back, do not crash the run
-        return "invalid arguments: " + "; ".join(
-            f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors())
+        return "invalid arguments: " + "; ".join(f"{err['loc'][0]}: {err['msg']}" for err in e.errors())
 
 print(validate_tool_call('{"query": "kv cache", "top_k": 50}'))
 # invalid arguments: top_k: Input should be less than or equal to 20
-
-app = FastAPI()
-
-@app.post("/v1/agent/run", response_model=AgentRunResponse)
-async def run(req: AgentRunRequest) -> AgentRunResponse:
-    # ... agent loop over req.max_steps using TOOL_SCHEMA; stubbed ...
-    return AgentRunResponse(answer="done", steps=[StepSummary(step=1, tool="search_docs", ok=True)])
 ```
+
+On a route, `async def run(req: AgentRunRequest) -> AgentRunResponse` makes FastAPI validate the body
+and filter the output to `answer`.
 
 ### Worked scenario: what the contract saved in one week
 An internal agent API before and after adding bounds (illustrative numbers).
@@ -378,16 +365,36 @@ An internal agent API before and after adding bounds (illustrative numbers).
 | Client typo `"max_step": 5` | silently ignored, default used | 422 with `loc` `["body", "max_step"]`, `type` `extra_forbidden` |
 | Scratchpad in responses | leaked chain-of-thought and system prompt | absent: not in `AgentRunResponse` |
 
-### Chat endpoint with a strict, bounded contract
-A forbidding request model, bounded sampling parameters, a discriminated content union, a cross-field
-rule and a separate response model that exposes usage but not cost. Sending
-`{"messages": [{"role": "user", "content": "hi"}], "temprature": 0.1}` returns a 422 whose `loc` is
-`["body", "temprature"]` and whose `type` is `extra_forbidden`.
+### Runnable: what the 422 is made of, and forwarding only set fields
+The errors FastAPI turns into a 422 `detail` list come from `ValidationError.errors()`; FastAPI
+prefixes each `loc` with `"body"`.
+
+```python
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+class Params(BaseModel):
+    model_config = ConfigDict(extra="forbid")          # "temprature" -> 422, not silently ignored
+    temperature: float = Field(default=0.7, ge=0, le=2)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+
+try:
+    Params.model_validate({"temprature": 0.1, "top_p": 5})
+except ValidationError as e:
+    print([(err["loc"], err["type"]) for err in e.errors()])
+# [(('top_p',), 'less_than_equal'), (('temprature',), 'extra_forbidden')]
+
+p = Params.model_validate({"top_p": 0.9})
+print(p.model_dump())                     # {'temperature': 0.7, 'top_p': 0.9}
+print(p.model_dump(exclude_unset=True))   # {'top_p': 0.9}: provider defaults apply to the rest
+```
+
+### Discriminated content parts
+`Field(discriminator="type")` picks the branch from the tag, so a bad part gets one precise error
+instead of one error per branch.
 
 ```python
 from typing import Annotated, Literal, Union
-from fastapi import FastAPI
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, Field
 
 class TextPart(BaseModel):
     type: Literal["text"]
@@ -397,72 +404,12 @@ class ImagePart(BaseModel):
     type: Literal["image_url"]
     url: str
 
-Part = Annotated[Union[TextPart, ImagePart], Field(discriminator="type")]
-
 class Message(BaseModel):
-    model_config = ConfigDict(extra="forbid")
     role: Literal["system", "user", "assistant"]
-    content: Union[str, list[Part]]
+    content: str | list[Annotated[Union[TextPart, ImagePart], Field(discriminator="type")]]
 
-class ChatRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")          # "temprature" -> 422, not silently ignored
-    messages: list[Message] = Field(min_length=1, max_length=200)
-    temperature: float = Field(default=0.7, ge=0, le=2)    # range is provider-specific
-    max_tokens: int = Field(default=1024, ge=1, le=8192)
-    stream: bool = False
-
-    @model_validator(mode="after")
-    def first_message_not_assistant(self):
-        if self.messages[0].role == "assistant":
-            raise ValueError("conversation must start with a system or user message")
-        return self
-
-class Usage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-
-class ChatResponse(BaseModel):
-    id: str
-    content: str
-    usage: Usage                                         # cost_usd and provider payload stay internal
-
-app = FastAPI()
-
-@app.post("/v1/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest) -> ChatResponse:
-    # ... call the model here; stubbed ...
-    return ChatResponse(id="msg_1", content="hi", usage=Usage(prompt_tokens=12, completion_tokens=1))
-```
-
-### Runnable: what the 422 is made of, and forwarding only set fields
-Pydantic only, no server. The errors FastAPI turns into a 422 `detail` list come from
-`ValidationError.errors()`; FastAPI prefixes each `loc` with `"body"`.
-
-```python
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
-
-class Params(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    temperature: float = Field(default=0.7, ge=0, le=2)
-    max_tokens: int = Field(default=1024, ge=1, le=8192)
-    top_p: float | None = Field(default=None, ge=0, le=1)
-
-# 1. What a 422 is built from: one entry per bad field, with its path.
-try:
-    Params.model_validate({"temprature": 0.1, "max_tokens": 100_000})
-except ValidationError as e:
-    for err in e.errors():
-        print(err["loc"], err["type"])
-# ('max_tokens',) less_than_equal
-# ('temprature',) extra_forbidden
-
-# 2. Lax mode coerces a numeric string; the result is a float.
-print(Params.model_validate({"temperature": "0.2"}).temperature)    # 0.2
-
-# 3. Forward only what the client set, so provider defaults apply to the rest.
-p = Params.model_validate({"top_p": 0.9})
-print(p.model_dump())                     # {'temperature': 0.7, 'max_tokens': 1024, 'top_p': 0.9}
-print(p.model_dump(exclude_unset=True))   # {'top_p': 0.9}
+m = Message.model_validate({"role": "user", "content": [{"type": "image_url", "url": "https://x/a.png"}]})
+print(type(m.content[0]).__name__)        # ImagePart
 ```
 
 ## Production patterns
@@ -486,6 +433,12 @@ print(p.model_dump(exclude_unset=True))   # {'top_p': 0.9}
 - **Forward with `exclude_unset`.** Use in provider proxies: send `req.model_dump(exclude_unset=True)`
   merged with your fixed fields, so client-omitted parameters keep provider defaults. Monitor
   per-parameter usage to decide which provider features to expose next.
+- **Sampling bounds are provider-specific.** Set `temperature`, `max_tokens` and similar limits from the
+  provider you call (for example `le=8192` tokens), not from a generic range.
+- **Lax mode coerces.** A numeric string such as `"0.2"` validates into a float field unless the model
+  uses strict mode; turn it on where coercion would hide client bugs.
+- **Put cross-field rules in `@model_validator(mode="after")`,** for example rejecting a conversation that
+  starts with an assistant message.
 
 ## Trade-offs
 - **Strict contracts vs pass-through speed.** They catch client errors early and document themselves, but

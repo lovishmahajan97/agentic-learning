@@ -205,27 +205,20 @@ client = anthropic.Anthropic()
 tools = [{
     "name": "get_fx_rate",
     "description": "Return the current exchange rate between two ISO 4217 currencies. "
-                   "Call it whenever the user asks for a conversion or a current rate; "
-                   "never estimate a rate from memory.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "base": {"type": "string", "description": "3-letter code, e.g. EUR"},
-            "quote": {"type": "string", "description": "3-letter code, e.g. USD"},
-        },
-        "required": ["base", "quote"], "additionalProperties": False,
-    },
+                   "Call it whenever the user asks for a conversion; never estimate a rate from memory.",
+    "input_schema": {"type": "object",
+                     "properties": {"base": {"type": "string"}, "quote": {"type": "string"}},
+                     "required": ["base", "quote"], "additionalProperties": False},
     "strict": True,
 }]
 
 def get_fx_rate(base: str, quote: str) -> dict:                       # stub for the lesson
-    return {"base": base, "quote": quote, "rate": 1.0842, "as_of": "2026-10-20T09:00Z"}
+    return {"base": base, "quote": quote, "rate": 1.0842}
 
 messages = [{"role": "user", "content": "How much is 250 EUR in USD right now?"}]
 first = client.messages.create(model="claude-opus-5-5", max_tokens=8192,
                                tools=tools, messages=messages)
-assert first.stop_reason == "tool_use"
-call = next(b for b in first.content if b.type == "tool_use")
+call = next(b for b in first.content if b.type == "tool_use")    # stop_reason was "tool_use"
 print(call.name, call.input)                       # get_fx_rate {'base': 'EUR', 'quote': 'USD'}
 
 messages += [

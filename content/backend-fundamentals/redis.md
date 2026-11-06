@@ -346,58 +346,42 @@ flowchart TD
 ```
 
 ## Examples
-### Three primitives in redis-py
-An LLM response cache, a fixed-window rate limiter made atomic with a Lua script, and a lock with a safe
-release.
+### Two primitives in redis-py: an atomic rate limiter and a safe lock release
+A fixed-window rate limiter made atomic with a Lua script, and a lock whose release only deletes the key
+if it still holds our token.
 
 - **Why the script:** it runs server-side so the increment and the TTL cannot be separated by a crash. With
   two client calls, a process dying after `INCR` and before `EXPIRE` leaves a key with no TTL, and that
   tenant is rate-limited forever once it reaches the limit.
-- **Why hash every parameter:** two requests that differ only in temperature or system prompt must not
-  share an entry.
+- **Why the token:** a worker whose lock expired mid-job must not delete the lock another worker has
+  since acquired.
 
 ```python
-import hashlib, json, redis, time, uuid
-from contextlib import contextmanager
+import time, uuid, redis   # pip install redis (or fakeredis[lua]: r = fakeredis.FakeRedis(...))
 
 r = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
-def cached_completion(model, prompt, call, **params):
-    spec = json.dumps({"prompt": prompt, **params}, sort_keys=True)   # stable across dict order
-    key = f"cache:{model}:" + hashlib.sha256(spec.encode()).hexdigest()
-    hit = r.get(key)
-    if hit is not None:
-        return json.loads(hit)
-    out = call(model, prompt, **params)       # the expensive provider call
-    r.set(key, json.dumps(out), ex=3600)      # 1-hour TTL; eviction handles the rest
-    return out
-
-RATE_LUA = """
+rate_script = r.register_script("""
 local n = redis.call('INCR', KEYS[1])
 if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
 return n
-"""
-rate_script = r.register_script(RATE_LUA)
+""")
 
 def allow(tenant, limit=60, window_s=60):
-    key = f"rl:{tenant}:{int(time.time() // window_s)}"   # e.g. rl:t42:29361600, one key per minute
-    return rate_script(keys=[key], args=[window_s]) <= limit   # 61st call this minute -> False
+    key = f"rl:{tenant}:{int(time.time() // window_s)}"    # e.g. rl:t42:29361600, one key per minute
+    return rate_script(keys=[key], args=[window_s]) <= limit
 
-RELEASE_LUA = """
+release_script = r.register_script("""
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
 return 0
-"""
-release_script = r.register_script(RELEASE_LUA)
+""")
 
-@contextmanager
-def with_lock(name, ttl_ms=30000):
-    token = str(uuid.uuid4())
-    if not r.set(f"lock:{name}", token, nx=True, px=ttl_ms):
-        raise RuntimeError("busy")
-    try:
-        yield                                  # with with_lock("reindex:tenant42"): ...
-    finally:
-        release_script(keys=[f"lock:{name}"], args=[token])   # only deletes if still ours
+token = str(uuid.uuid4())
+print(sum(allow("t42") for _ in range(61)))                      # 60: the 61st call is refused
+print(r.set("lock:reindex", token, nx=True, px=30000))           # True: lock held for at most 30 s
+print(r.set("lock:reindex", "other", nx=True, px=30000))         # None: someone already holds it
+print(release_script(keys=["lock:reindex"], args=["stale"]))     # 0: not our token, nothing deleted
+print(release_script(keys=["lock:reindex"], args=[token]))       # 1: released by its owner
 ```
 
 ### Runnable: the fixed-window burst, simulated
@@ -443,45 +427,6 @@ A 5 MB cached response (say, a large shared document summary) is read 1,000 time
 The arithmetic is illustrative, but the shape is common: one node's network saturates while the cluster
 looks underused.
 
-### Agent scenario: a shared semaphore and a per-run budget
-Many agent workers share one provider. A sorted-set semaphore caps in-flight model calls fleet-wide, and
-expired entries free slots held by crashed workers. A per-run counter stops a looping agent.
-
-```python
-import time, uuid
-
-SEM_ACQUIRE = """
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', tonumber(ARGV[1]) - tonumber(ARGV[2]))
-if redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[3]) then
-  redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
-  return 1
-end
-return 0
-"""
-sem_acquire = r.register_script(SEM_ACQUIRE)
-
-def call_model_with_slot(call, provider="llm", limit=50, lease_s=120):
-    token = str(uuid.uuid4())
-    while not sem_acquire(keys=[f"sem:{provider}"], args=[time.time(), lease_s, limit, token]):
-        time.sleep(0.2)                       # back off; production adds jitter and a deadline
-    try:
-        return call()
-    finally:
-        r.zrem(f"sem:{provider}", token)      # release our slot only
-
-def charge_run(run_id, tokens, max_tokens=200_000):
-    used = r.incrby(f"budget:{run_id}", tokens)
-    r.expire(f"budget:{run_id}", 86400)       # scratch state: gone a day after the run
-    if used > max_tokens:
-        raise RuntimeError(f"run {run_id} over budget: {used} tokens")  # agent loop stops here
-```
-
-- **Clock caveat:** scores come from each worker's clock, so skew between hosts shifts when stale leases
-  expire; keep the lease well above the slowest model call.
-- **Numbers to size it:** with 200 concurrent agent runs, a provider limit equivalent to 50 in-flight
-  calls, and ~10 s per call, the semaphore holds runs to 50 calls at a time instead of letting 200
-  collide into rate-limit errors and retries.
-
 ## Production patterns
 - **One instance per role.** Run the cache with `maxmemory-policy allkeys-lfu` (or `allkeys-lru`) and TTLs
   on every key; run queues and locks on a separate instance with `noeviction` and `appendonly yes` plus
@@ -503,6 +448,17 @@ def charge_run(run_id, tokens, max_tokens=200_000):
 - **Cache read-only tool results by argument hash.** Key on tool name plus a hash of canonical arguments,
   with a TTL matched to how fast the source changes (minutes for search, hours for reference data).
   Monitor hit ratio per tool and never cache side-effecting tools.
+- **LLM response cache keyed on every parameter.** Hash the prompt plus all parameters with
+  `json.dumps(..., sort_keys=True)` into `cache:{model}:{sha256}` and store with a TTL (for example 1 hour),
+  so two requests that differ only in temperature or system prompt never share an entry.
+- **Fleet-wide semaphore as a sorted set.** One Lua script drops entries older than the lease
+  (`ZREMRANGEBYSCORE`), checks `ZCARD` against the limit and `ZADD`s a uuid token scored by time; release
+  with `ZREM` of that token, and back off with jitter and a deadline while waiting. Example sizing: 200
+  concurrent runs against a provider limit of 50 in-flight calls stay at 50 instead of colliding into 429s.
+- **Semaphore clock caveat.** Lease scores come from each worker's clock, so skew between hosts shifts
+  when stale leases expire; keep the lease (for example 120 s) well above the slowest model call.
+- **Per-run token budget counter.** `INCRBY budget:{run_id}` with each step's tokens, `EXPIRE` it after
+  a day, and stop the agent loop once it passes the cap (for example 200,000 tokens).
 
 ## Trade-offs
 - **Speed vs RAM-sized data.** Sub-millisecond operations in memory, but the dataset must fit in RAM;

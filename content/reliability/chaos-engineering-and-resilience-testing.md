@@ -209,18 +209,16 @@ flowchart TD
 ```
 
 ## Examples
-### Fault-injecting client wrapper and experiment runner
-A wrapper around the real model client, controlled by environment variables so it is inert by default,
-plus a minimal runner with an abort condition. Run once as a control and once with a fault, and compare
-the two results against the hypothesis.
+### Fault-injecting client wrapper
+A wrapper around the real model client, controlled by environment variables so it is inert by default.
+Run once as a control and once with a fault, and compare the two results against the hypothesis.
 
 ```python
-import asyncio, os, random, time
+import asyncio, os, random, types
 
 class RateLimitError(Exception): pass
 
-class ChaosLLM:
-    """Wraps the real client. Injects faults on a fraction of calls; inert unless CHAOS_RATE is set."""
+class ChaosLLM:          # wraps the real client; inert unless CHAOS_RATE is set
     def __init__(self, client):
         self.client = client
         self.rate = float(os.getenv("CHAOS_RATE", "0"))
@@ -233,32 +231,25 @@ class ChaosLLM:
             elif self.mode == "rate_limit":
                 raise RateLimitError("429")              # do backoff, jitter and step budgets hold?
             elif self.mode == "garbage":
-                return {"content": "{not json", "usage": {"total_tokens": 5}}   # does validation catch it?
+                return {"content": "{not json"}          # does validation catch it?
         return await self.client.complete(**kw)
 
-async def experiment(handler, requests, min_success=0.95):
-    """Runs traffic through `handler`, aborts if steady state is violated, reports the SLIs."""
-    latencies, ok = [], 0
-    for req in requests:
-        t0 = time.perf_counter()
-        try:
-            await handler(req); ok += 1
-        except Exception:
-            pass
-        latencies.append(time.perf_counter() - t0)
-        if len(latencies) >= 20 and ok / len(latencies) < min_success:
-            raise RuntimeError("steady state violated; experiment aborted")   # the kill switch
-    latencies.sort()
-    return {"success_rate": ok / len(latencies),
-            "p95_s": latencies[int(0.95 * (len(latencies) - 1))]}
+async def main():
+    os.environ.update(CHAOS_MODE="rate_limit", CHAOS_RATE="0.3")
+    llm = ChaosLLM(types.SimpleNamespace(complete=lambda **kw: asyncio.sleep(0, {"content": "ok"})))
+    results = await asyncio.gather(*(llm.complete() for _ in range(1000)), return_exceptions=True)
+    print(sum(isinstance(r, RateLimitError) for r in results))   # about 300 of 1000 calls get a 429
 
-# Control run: CHAOS_RATE=0. Experiment: CHAOS_MODE=rate_limit CHAOS_RATE=0.3.
-# Hypothesis: success_rate >= 0.99 and p95_s < 1.2 x the control's. Anything else is a finding.
+asyncio.run(main())
 ```
 
+- **Hypothesis:** with `CHAOS_MODE=rate_limit CHAOS_RATE=0.3`, success rate stays at or above 0.99 and
+  p95 latency under 1.2 times the control's. Anything else is a finding.
+- **Abort condition:** once 20 requests are in, stop the experiment if the success rate falls below 95
+  percent; that check is the kill switch.
 - **In production the same wrapper sits in the deployed service** behind a per-tenant or per-request flag,
   so the fault can be applied to one percent of real traffic.
-- **The runner's abort check becomes an alert** on the experiment slice's SLIs that flips the flag off.
+- **The abort check becomes an alert** on the experiment slice's SLIs that flips the flag off.
 
 ### Fault-injecting tool adapter for an agent
 The same idea one layer down: wrap each tool the agent can call, so experiments can make one tool slow,
@@ -306,29 +297,14 @@ client, before and after the fixes the experiment produced.
   step, and count waits against the run's time budget, not its step budget.
 - **Hypothesis re-run:** completion back within 1 point of control; the experiment became a weekly job.
 
-### How long must the experiment run? A runnable sizing check
+### How long must the experiment run?
 A standard two-proportion power calculation (two-sided 5 percent, 80 percent power) for telling a 99
 percent control from a 98 percent fault arm, and what that means in hours per arm.
 
-```python
-from math import ceil, sqrt
-
-def se(p, n):
-    return sqrt(p * (1 - p) / n)          # standard error of a success rate
-
-def n_per_arm(p_control, p_fault, z_alpha=1.96, z_power=0.84):
-    """Requests per arm to tell two success rates apart (two-sided 5%, 80% power)."""
-    var = p_control * (1 - p_control) + p_fault * (1 - p_fault)
-    return ceil((z_alpha + z_power) ** 2 * var / (p_control - p_fault) ** 2)
-
-print(f"SE of 99% over 1,000 requests: {100 * se(0.99, 1000):.2f} points")   # 0.31
-n = n_per_arm(0.99, 0.98)
-print("requests per arm, 99% vs 98%:", n)                                     # 2313
-for rps, slice_ in [(10, 0.01), (10, 0.10), (200, 0.01)]:
-    hours = n / (rps * slice_) / 3600
-    print(f"{rps} rps service, {slice_:.0%} slice: {hours:.1f} h per arm")
-# 10 rps at 1%: 6.4 h | 10 rps at 10%: 0.6 h | 200 rps at 1%: 0.3 h
-```
+- **Requests per arm:** `n = (1.96 + 0.84)² × (0.99 × 0.01 + 0.98 × 0.02) / 0.01² ≈ 2,313`.
+- **Noise floor:** the standard error of a 99 percent success rate over 1,000 requests is
+  `sqrt(0.99 × 0.01 / 1000)` ≈ 0.31 points.
+- **Hours per arm:** `n / (rps × slice) / 3600`.
 
 | Service | Slice | Time per arm |
 |---|---|---|

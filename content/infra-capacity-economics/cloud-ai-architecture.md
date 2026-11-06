@@ -274,33 +274,23 @@ from google import genai
 
 QUESTION = "Summarise our refund policy in one sentence."
 
-def via_bedrock(model_id: str) -> str:
-    rt = boto3.client("bedrock-runtime", region_name=os.environ["AWS_REGION"])  # IAM creds, SigV4
-    r = rt.converse(
-        modelId=model_id,                                   # or a cross-region inference profile id
-        messages=[{"role": "user", "content": [{"text": QUESTION}]}],
-        inferenceConfig={"maxTokens": 200},
-    )
+def via_bedrock(model_id: str) -> str:             # IAM creds, SigV4; or a cross-region profile id
+    rt = boto3.client("bedrock-runtime", region_name=os.environ["AWS_REGION"])
+    r = rt.converse(modelId=model_id, messages=[{"role": "user", "content": [{"text": QUESTION}]}])
     return r["output"]["message"]["content"][0]["text"]
 
 def via_azure(deployment_name: str) -> str:
     # v1 API (checked against openai 3.46.0, 2026-11): standard client, no api_version
     token = get_bearer_token_provider(DefaultAzureCredential(), "https://ai.azure.com/.default")
-    client = OpenAI(
-        base_url=os.environ["AZURE_OPENAI_ENDPOINT"] + "/openai/v1/",  # https://<resource>.openai.azure.com
-        api_key=token,                                     # Entra ID; refreshed automatically
-    )
-    r = client.chat.completions.create(
-        model=deployment_name,                               # deployment, not the model family name
-        messages=[{"role": "user", "content": QUESTION}], max_tokens=200,
-    )
+    client = OpenAI(base_url=os.environ["AZURE_OPENAI_ENDPOINT"] + "/openai/v1/", api_key=token)
+    r = client.chat.completions.create(model=deployment_name,   # deployment, not the model family
+                                       messages=[{"role": "user", "content": QUESTION}])
     return r.choices[0].message.content
 
-def via_vertex(model_name: str) -> str:
+def via_vertex(model_name: str) -> str:            # ADC supplies the identity
     client = genai.Client(vertexai=True, project=os.environ["GCP_PROJECT"],
-                          location=os.environ["GCP_LOCATION"])  # ADC supplies the identity
-    r = client.models.generate_content(model=model_name, contents=QUESTION)
-    return r.text
+                          location=os.environ["GCP_LOCATION"])
+    return client.models.generate_content(model=model_name, contents=QUESTION).text
 ```
 
 - **In production none of these calls live in application code.** They sit behind the gateway, which tags
@@ -345,36 +335,30 @@ model asks for a tool by stopping with `tool_use`. The model id is a placeholder
 stand-in for a real tool.
 
 ```python
-import os, json, boto3
+import os, boto3
 
 rt = boto3.client("bedrock-runtime", region_name=os.environ["AWS_REGION"])
-TOOLS = {"tools": [{"toolSpec": {
-    "name": "lookup_order", "description": "Fetch an order by id",
-    "inputSchema": {"json": {"type": "object", "properties": {"order_id": {"type": "string"}},
-                             "required": ["order_id"]}}}}]}
+TOOLS = {"tools": [{"toolSpec": {"name": "lookup_order", "description": "Fetch an order by id",
+    "inputSchema": {"json": {"type": "object", "properties": {"order_id": {"type": "string"}}}}}}]}
 
 def lookup_order(order_id: str) -> dict:          # stand-in: call your own service here
     return {"order_id": order_id, "status": "shipped"}
 
 def run_agent(model_id: str, question: str, max_steps: int = 8) -> str:
     messages = [{"role": "user", "content": [{"text": question}]}]
-    for step in range(max_steps):                  # every step is one quota-counted model call
-        r = rt.converse(modelId=model_id, messages=messages, toolConfig=TOOLS,
-                        inferenceConfig={"maxTokens": 400})
+    for _ in range(max_steps):                     # every step is one quota-counted model call
+        r = rt.converse(modelId=model_id, messages=messages, toolConfig=TOOLS)
         msg = r["output"]["message"]; messages.append(msg)
         if r["stopReason"] != "tool_use":
             return msg["content"][0]["text"]
-        results = []
-        for block in msg["content"]:
-            if "toolUse" in block:
-                tu = block["toolUse"]
-                out = lookup_order(**tu["input"])      # this data is now in the next prompt and the logs
-                results.append({"toolResult": {"toolUseId": tu["toolUseId"], "content": [{"json": out}]}})
-        messages.append({"role": "user", "content": results})
+        messages.append({"role": "user", "content": [
+            {"toolResult": {"toolUseId": b["toolUse"]["toolUseId"],
+                            "content": [{"json": lookup_order(**b["toolUse"]["input"])}]}}
+            for b in msg["content"] if "toolUse" in b]})
     raise RuntimeError("step budget exhausted")
 ```
 
-- **The perimeter question is the tool result.** `out` re-enters the prompt on the next step and lands in
+- **The perimeter question is the tool result.** It re-enters the prompt on the next step and lands in
   invocation logs, so residency, logging and abuse-monitoring terms apply to tool data, not just to the
   user's question.
 
@@ -419,6 +403,9 @@ so a run charges about 52k input and 3k output tokens.
   gateway request has a matching platform log entry.
 - **Quota headroom per model per region.** Keep a sheet or config of quota, current peak TPM and lead time
   for each model-region pair, and file increases weeks before launch. Monitor 429 and throttle rates.
+- **Cap output on every call.** Set `inferenceConfig={"maxTokens": ...}` on Bedrock Converse and
+  `max_tokens` on Azure per step type (a few hundred tokens for a tool-calling step), because uncapped
+  output inflates both quota use and cost.
 
 ## Trade-offs
 - **Cloud perimeter vs model lag.** You inherit the cloud's identity, network, logging and compliance

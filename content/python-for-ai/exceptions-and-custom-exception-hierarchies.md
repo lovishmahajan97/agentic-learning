@@ -349,44 +349,33 @@ flowchart TD
 
 ## Examples
 ### Agent tool step: model-visible errors versus infrastructure errors
-`ToolError` subclasses become an error tool result the model reads; `Transient` is retried silently;
-when retries run out the run aborts. Passes `mypy --strict`.
+`ToolError` subclasses become an error tool result the model reads; everything else (a `Transient`
+blip, your own bug) propagates to code that can act on it.
 
 ```python
 class AgentError(Exception): ...
-class ToolError(AgentError):                     # the model can act on it: show it, keep going
-    def __init__(self, tool: str, message: str):
-        super().__init__(tool, message)
-        self.tool, self.message = tool, message
+class ToolError(AgentError): ...                 # the model can act on it: show it, keep going
 class ToolInputError(ToolError): ...             # bad arguments: the model should fix the call
 class NotFound(ToolError): ...                   # valid call, empty world: the model should re-plan
 class Transient(AgentError): ...                 # infrastructure blip: retry, the model never sees it
-class RunAborted(AgentError): ...                # stop the run, keep the trace
 
 def lookup(order_id: str) -> str:
     if not order_id.startswith("ORD-"):
-        raise ToolInputError("lookup", f"order_id must look like ORD-123456, got {order_id!r}")
+        raise ToolInputError(f"order_id must look like ORD-123456, got {order_id!r}")
     if order_id == "ORD-000000":
-        raise NotFound("lookup", "no such order")
-    if order_id == "ORD-999999":
-        raise Transient("orders API timed out")
+        raise NotFound("no such order")
     return f"{order_id}: shipped"
 
-def run_tool(order_id: str, retries: int = 2) -> dict[str, object]:
-    for attempt in range(retries + 1):
-        try:
-            return {"content": lookup(order_id)}
-        except ToolError as e:                   # model-visible: becomes the tool result
-            return {"content": f"{type(e).__name__}: {e.message}", "is_error": True}
-        except Transient:
-            if attempt == retries:
-                raise RunAborted("lookup kept failing") from None
-    raise AssertionError("unreachable")          # loop always returns or raises
+def run_tool(order_id: str) -> dict[str, object]:
+    try:
+        return {"content": lookup(order_id)}
+    except ToolError as e:                       # model-visible: becomes the tool result
+        return {"content": f"{type(e).__name__}: {e}", "is_error": True}
+    # Transient goes to the retry loop; a KeyError in lookup escapes at once as the bug it is
 
 print(run_tool("12345"))       # {'content': "ToolInputError: order_id must look like ORD-123456, got '12345'", 'is_error': True}
 print(run_tool("ORD-000000"))  # {'content': 'NotFound: no such order', 'is_error': True}
 print(run_tool("ORD-123456"))  # {'content': 'ORD-123456: shipped'}
-# run_tool("ORD-999999") retries twice, then raises RunAborted; a KeyError in lookup escapes at once
 ```
 
 | Failure in a tool step | Seen by the model? | Cost |
@@ -394,76 +383,16 @@ print(run_tool("ORD-123456"))  # {'content': 'ORD-123456: shipped'}
 | `ToolInputError` | yes, as an error result | one more model turn to fix the call |
 | `NotFound` | yes | one more turn to re-plan |
 | `Transient`, then success | no | a retry, no extra tokens |
-| `Transient` three times | no; run ends with `RunAborted` | the run, with its trace kept |
 | Your own `KeyError` | no; escapes as a bug | zero retries, one clear trace |
 
-### A hierarchy, an adapter and a policy-aware retry loop
-HTTP failures are translated once at the adapter; the loop retries only what is marked retryable. The
-error-body shape is illustrative; map your provider's codes the same way.
+### Worked trace: three provider failures through the adapter
+The lab's `call_provider` translates once; `answer` decides by class.
 
-```python
-import time, httpx
-
-class LLMError(Exception): ...
-class Transient(LLMError): ...                      # safe to retry
-class Permanent(LLMError): ...                      # do not retry
-class Recoverable(LLMError): ...                    # retry only after changing the request
-
-class RateLimited(Transient):
-    def __init__(self, retry_after: float):
-        super().__init__(retry_after)               # args == ctor args keeps it picklable
-        self.retry_after = retry_after
-    def __str__(self) -> str:
-        return f"rate limited, retry after {self.retry_after:.1f}s"
-
-class ContextTooLong(Recoverable):
-    def __init__(self, tokens: int, limit: int):
-        super().__init__(tokens, limit)
-        self.tokens, self.limit = tokens, limit
-
-def call_provider(client: httpx.Client, prompt: str) -> str:
-    try:
-        r = client.post("/v1/complete", json={"prompt": prompt}, timeout=30)
-        r.raise_for_status()
-    except httpx.TransportError as e:               # timeouts, refused or reset connections
-        raise Transient(f"transport error: {e!r}") from e   # keep the cause for logs
-    except httpx.HTTPStatusError as e:
-        status = e.response.status_code
-        if status == 429:
-            ra = e.response.headers.get("retry-after", "2")      # may also be an HTTP date
-            raise RateLimited(float(ra) if ra.isdigit() else 2.0) from e
-        if status >= 500:                           # check before parsing: 5xx bodies are often HTML
-            raise Transient(f"provider returned {status}") from e
-        is_json = "json" in e.response.headers.get("content-type", "")
-        body = e.response.json() if is_json else {}
-        if body.get("error", {}).get("code") == "context_length_exceeded":
-            raise ContextTooLong(body["error"]["tokens"], body["error"]["limit"]) from e
-        raise Permanent(f"provider returned {status}: {body}") from e   # 400/401/403: stop
-    return r.json()["text"]
-
-def answer(client: httpx.Client, prompt: str, attempts: int = 3) -> str:
-    last: LLMError | None = None
-    for n in range(attempts):
-        try:
-            return call_provider(client, prompt)
-        except RateLimited as e:                    # subclass handler before its base
-            last = e; time.sleep(min(e.retry_after, 30))   # cap a hostile or huge hint
-        except Transient as e:
-            last = e; time.sleep(2 ** n)
-        except ContextTooLong as e:                 # recoverable: shrink, then try again
-            last = e; prompt = prompt[: len(prompt) * e.limit * 9 // (10 * e.tokens)]
-    raise Permanent(f"gave up after {attempts} attempts") from last   # Permanent: propagates
-```
-
-### Worked trace: three failures through that code
 | Provider response | Adapter raises | What `answer` does | Cost |
 |---|---|---|---|
-| 429 with `retry-after: 7` | `RateLimited(7.0)`, chained to the `HTTPStatusError` so the vendor trace survives | Matches `except RateLimited` first (listed before its base), sleeps seven seconds, loops | One wait, one retry |
-| 401 | `Permanent` | No handler names it, so it propagates immediately to the request handler | Zero retries spent |
-| 200 with a changed body | `r.json()["text"]` raises `KeyError`, not an `LLMError` | Escapes on the first attempt as the bug it is | Zero retries, one clear trace |
-
-- **The handlers never inspect a status code or a message string;** the classification happened once, in
-  the adapter.
+| 429 with `retry-after: 7` | `RateLimited(7.0)`, chained to the `ProviderHTTPError` | Matches `except RateLimited` first (listed before its base), sleeps 7 s, loops | One wait, one retry |
+| 401 | `Permanent` | No handler names it, so it propagates immediately | Zero retries spent |
+| 200 with a changed body | `KeyError`, not an `LLMError` | Escapes on the first attempt as the bug it is | Zero retries, one clear trace |
 
 ### Parallel tool calls with `except*` (Python 3.11+)
 A `TaskGroup` fails with an `ExceptionGroup`; `except*` splits it by policy.
@@ -471,9 +400,8 @@ A `TaskGroup` fails with an `ExceptionGroup`; `except*` splits it by policy.
 ```python
 import asyncio
 
-class LLMError(Exception): ...
-class Transient(LLMError): ...
-class Permanent(LLMError): ...
+class Transient(Exception): ...
+class Permanent(Exception): ...
 
 async def tool(name: str) -> str:
     await asyncio.sleep(0.01)
@@ -483,22 +411,17 @@ async def tool(name: str) -> str:
         raise Permanent("crm: 403 forbidden")
     return f"{name}: ok"
 
-async def fan_out(names: list[str]) -> None:
-    async with asyncio.TaskGroup() as tg:
-        for n in names:
-            tg.create_task(tool(n))
-
 async def main() -> None:
     try:
-        await fan_out(["search", "crm", "calendar"])
+        async with asyncio.TaskGroup() as tg:
+            for n in ["search", "crm", "calendar"]:
+                tg.create_task(tool(n))
     except* Transient as eg:                      # only the retryable members
-        print("retry:", [str(e) for e in eg.exceptions])
+        print("retry:", [str(e) for e in eg.exceptions])   # retry: ['search timed out']
     except* Permanent as eg:                      # the rest, handled separately
-        print("stop:", [str(e) for e in eg.exceptions])
+        print("stop:", [str(e) for e in eg.exceptions])    # stop: ['crm: 403 forbidden']
 
 asyncio.run(main())
-# retry: ['search timed out']
-# stop: ['crm: 403 forbidden']
 ```
 
 - **Why both failures appear:** both tasks fail in the same event-loop step. After the first failure a
@@ -525,6 +448,10 @@ asyncio.run(main())
 - **Trip a breaker on `Transient` rate.** When `Transient` errors from one provider exceed a threshold in
   a window, route to a fallback model instead of retrying; this works because classification is already
   done. Monitor breaker open time per provider.
+- **Classify provider responses defensively.** Set an explicit request timeout (such as 30 s), map
+  transport errors (timeouts, refused or reset connections) to `Transient`, check 5xx before parsing the
+  body (it is often HTML), and treat `retry-after` as possibly an HTTP date: fall back to about 2 s and
+  cap the hint at 30 s.
 
 ## Trade-offs
 - **Precise catching vs class sprawl.** A policy-based tree lets callers catch exactly what they can handle,

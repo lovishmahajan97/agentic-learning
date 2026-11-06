@@ -215,7 +215,7 @@ An asynchronous shadow worker for a claims-triage service. Production has alread
 the candidate with write tools stubbed and records a comparable row.
 
 ```python
-import asyncio, time, json
+import asyncio, json
 
 WRITE_TOOLS = {"update_claim", "send_email", "issue_payment"}
 READ_TOOLS = {"get_claim", "get_policy"}
@@ -234,21 +234,25 @@ class DryRunTools:
             return self.recorded[key]
         return await self.real.call(name, args)       # read-only, safe to execute
 
+recorded = {json.dumps(["get_claim", {"id": 7}], sort_keys=True): {"id": 7, "status": "open"}}
+tools = DryRunTools(real_tools=None, recorded_reads=recorded)
+print(asyncio.run(tools.call("get_claim", {"id": 7})))       # {'id': 7, 'status': 'open'}
+print(asyncio.run(tools.call("issue_payment", {"amt": 900})))  # {'status': 'ok', 'dry_run': True}
+print(tools.intended_writes)  # [{'tool': 'issue_payment', 'args': {'amt': 900}}]
+```
+
+The worker runs the candidate after production has answered and stores one comparable row:
+
+```python
 async def shadow_one(event, candidate, real_tools, store, timeout_s=30):
     tools = DryRunTools(real_tools, event["recorded_reads"])
-    t0 = time.monotonic()
     try:
-        out = await asyncio.wait_for(candidate.run(event["input"], tools), timeout_s)
-        err = None
+        out, err = await asyncio.wait_for(candidate.run(event["input"], tools), timeout_s), None
     except Exception as e:                            # shadow failures are data, not incidents
         out, err = None, repr(e)
-    store.write({
-        "request_id": event["request_id"], "tenant": event["tenant"],
-        "prod": event["prod_output"], "cand": out, "cand_error": err,
-        "cand_latency_s": round(time.monotonic() - t0, 3),
-        "cand_intended_writes": tools.intended_writes,
-        "prod_writes": event["prod_writes"], "versions": candidate.versions,
-    })
+    store.write({"request_id": event["request_id"], "prod": event["prod_output"], "cand": out,
+                 "cand_error": err, "cand_intended_writes": tools.intended_writes,
+                 "prod_writes": event["prod_writes"], "versions": candidate.versions})
 ```
 
 ### Worked readout: two weeks of shadow on one customer
@@ -304,6 +308,8 @@ print(shadow_readout(18_000, 0.94, 140, 90, 70))
 - **Step budget and cost cap on the shadow loop** — for every agent shadow. Give the candidate the same
   maximum step count as production and a per-run token cap, and record the stop reason. Monitor budget-hit
   rate and cost per task next to production's, since a looping candidate burns money silently.
+- **Record candidate latency and tenant on every shadow row** — so the readout can compare p95 latency
+  against the budget and segment results per customer.
 
 ## Trade-offs
 - **Zero user exposure vs no outcome signal.** When task completion is the KPI, shadow must be followed by

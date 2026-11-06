@@ -203,99 +203,48 @@ stateDiagram-v2
 ```
 
 ## Examples
-### One schema for extraction, glossary, invariant and lifecycle
-A slice of an insurer's claims domain, agreed with claims SMEs, expressed as a Pydantic v2 schema. The
-same class constrains LLM extraction output, documents the glossary in field descriptions, enforces an
-invariant and guards lifecycle transitions that an agent might attempt.
+### A lifecycle-guarded agent tool typed by the domain model
+A slice of an insurer's claims domain, agreed with claims SMEs. The tool's argument schema comes from the
+domain model, so the agent cannot name a state the business does not have, and the lifecycle guard returns
+its error to the agent as data, so the model can ask or re-plan instead of crashing the loop.
 
 ```python
-from datetime import date
-from decimal import Decimal
 from enum import Enum
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
-class ClaimStatus(str, Enum):           # lifecycle agreed with claims SMEs
-    FNOL = "first_notice_of_loss"
+class ClaimStatus(str, Enum):                         # lifecycle agreed with claims SMEs
     UNDER_REVIEW = "under_review"
     APPROVED = "approved"
     DENIED = "denied"
     PAID = "paid"
-
-ALLOWED = {                             # which transitions the business permits
-    ClaimStatus.FNOL: {ClaimStatus.UNDER_REVIEW},
-    ClaimStatus.UNDER_REVIEW: {ClaimStatus.APPROVED, ClaimStatus.DENIED},
-    ClaimStatus.APPROVED: {ClaimStatus.PAID},
-    ClaimStatus.DENIED: set(), ClaimStatus.PAID: set(),
-}
-
-class Claim(BaseModel):
-    claim_id: str = Field(pattern=r"^CLM-\d{8}$")         # identity comes from the claims system
-    policy_number: str = Field(description="Policy, not the customer account number")
-    loss_date: date = Field(description="Date the loss happened, not the date it was reported")
-    reported_date: date
-    status: ClaimStatus
-    reserve_amount: Decimal = Field(ge=0, description="Estimated liability, not the amount paid")
-
-    @model_validator(mode="after")
-    def loss_before_report(self):
-        if self.loss_date > self.reported_date:           # invariant stated by SMEs
-            raise ValueError("loss_date cannot be after reported_date")
-        return self
-
-def transition(claim: Claim, new: ClaimStatus) -> Claim:
-    if new not in ALLOWED[claim.status]:
-        raise ValueError(f"{claim.status.value} -> {new.value} is not a permitted transition")
-    return claim.model_copy(update={"status": new})
-
-c = Claim(claim_id="CLM-00412345", policy_number="HX-778", loss_date="2026-03-02",
-          reported_date="2026-03-05", status="under_review", reserve_amount=4200)
-print(transition(c, ClaimStatus.APPROVED).status.value)   # approved
-try:
-    transition(c, ClaimStatus.PAID)
-except ValueError as e:
-    print(e)                     # under_review -> paid is not a permitted transition
-```
-
-- **Field descriptions carry the glossary** into the JSON schema the model sees.
-- **The enum restricts status** to the agreed states.
-- **The validator rejects** an extraction that swaps the loss and report dates.
-- **The reserve is a `Decimal` rather than a `float`** because money is a value object whose arithmetic must
-  be exact; binary floats cannot represent most decimal amounts and accumulate rounding error in totals.
-
-### The same model as an agent tool
-Continuing the example above: the tool's argument schema is generated from the domain model, and the tool
-returns the guard's error to the agent as data, so the model can recover (ask, or pick another action)
-instead of crashing the loop.
-
-```python
-from pydantic import BaseModel, Field
+ALLOWED = {"under_review": {"approved", "denied"}, "approved": {"paid"}}   # permitted transitions
 
 class SetClaimStatusArgs(BaseModel):
     claim_id: str = Field(pattern=r"^CLM-\d{8}$", description="Claim number, never a policy number")
     new_status: ClaimStatus
 
-TOOL = {"name": "set_claim_status",
-        "description": "Move a claim to its next lifecycle state. Only permitted transitions succeed.",
-        "input_schema": SetClaimStatusArgs.model_json_schema()}   # one source for the schema
-
-CLAIMS = {c.claim_id: c}                                         # stand-in for the claims system
+TOOL_SCHEMA = SetClaimStatusArgs.model_json_schema()  # what the model sees; one source for the schema
+CLAIMS = {"CLM-00412345": "under_review"}             # stand-in for the claims system
 
 def set_claim_status(raw_args: dict) -> dict:
     try:
-        args = SetClaimStatusArgs.model_validate(raw_args)       # rejects bad IDs and unknown states
-        if args.claim_id not in CLAIMS:
-            return {"ok": False, "error": f"no claim {args.claim_id}"}
-        CLAIMS[args.claim_id] = transition(CLAIMS[args.claim_id], args.new_status)
-        return {"ok": True, "status": CLAIMS[args.claim_id].status.value}
-    except ValueError as e:                                      # pydantic's ValidationError is a ValueError
-        return {"ok": False, "error": str(e)}                    # goes back to the model as the tool result
+        args = SetClaimStatusArgs.model_validate(raw_args)   # rejects bad IDs and unknown states
+    except ValueError as e:                           # pydantic's ValidationError is a ValueError
+        return {"ok": False, "error": str(e)}
+    old, new = CLAIMS[args.claim_id], args.new_status.value
+    if new not in ALLOWED.get(old, set()):
+        return {"ok": False, "error": f"{old} -> {new} is not a permitted transition"}
+    CLAIMS[args.claim_id] = new
+    return {"ok": True, "status": new}
 
 print(set_claim_status({"claim_id": "CLM-00412345", "new_status": "paid"}))
 # {'ok': False, 'error': 'under_review -> paid is not a permitted transition'}
 ```
 
+- **Field descriptions carry the glossary** into the JSON schema the model sees.
 - **The enum in the schema** means the model cannot even name a state the business does not have.
-- **Log every `ok: False`** result; it shows where the agent's plan disagrees with the business rules.
+- **The guard lives in the tool, not the prompt,** so an attempt to pay a claim still under review fails in
+  code every time.
 
 ### An aggregate that guards a cross-line invariant
 The claim is the aggregate root, so the only way to pay a coverage line is through it. Each payment would
@@ -306,31 +255,20 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 @dataclass
-class CoverageLine:
-    line_id: str
-    paid: Decimal = Decimal("0")
-
-@dataclass
 class ClaimAggregate:                       # the root: every change goes through it
     claim_id: str
     approved_amount: Decimal
-    lines: dict[str, CoverageLine] = field(default_factory=dict)
-
-    def total_paid(self) -> Decimal:
-        return sum((l.paid for l in self.lines.values()), Decimal("0"))
+    paid: dict[str, Decimal] = field(default_factory=dict)   # coverage line -> amount paid
 
     def add_payment(self, line_id: str, amount: Decimal) -> None:
-        if amount <= 0:
-            raise ValueError("payment must be positive")
-        if self.total_paid() + amount > self.approved_amount:   # cross-line invariant
-            raise ValueError(f"would pay {self.total_paid() + amount}, approved {self.approved_amount}")
-        self.lines[line_id].paid += amount
+        total = sum(self.paid.values(), Decimal("0")) + amount
+        if total > self.approved_amount:    # cross-line invariant
+            raise ValueError(f"would pay {total}, approved {self.approved_amount}")
+        self.paid[line_id] = self.paid.get(line_id, Decimal("0")) + amount
 
-claim = ClaimAggregate("CLM-00412345", Decimal("5000"),
-                       {"building": CoverageLine("building"), "contents": CoverageLine("contents")})
+claim = ClaimAggregate("CLM-00412345", Decimal("5000"))
 claim.add_payment("building", Decimal("3000"))
 claim.add_payment("contents", Decimal("1500"))
-print(claim.total_paid())                   # 4500
 try:
     claim.add_payment("contents", Decimal("800"))   # each line alone looks fine; the total does not
 except ValueError as e:
@@ -339,6 +277,8 @@ except ValueError as e:
 
 - **Expose `add_payment` as the agent's tool,** not a generic "update coverage line" write, so the tool
   surface cannot express a payment that breaks the total.
+- **Amounts are `Decimal` rather than `float`** because money is a value object whose arithmetic must be
+  exact; binary floats cannot represent most decimal amounts and accumulate rounding error in totals.
 
 ### Worked scenario: resolving the claim an email is about
 Five inbound emails to a claims agent, resolved with the cascade from step 2 before any tool acts

@@ -344,49 +344,40 @@ flowchart TD
 
 ## Examples
 ### Cache-aside wrapper for an embedding call
-The RAG step of an agent embeds queries and chunks. A canonical key, TTL jitter and fail-open reads.
-`embed_remote` stands in for the real provider call.
+The RAG step of an agent embeds queries and chunks: a canonical key, a jittered TTL and fail-open reads
+and writes. `embed_remote` stands in for the real provider call. It runs without a Redis server: the
+connection error is a `RedisError`, so the call falls through to the provider.
 
 ```python
-import hashlib, json, random
+# pip install "redis>=5"
+import asyncio, hashlib, json, random
 import redis.asyncio as redis
 from redis.exceptions import RedisError
-from fastapi import Depends, FastAPI, Request
-from contextlib import asynccontextmanager
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    app.state.redis = redis.from_url("redis://localhost:6379/0", socket_timeout=0.2)
-    yield
-    await app.state.redis.aclose()          # close() on older redis-py releases
-
-app = FastAPI(lifespan=lifespan)
-
-def get_redis(request: Request) -> redis.Redis:
-    return request.app.state.redis
+r = redis.from_url("redis://localhost:6379/0", socket_timeout=0.2)   # build once, in the lifespan
 
 def cache_key(model: str, text: str, tenant: str) -> str:
     payload = json.dumps({"m": model, "t": text}, sort_keys=True, separators=(",", ":"))
     return f"emb:v2:{tenant}:{hashlib.sha256(payload.encode()).hexdigest()}"
 
-async def embed_cached(r: redis.Redis, model: str, text: str, tenant: str) -> list[float]:
+async def embed_remote(model: str, text: str) -> list[float]:
+    return [float(len(text)), 1.0]             # the expensive provider call
+
+async def embed_cached(model: str, text: str, tenant: str) -> list[float]:
     key = cache_key(model, text, tenant)
     try:
         if (hit := await r.get(key)) is not None:
             return json.loads(hit)
     except RedisError:
         pass                                   # fail open: cache down means slower, not broken
-    vec = await embed_remote(model, text)      # the expensive call
-    ttl = 7 * 86400 + random.randint(0, 3600)  # jitter spreads expiries
+    vec = await embed_remote(model, text)
     try:
-        await r.set(key, json.dumps(vec), ex=ttl)
+        await r.set(key, json.dumps(vec), ex=7 * 86400 + random.randint(0, 3600))  # jittered TTL
     except RedisError:
         pass
     return vec
 
-@app.post("/embed")   # in production take tenant from auth, never from the request body
-async def embed(body: dict, r: redis.Redis = Depends(get_redis)):
-    return {"vector": await embed_cached(r, "text-embedding-x", body["text"], body["tenant"])}
+print(asyncio.run(embed_cached("embed-x", "refund policy", "t1")))   # [13.0, 1.0], hit or miss
 ```
 
 - **Re-index saving:** re-indexing 100,000 chunks where 90% are unchanged now pays for roughly 10,000
@@ -396,17 +387,12 @@ async def embed(body: dict, r: redis.Redis = Depends(get_redis)):
 
 ### Stampede lock with a safe release
 One worker recomputes a hot key; the others poll briefly, then fall through. The release only deletes a
-lock that still holds this worker's token. The same helper wraps a slow, popular agent tool.
+lock that still holds this worker's token.
 
 ```python
 import asyncio, secrets
 
-RELEASE = """
-if redis.call('get', KEYS[1]) == ARGV[1] then
-  return redis.call('del', KEYS[1])
-end
-return 0
-"""
+RELEASE = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
 
 async def get_or_compute(r, key: str, compute, ttl: int, wait_s: float = 5.0):
     if (hit := await r.get(key)) is not None:
@@ -432,33 +418,6 @@ async def get_or_compute(r, key: str, compute, ttl: int, wait_s: float = 5.0):
   consistently on both paths.
 - **Redis errors are not caught here,** to keep the lock logic readable; in production wrap these calls
   fail-open as in the first example.
-
-### Caching a read-only agent tool
-Only pure, read-only tools are cached; the key carries the tool name, its schema version and the tenant.
-For a retrieval tool such as `search_docs`, also put the index version in `args` (or the prefix), so a
-re-index changes the key. Like the lock example, it omits the fail-open `try` for brevity.
-
-```python
-import hashlib, json
-
-CACHEABLE = {"search_docs": 3600, "get_product": 600}   # tool name -> TTL in seconds
-
-def tool_key(tenant: str, name: str, schema_v: int, args: dict) -> str:
-    blob = json.dumps({"n": name, "v": schema_v, "a": args}, sort_keys=True, separators=(",", ":"))
-    return f"tool:v1:{tenant}:{hashlib.sha256(blob.encode()).hexdigest()}"
-
-async def run_tool(r, tenant: str, name: str, schema_v: int, args: dict, impl):
-    if name not in CACHEABLE:                 # send_email, create_ticket: never cached
-        return await impl(**args)
-    key = tool_key(tenant, name, schema_v, args)
-    hit = await r.get(key)
-    if hit is not None:
-        return json.loads(hit)
-    result = await impl(**args)
-    if not result.get("error"):               # never cache failures
-        await r.set(key, json.dumps(result), ex=CACHEABLE[name])
-    return result
-```
 
 ### Worked numbers: is the cache worth it?
 Illustrative inputs: *t_r* = 1 ms, *t_m* = 800 ms, 1,000,000 calls a month.
@@ -494,6 +453,12 @@ Illustrative inputs: *t_r* = 1 ms, *t_m* = 800 ms, 1,000,000 calls a month.
 - **Pin eval runs with the cache.** Agent teams often run regression evals with model calls cached, so
   reruns after a non-model change are cheap and deterministic, then bump the namespace to force fresh calls
   when the model or prompt changes.
+- **One client per worker, closed on shutdown.** Create the `redis.asyncio` client in the lifespan, store
+  it on `app.state`, hand it out through a dependency, and `await r.aclose()` on shutdown (`close()` on
+  older redis-py releases). Take the tenant for the key from auth, never from the request body.
+- **Cache tools by allow-list with a schema-versioned key.** Key a read-only tool's result on tenant,
+  tool name, schema version and canonical JSON args (`tool:v1:{tenant}:{sha}`), with a TTL per tool (for
+  example 3600 s for `search_docs`, 600 s for `get_product`); never cache a result that carries an error.
 
 ## Trade-offs
 - **Shared cache vs in-process LRU.** Redis raises hit rate across all workers and survives deploys, but

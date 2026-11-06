@@ -323,52 +323,32 @@ import sqlite3
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.config import get_stream_writer
 from langgraph.types import interrupt, Command
 
 class Refund(TypedDict, total=False):
     order_id: str
-    amount: float
     decision: str
     receipt: str
 
-def propose(state: Refund) -> dict:
-    get_stream_writer()({"progress": "looked up order"})      # 'custom' stream event
-    return {"amount": 120.0}                                 # a model + tool call in practice
-
-def approve(state: Refund) -> dict:
-    if state["amount"] < 50:
-        return {"decision": "auto-approved"}
-    answer = interrupt({"question": f"Refund {state['amount']} for {state['order_id']}?"})
-    return {"decision": answer}                              # node re-runs from the top on resume
+def approve(state: Refund) -> dict:                          # pauses here; re-runs from the top on resume
+    return {"decision": interrupt(f"Refund order {state['order_id']}?")}
 
 def execute(state: Refund) -> dict:                          # side effect lives AFTER the approval
-    if state["decision"] != "approve":
-        return {"receipt": "cancelled"}
-    return {"receipt": f"refund-{state['order_id']}"}        # pass an idempotency key to the payment API
+    ok = state["decision"] == "approve"
+    return {"receipt": f"refund-{state['order_id']}" if ok else "cancelled"}
 
 g = StateGraph(Refund)
-g.add_node("propose", propose); g.add_node("approve", approve); g.add_node("execute", execute)
-g.add_edge(START, "propose"); g.add_edge("propose", "approve")
-g.add_edge("approve", "execute"); g.add_edge("execute", END)
-
-conn = sqlite3.connect("checkpoints.db", check_same_thread=False)
-app = g.compile(checkpointer=SqliteSaver(conn))              # PostgresSaver in production
+g.add_node("approve", approve); g.add_node("execute", execute)
+g.add_edge(START, "approve"); g.add_edge("approve", "execute"); g.add_edge("execute", END)
+app = g.compile(checkpointer=SqliteSaver(sqlite3.connect("checkpoints.db", check_same_thread=False)))
 cfg = {"configurable": {"thread_id": "refund-A1001"}}
 
-for mode, chunk in app.stream({"order_id": "A1001"}, cfg, stream_mode=["updates", "custom"]):
-    print(mode, chunk)                                       # last update carries '__interrupt__'
-
-snap = app.get_state(cfg)
-print("paused at:", snap.next, "| payload:", snap.tasks[0].interrupts[0].value)
-
+for chunk in app.stream({"order_id": "A1001"}, cfg, stream_mode="updates"):
+    print(chunk)                                             # {'__interrupt__': (Interrupt(...),)}
+print("paused at:", app.get_state(cfg).next)                 # ('approve',)
 # ...hours later, any process with the same DB and thread_id:
-print(app.invoke(Command(resume="approve"), cfg)["receipt"])
-print("checkpoints:", len(list(app.get_state_history(cfg))))
+print(app.invoke(Command(resume="approve"), cfg)["receipt"]) # refund-A1001
 ```
-
-- **Output:** a `custom` progress event, the `propose` update, an `__interrupt__` update, then
-  `paused at: ('approve',)`, the receipt `refund-A1001`, and `checkpoints: 5` after the resume.
 
 ### Time travel: replay and fork a run
 Find the checkpoint before a bad step, edit state, and continue from there. The thread head moves to the
@@ -384,23 +364,19 @@ class S(TypedDict, total=False):
     plan: str
     answer: str
 
-def plan(s: S) -> dict:   return {"plan": f"search for {s['query']}"}
-def act(s: S) -> dict:    return {"answer": f"result of '{s['plan']}'"}
-
 g = StateGraph(S)
-g.add_node("plan", plan); g.add_node("act", act)
+g.add_node("plan", lambda s: {"plan": f"search web for {s['query']}"})
+g.add_node("act", lambda s: {"answer": f"result of '{s['plan']}'"})
 g.add_edge(START, "plan"); g.add_edge("plan", "act"); g.add_edge("act", END)
 app = g.compile(checkpointer=InMemorySaver())
 cfg = {"configurable": {"thread_id": "t1"}}
 app.invoke({"query": "q3 revenue"}, cfg)
 
-history = list(app.get_state_history(cfg))            # newest first
+history = list(app.get_state_history(cfg))                  # newest first
 before_act = next(h for h in history if h.next == ("act",))
-print("replay from:", before_act.config["configurable"]["checkpoint_id"][:8], before_act.values["plan"])
-
-fork = app.update_state(before_act.config, {"plan": "search finance DB for q3 revenue"})  # new branch
-print(app.invoke(None, fork)["answer"])              # None = continue from that checkpoint
-print(app.get_state(cfg).values["answer"])           # thread head is now the fork
+fork = app.update_state(before_act.config, {"plan": "search finance DB"})  # new branch
+print(app.invoke(None, fork)["answer"])      # result of 'search finance DB' (None = continue)
+print(app.get_state(cfg).values["answer"])   # same: the thread head is now the fork
 ```
 
 ### Worked scenario: duplicate emails after adding approval
@@ -426,6 +402,9 @@ print(app.get_state(cfg).values["answer"])           # thread head is now the fo
   `langgraph_node` for tokens, and `custom` for tool progress; drop `values` to keep payloads small.
 - **Encrypt sensitive state.** Checkpoints store full state, including PII and tool results; restrict
   database access and use an encrypted serializer (`EncryptedSerializer`) if policy requires it.
+- **Interrupt only above a risk threshold.** Auto-approve low-value actions (for example refunds under
+  50) inside the approval node and call `interrupt()` only above it; read a pending payload with
+  `get_state(cfg).tasks[0].interrupts[0].value`.
 
 ## Trade-offs
 - **Durability vs latency.** Writing a checkpoint every superstep adds a database round trip per step;

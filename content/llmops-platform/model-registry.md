@@ -229,13 +229,11 @@ run_id = "3f1c0a9e2b7d"                                          # the run that 
 mv = mlflow.register_model(f"runs:/{run_id}/model", NAME)        # returns a new immutable version number
 
 # 2. Attach the evidence a reviewer and, later, an auditor will ask for
-client.set_model_version_tag(NAME, mv.version, "base_model", "meta-llama/Llama-3.1-8B-Instruct")
-client.set_model_version_tag(NAME, mv.version, "base_revision", "<hf commit sha>")   # pinned, not 'main'
-client.set_model_version_tag(NAME, mv.version, "golden_set", "golden-v8@5c2e91")
-client.set_model_version_tag(NAME, mv.version, "eval_fingerprint", "run:9a71cc")
-client.set_model_version_tag(NAME, mv.version, "eval_accuracy", "0.912")
-client.update_model_version(NAME, mv.version,
-                            description="Retrained on Q3 tickets; fixes refund-intent confusion")
+for key, value in {"base_model": "meta-llama/Llama-3.1-8B-Instruct",
+                   "base_revision": "<hf commit sha>",             # pinned, not 'main'
+                   "golden_set": "golden-v8@5c2e91", "eval_fingerprint": "run:9a71cc",
+                   "eval_accuracy": "0.912"}.items():
+    client.set_model_version_tag(NAME, mv.version, key, value)
 
 # 3. Promote by moving a pointer; rollback is this same call with the previous version number
 client.set_registered_model_alias(NAME, "challenger", mv.version)
@@ -260,8 +258,7 @@ class EmbedderMismatch(RuntimeError):
 
 REGISTRY = {("agent-llm", "champion"): "provider:vendor-model-2025-04-14",   # virtual version
             ("router", "champion"): "router-adapter:3",
-            ("kb-embedder", "champion"): "kb-embedder:4",
-            ("guard", "champion"): "guard-classifier:2"}
+            ("kb-embedder", "champion"): "kb-embedder:4"}
 
 def resolve(name, alias="champion"):
     return REGISTRY[(name, alias)]
@@ -272,31 +269,10 @@ def start_agent_service(roles, index_meta):
         raise EmbedderMismatch(f"index built with {index_meta['embedder']}, resolved {pins['embedder']}")
     return pins
 
-pins = start_agent_service({"planner": "agent-llm", "router": "router", "embedder": "kb-embedder",
-                            "guard": "guard"}, {"name": "kb-main", "embedder": "kb-embedder:4"})
-print(pins)   # attach this dict to every agent run's root span, so any trajectory names its models
-```
-
-### Refusing an embedder-index mismatch at startup
-Pure Python, runnable. The index build job records the embedder version; the query service compares it
-with the embedder version it resolved from the registry and refuses to start on a mismatch.
-
-```python
-class EmbedderMismatch(RuntimeError):
-    pass
-
-def check_index(index_meta, resolved_embedder):
-    built_with = index_meta["embedder"]                 # written by the index build job
-    if built_with != resolved_embedder:
-        raise EmbedderMismatch(f"index {index_meta['name']} built with {built_with}, "
-                               f"but this replica resolved {resolved_embedder}")
-
-index_meta = {"name": "kb-main", "embedder": "kb-embedder:4"}      # name:version from the registry
-check_index(index_meta, "kb-embedder:4")                           # ok: same vector space
-try:
-    check_index(index_meta, "kb-embedder:5")                       # someone moved the embedder alias
-except EmbedderMismatch as e:
-    print("refusing to serve:", e)   # loud failure instead of silently nonsense neighbours
+roles = {"planner": "agent-llm", "router": "router", "embedder": "kb-embedder"}
+print(start_agent_service(roles, {"name": "kb-main", "embedder": "kb-embedder:4"}))
+# {'planner': 'provider:vendor-model-2025-04-14', 'router': 'router-adapter:3', 'embedder': 'kb-embedder:4'}
+# Attach this dict to every run's root span. With an index built on kb-embedder:3 it raises EmbedderMismatch.
 ```
 
 ### Worked scenario: what a rollback really costs

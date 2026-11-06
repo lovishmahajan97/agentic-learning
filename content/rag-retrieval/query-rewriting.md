@@ -157,37 +157,10 @@ flowchart TD
   instructions can steer filters or queries. Constrain the output to validated JSON or an enum.
 
 ## Examples
-### Condensing plus expansion with weighted RRF
-`llm(prompt)` returns text and `retrieve(query, k)` returns ranked chunk ids; any provider or vector store
-works.
+### Runnable: why the non-standalone original needs a lower weight
+Two disjoint 20-item lists fused into a top-8 with weighted reciprocal rank fusion. Pure Python.
 
 ```python
-import json, hashlib
-
-REWRITE_PROMPT = """Conversation so far:
-{history}
-Latest user message: {query}
-Rewrite the latest message as 1-3 standalone search queries for a product documentation index.
-Keep every code, number and quoted string exactly as written. Use the documentation's own terms
-(plan, seat, workspace). Return JSON: {{"queries": [...], "standalone": true|false, "needs_retrieval": true|false}}
-"standalone" means the latest message is understandable without the conversation."""
-
-_cache = {}
-
-def rewrite(history, query):
-    key = hashlib.sha256((history[-2000:] + "\n" + query).encode()).hexdigest()
-    if key not in _cache:
-        raw = llm(REWRITE_PROMPT.format(history=history[-2000:], query=query))
-        try:                                       # validate: never trust the format
-            plan = json.loads(raw)
-            qs = [q for q in plan["queries"] if isinstance(q, str)][:3]
-            plan = {"queries": qs, "standalone": plan.get("standalone") is not False,
-                    "needs_retrieval": plan["needs_retrieval"] is not False}
-        except (ValueError, KeyError, TypeError):
-            plan = {"queries": [], "standalone": True, "needs_retrieval": True}  # original only
-        _cache[key] = plan
-    return _cache[key]
-
 def rrf(ranked_lists, weights, c=60):            # weighted reciprocal rank fusion
     scores = {}
     for lst, w in zip(ranked_lists, weights):
@@ -195,35 +168,10 @@ def rrf(ranked_lists, weights, c=60):            # weighted reciprocal rank fusi
             scores[cid] = scores.get(cid, 0.0) + w / (c + rank + 1)
     return sorted(scores, key=scores.get, reverse=True)
 
-def search(history, query, k=8):
-    plan = rewrite(history, query)
-    if not plan["needs_retrieval"]:
-        return []
-    queries = [query] + plan["queries"]            # original always included...
-    weights = [1.0 if plan["standalone"] else 0.3] + [1.0] * len(plan["queries"])  # ...but down-weighted
-    return rrf([retrieve(q, 20) for q in queries], weights)[:k]
-
-ctx = search("user: how do I turn on push notifications?\nassistant: In Settings > Alerts...",
-             "and on Android?")
-# rewrite: "enable push notifications on Android", standalone=false, so the bare "and on Android?"
-# list (generic Android pages) only fills slots the rewrite's list leaves weakly supported
-```
-
-### Runnable: why the non-standalone original needs a lower weight
-Two disjoint 20-item lists, fused into a top-8, exactly as `search` does. Pure Python.
-
-```python
-def rrf(ranked_lists, weights, c=60):
-    scores = {}
-    for lst, w in zip(ranked_lists, weights):
-        for rank, cid in enumerate(lst):
-            scores[cid] = scores.get(cid, 0.0) + w / (c + rank + 1)
-    return sorted(scores, key=scores.get, reverse=True)
-
 original = [f"android-generic-{i}" for i in range(20)]   # "and on Android?" alone
-rewrite = [f"push-android-{i}" for i in range(20)]       # "enable push notifications on Android"
+rewritten = [f"push-android-{i}" for i in range(20)]     # "enable push notifications on Android"
 for w in (1.0, 0.3):
-    top = rrf([original, rewrite], [w, 1.0])[:8]
+    top = rrf([original, rewritten], [w, 1.0])[:8]
     print(w, sum(c.startswith("android-generic") for c in top), "of 8 generic")
 # 1.0 4 of 8 generic   <- plain RRF: noise takes half the context
 # 0.3 0 of 8 generic   <- down-weighted: generic pages only appear if the rewrite's list runs thin
@@ -231,6 +179,39 @@ for w in (1.0, 0.3):
 
 With weight 0.3 the original's best item scores 0.3/61 ≈ 0.0049, below the rewrite's 8th item at
 1/68 ≈ 0.0147, so the original only matters when it agrees with the rewrite.
+
+### Condensing plus expansion, fused with the weighted original
+`llm(prompt)` returns text and `retrieve(query, k)` returns ranked chunk ids; `rrf` is the function above.
+
+```python
+import json, hashlib
+
+REWRITE_PROMPT = """Conversation so far:
+{history}
+Latest user message: {query}
+Rewrite the latest message as 1-3 standalone search queries for the product docs.
+Keep every code, number and quoted string exactly as written.
+Return JSON: {{"queries": [...], "standalone": true|false, "needs_retrieval": true|false}}"""
+_cache = {}
+
+def rewrite(history, query):
+    history = history[-2000:]                      # recent turns only: bounds cost and dilution
+    key = hashlib.sha256((history + "\n" + query).encode()).hexdigest()
+    if key not in _cache:
+        try:
+            _cache[key] = json.loads(llm(REWRITE_PROMPT.format(history=history, query=query)))
+        except ValueError:                         # bad JSON: search the original only
+            _cache[key] = {"queries": [], "standalone": True, "needs_retrieval": True}
+    return _cache[key]
+
+def search(history, query, k=8):
+    plan = rewrite(history, query)
+    if not plan["needs_retrieval"]:
+        return []
+    queries = [query] + plan["queries"][:3]        # original always included...
+    weights = [1.0 if plan["standalone"] else 0.3] + [1.0] * (len(queries) - 1)  # ...down-weighted
+    return rrf([retrieve(q, 20) for q in queries], weights)[:k]
+```
 
 ### Worked scenario: what each form changed in a failure review
 Illustrative review of a support bot's 40 worst retrievals, grouped by cause:
@@ -243,36 +224,27 @@ Illustrative review of a support bot's 40 worst retrievals, grouped by cause:
 | "why did key K-7 get 429?" | incident threads only | step-back | rate-limit rules plus the original's hits |
 
 ### Agent scenario: steer the agent's query, then guard it in the tool
-The tool description is the rewriter prompt; the tool body re-adds the raw user text when the agent's
-query lost a literal. `retrieve(query, k, filters)` is a stub; `rrf` is the function above.
+The tool description is the rewriter prompt; the tool body also searches the raw user text when the
+agent's query lost a literal. `retrieve` and `rrf` are as above.
 
 ```python
 import re
 
 SEARCH_TOOL = {
     "name": "search_docs",
-    "description": ("Search the product documentation. Write `query` as a standalone search string: "
-                    "resolve references to earlier turns, use the docs' terms (plan, seat, workspace), "
-                    "and copy error codes, version strings and quoted text exactly as the user wrote them."),
-    "input_schema": {"type": "object",
-                     "properties": {"query": {"type": "string"},
-                                    "product": {"type": "string", "enum": ["web", "ios", "android"]}},
+    "description": ("Search the product docs. Write `query` as a standalone search string in the "
+                    "docs' terms, and copy error codes, versions and quoted text exactly."),
+    "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
                      "required": ["query"]},
 }
-
 LITERAL = re.compile(r'"[^"]+"|\b[A-Z]+_\d+\b|\b\d+(?:\.\d+)+\b')   # quotes, ERR_4012, 2.3.1
-ALLOWED_PRODUCTS = {"web", "ios", "android"}                         # never trust the enum alone
 
 def run_search_docs(tool_input, user_message, k=8):
     q = str(tool_input.get("query", ""))[:300]                       # validate type and length
-    lost = [m for m in LITERAL.findall(user_message) if m.strip('"') not in q]   # quotes optional
-    queries, weights = [q], [1.0]
-    if lost:                                                          # literal guard: search raw text too
-        queries.append(user_message); weights.append(1.0)
-    product = tool_input.get("product")
-    filters = {"product": product} if product in ALLOWED_PRODUCTS else {}
-    return rrf([retrieve(x, 20, filters) for x in queries], weights)[:k], {"query": q, "lost": lost}
-# Log the second return value on the tool span: it is how you audit the agent's rewrites later.
+    lost = [m for m in LITERAL.findall(user_message) if m.strip('"') not in q]
+    queries = [q, user_message] if lost else [q]                     # literal guard
+    return rrf([retrieve(x, 20) for x in queries], [1.0] * len(queries))[:k], lost
+# Log `lost` on the tool span: it is how you audit the agent's rewrites later.
 ```
 
 ## Production patterns
@@ -296,6 +268,9 @@ def run_search_docs(tool_input, user_message, k=8):
 - **Gate prompt changes on a multi-turn golden set.** Compare recall@k with and without the rewriter, and
   across prompt and tool-description versions, before shipping. Monitor recall@k on follow-up turns
   separately from first turns.
+- **Validate rewriter output and tool arguments in code.** Cap rewrites at 3, truncate the history fed
+  to the rewriter (for example the last 2000 characters), and allow-list filter values such as `product`;
+  a schema `enum` alone is not enforcement.
 
 ## Trade-offs
 - **Better retrieval vs an extra sequential call.** Adds latency and cost per request; worth it for

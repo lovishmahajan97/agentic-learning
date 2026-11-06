@@ -260,14 +260,12 @@ correct one. `scrub` is your PII scrubber.
 import json
 
 def trace_to_item(trace, correct_state, forbidden, item_id, reviewer):
-    fixtures = [{"tool": c["tool"], "args": c["args"], "result": scrub(c["result"])}
-                for c in trace["tool_calls"]]                    # recorded world, not the live one
     return {
-        "id": item_id,
-        "slice": trace["intent"],                                # e.g. "refunds"
+        "id": item_id, "slice": trace["intent"],                 # slice e.g. "refunds"
         "tier": "regression",                                    # never pruned, must pass 100%
         "input": {"task": scrub(trace["user_message"])},
-        "fixtures": fixtures,
+        "fixtures": [{"tool": c["tool"], "args": c["args"], "result": scrub(c["result"])}
+                     for c in trace["tool_calls"]],              # recorded world, not the live one
         "expected": {"state": correct_state},                    # outcome, not the exact tool sequence
         "forbidden": forbidden,                                  # path constraints scored as floors
         "source": {"trace_id": trace["id"], "reviewed_by": reviewer},
@@ -278,10 +276,12 @@ item = trace_to_item(
     correct_state={"order_1182": "refunded", "order_1183": "unchanged"},
     forbidden=[{"tool": "issue_refund", "args": {"order_id": "1183"}}],
     item_id="reg-2291", reviewer="domain:refunds-lead")
-# Merge into the NEXT version with a changelog line: "reg-2291: refund on wrong order (INC-2291)"
 ```
 
-### Sizing, quota sampling and cutting a version
+Merge the item into the next version with a changelog line such as "reg-2291: refund on wrong order
+(INC-2291)".
+
+### Sizing and cutting a version
 A support assistant with six intents whose production traffic splits roughly 60/20/10/5/3/2 percent.
 
 | Sampling | Items per intent | Total | Rarest intent |
@@ -290,11 +290,10 @@ A support assistant with six intents whose production traffic splits roughly 60/
 | Quota of 40 per slice from the full trace pool | 40 each | 240 | measurable to roughly ±12 points at p = 0.8 |
 
 - **Report the aggregate both ways:** traffic-weighted and as per-slice floors.
-- **The code** shows the size arithmetic, the quota sampler and how a version is cut.
+- **The code** shows the size arithmetic and how a version is cut.
 
 ```python
-import hashlib, json, math, random
-from collections import defaultdict
+import hashlib, json, math
 
 def half_width_points(p, n):            # 95% half-width in percentage points for a pass-rate metric
     return 100 * 1.96 * math.sqrt(p * (1 - p) / n)
@@ -302,28 +301,15 @@ def half_width_points(p, n):            # 95% half-width in percentage points fo
 for n in (40, 50, 200, 1000):
     print(f"n={n:5d}: ±{half_width_points(0.8, n):.1f} points")   # ±12.4, ±11.1, ±5.5, ±2.5
 
-def items_for_paired_gate(h, flip_rate):  # n so the paired 95% half-width on the delta is h (fractions)
-    return math.ceil(1.96**2 * flip_rate / h**2)          # items_for_paired_gate(0.02, 0.10) -> 961
-
-def stratified_sample(candidates, quota_per_slice, seed=7):
-    """candidates: labeled production traces; a fixed quota per slice keeps rare intents measurable."""
-    by_slice = defaultdict(list)
-    for c in candidates:
-        by_slice[c["slice"]].append(c)
-    rng = random.Random(seed)
-    chosen = []
-    for slice_name, items in sorted(by_slice.items()):
-        rng.shuffle(items)
-        chosen += items[:quota_per_slice]           # a slice with fewer than quota items is a coverage gap to log
-    return chosen
-
 def cut_version(items, parent, changelog, tier="full", sealed=False):
     body = json.dumps(sorted(items, key=lambda i: i["id"]), sort_keys=True).encode()
-    slices = {i["slice"] for i in items}
     return {"version": hashlib.sha256(body).hexdigest()[:12],   # content hash: an edit is a new version
             "parent": parent, "n": len(items), "tier": tier, "sealed": sealed,
-            "per_slice": {s: sum(i["slice"] == s for i in items) for s in sorted(slices)},
+            "per_slice": {s: sum(i["slice"] == s for i in items) for s in sorted({i["slice"] for i in items})},
             "changelog": changelog}                            # e.g. "relabeled 15 refund items after policy change 2025-06"
+
+print(cut_version([{"id": "a", "slice": "refunds"}, {"id": "b", "slice": "billing"}], None, "initial")["per_slice"])
+# {'billing': 1, 'refunds': 1}
 ```
 
 ### Worked scenario: sizing an agent's task set by tool
@@ -345,25 +331,22 @@ banks and fine-tuning corpora: exact match after normalisation, then word 8-gram
 duplicates. The 0.5 threshold is a starting point to tune, not a standard.
 
 ```python
-import hashlib, re
-
-def norm(text):
-    return re.sub(r"\s+", " ", text.lower()).strip()
+import hashlib
 
 def shingles(text, k=8):                     # word 8-grams catch light paraphrase and copy-paste
-    w = norm(text).split()
+    w = text.lower().split()
     return {" ".join(w[i:i + k]) for i in range(max(1, len(w) - k + 1))}
 
 def contamination(golden_inputs, corpus_docs, threshold=0.5):
-    exact = {hashlib.sha256(norm(d).encode()).hexdigest() for d in corpus_docs}
-    corpus_sh = [shingles(d) for d in corpus_docs]
+    key = lambda t: hashlib.sha256(" ".join(t.lower().split()).encode()).hexdigest()   # normalised exact match
+    exact, corpus_sh = {key(d) for d in corpus_docs}, [shingles(d) for d in corpus_docs]
     hits = []
     for gid, text in golden_inputs.items():
-        if hashlib.sha256(norm(text).encode()).hexdigest() in exact:
-            hits.append((gid, "exact")); continue
         s = shingles(text)
-        best = max((len(s & c) / len(s) for c in corpus_sh), default=0.0)
-        if best >= threshold:                # share of the item's 8-grams found in one corpus doc
+        best = max((len(s & c) / len(s) for c in corpus_sh), default=0.0)   # share of 8-grams in one doc
+        if key(text) in exact:
+            hits.append((gid, "exact"))
+        elif best >= threshold:
             hits.append((gid, f"near-duplicate {best:.0%}"))
     return hits
 
@@ -396,6 +379,10 @@ print(contamination(golden, few_shot_bank))   # [('g17', 'near-duplicate 89%')]
 - **Measured flip rate drives size** — once you have run a few candidates. Record the fraction of items whose
   verdict differs between candidate and champion, and recompute paired sizes per slice from it. Monitor
   confidence-interval width per slice against the regression size you must detect.
+- **Paired gate size from the flip rate.** Items needed for a paired 95% half-width h on the delta are
+  `ceil(1.96**2 * flip_rate / h**2)`: a 2-point half-width at a 10% flip rate needs 961 items.
+- **Seeded quota sampler.** Shuffle each slice with a fixed seed and take the quota, so the sample is
+  reproducible; log any slice with fewer candidates than the quota as a coverage gap.
 
 ## Trade-offs
 - **Measurable rare slices vs a traffic-faithful aggregate.** Per-slice quotas make rare cases measurable,

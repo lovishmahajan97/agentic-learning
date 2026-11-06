@@ -197,72 +197,51 @@ from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve
 
 y = np.array([1, 1, 1, 1, 0, 0, 0, 0, 0, 0])                         # 4 positives, 6 negatives
 s = np.array([0.9, 0.8, 0.6, 0.3, 0.7, 0.5, 0.4, 0.2, 0.1, 0.05])    # detector scores
-
-def auc_by_pairs(y, s):
-    pos, neg = s[y == 1], s[y == 0]
-    wins = (pos[:, None] > neg[None, :]).sum() + 0.5 * (pos[:, None] == neg[None, :]).sum()
-    return wins / (len(pos) * len(neg))
-
-print(auc_by_pairs(y, s), roc_auc_score(y, s))                       # both 0.8333
+pos, neg = s[y == 1], s[y == 0]
+print((pos[:, None] > neg).mean(), roc_auc_score(y, s))              # both 0.8333: 20 of 24 pairs
 print(roc_auc_score(y, s ** 3), roc_auc_score(y, np.log(s)))         # unchanged: AUC only sees the ranking
-
 fpr, tpr, thr = roc_curve(y, s, drop_intermediate=False)
 for f, t, th in zip(fpr, tpr, thr):
     print(f"threshold>={th:.2f}: FPR={f:.3f} TPR={t:.2f}")           # one confusion matrix per row
 
 rng = np.random.default_rng(0)
-def sample(n_pos, n_neg):
+for n_pos, n_neg in ((5_000, 5_000), (500, 50_000)):                 # same separation, two prevalences
     yy = np.r_[np.ones(n_pos), np.zeros(n_neg)]
-    ss = np.r_[rng.normal(2, 1, n_pos), rng.normal(0, 1, n_neg)]     # same separation in both datasets
-    return yy, ss
-for n_pos, n_neg in ((5_000, 5_000), (500, 50_000)):
-    yy, ss = sample(n_pos, n_neg)
+    ss = np.r_[rng.normal(2, 1, n_pos), rng.normal(0, 1, n_neg)]
     print(f"prevalence={n_pos/(n_pos+n_neg):.1%}: ROC-AUC={roc_auc_score(yy, ss):.3f}  "
           f"PR-AUC={average_precision_score(yy, ss):.3f}")
 # Expect ROC-AUC near 0.92 in both runs and average precision falling from about 0.9 to well under 0.3
 ```
 
-### Paired bootstrap and TPR at an FPR budget, in plain Python
+### Paired bootstrap and TPR at an FPR budget
 Before declaring a retrain better, resample items, score both models on the same resample, and read the
 interval of the difference; then check the operating point you will actually ship.
 
 ```python
-import random
-
-def auc(y, s):                                   # Mann-Whitney: fraction of pairs ordered correctly
-    pos = [v for v, t in zip(s, y) if t == 1]
-    neg = [v for v, t in zip(s, y) if t == 0]
-    wins = sum((p > n) + 0.5 * (p == n) for p in pos for n in neg)
-    return wins / (len(pos) * len(neg))
+import numpy as np
+from sklearn.metrics import roc_auc_score, roc_curve
 
 def tpr_at_fpr(y, s, budget):                    # best TPR whose FPR stays within budget
-    neg = sorted((v for v, t in zip(s, y) if t == 0), reverse=True)
-    k = int(budget * len(neg))                   # negatives we may let through
-    tau = neg[k] if k < len(neg) else float("-inf")
-    pos = [v for v, t in zip(s, y) if t == 1]
-    return sum(v > tau for v in pos) / len(pos)
+    fpr, tpr, _ = roc_curve(y, s)
+    return tpr[fpr <= budget].max()
 
-random.seed(0)
-y = [1] * 60 + [0] * 600
-a = [random.gauss(1.8 if t else 0, 1) for t in y]          # model A
-b = [x + random.gauss(0, 0.6) for x in a]                  # model B: A plus noise, correlated errors
-
+rng = np.random.default_rng(0)
+y = np.r_[np.ones(60), np.zeros(600)]
+a = rng.normal(1.8 * y, 1)                       # model A
+b = a + rng.normal(0, 0.6, len(y))               # model B: A plus noise, correlated errors
 diffs = []
 for _ in range(300):                             # paired bootstrap: resample items, score both models
-    idx = [random.randrange(len(y)) for _ in y]
-    yy = [y[i] for i in idx]
-    if 0 < sum(yy) < len(yy):
-        diffs.append(auc(yy, [a[i] for i in idx]) - auc(yy, [b[i] for i in idx]))
-diffs.sort()
-lo, hi = diffs[int(0.025 * len(diffs))], diffs[int(0.975 * len(diffs))]
-print(f"AUC A={auc(y, a):.3f} B={auc(y, b):.3f}  paired 95% CI of A-B: [{lo:.3f}, {hi:.3f}]")
+    i = rng.integers(0, len(y), len(y))
+    diffs.append(roc_auc_score(y[i], a[i]) - roc_auc_score(y[i], b[i]))
+lo, hi = np.percentile(diffs, [2.5, 97.5])
+print(f"AUC A={roc_auc_score(y, a):.3f} B={roc_auc_score(y, b):.3f}  paired 95% CI of A-B: [{lo:.3f}, {hi:.3f}]")
 print(f"TPR at FPR<=1%: A={tpr_at_fpr(y, a, 0.01):.2f} B={tpr_at_fpr(y, b, 0.01):.2f}")
-# AUC A=0.889 B=0.859  paired 95% CI of A-B: [0.001, 0.055]
-# TPR at FPR<=1%: A=0.28 B=0.17
+# AUC A=0.921 B=0.893  paired 95% CI of A-B: [0.006, 0.055]
+# TPR at FPR<=1%: A=0.42 B=0.32
 ```
 
 - **With only 60 positives the interval is wide:** a 0.03 AUC gap barely clears zero.
-- **The budget view is starker:** at FPR ≤ 1% model A catches 28% of positives and B 17%.
+- **The budget view is starker:** at FPR ≤ 1% model A catches 42% of positives and B 32%.
 
 ### Worked scenario: the vendor's 0.97 AUC on 0.2% traffic
 A customer runs 500,000 messages a day at 0.2% positives (1,000 positives, 499,000 negatives) through a

@@ -396,48 +396,35 @@ type that makes "validated" visible to the compiler. Compile with `"strict": tru
 `"noUncheckedIndexedAccess": true` in `tsconfig.json`.
 
 ```ts
-type Usage = { inputTokens: number; outputTokens: number };
 type StreamEvent =
   | { type: "text_delta"; text: string }
-  | { type: "tool_call"; name: string; args: unknown }
-  | { type: "done"; usage: Usage };
+  | { type: "done"; usage: { outputTokens: number } };
+
+function handle(ev: StreamEvent, out: string[]) {
+  switch (ev.type) {
+    case "text_delta": out.push(ev.text); break;          // ev narrowed: .text exists
+    case "done": out.push(`[${ev.usage.outputTokens} tokens]`); break;
+    default: { const never: never = ev; return never; }   // compile error if a variant is added
+  }
+}
 
 const models = {
   fast: { id: "small-model", maxOutput: 4096 },
   smart: { id: "large-model", maxOutput: 16384 },
 } as const satisfies Record<string, { id: string; maxOutput: number }>;
-type ModelKey = keyof typeof models;            // "fast" | "smart", not string
-
-function parseJson(text: string): unknown {      // never let `any` escape JSON.parse
-  return JSON.parse(text);
-}
-
-function handle(ev: StreamEvent, out: string[], tools: Map<string, (a: unknown) => void>) {
-  switch (ev.type) {
-    case "text_delta": out.push(ev.text); break;          // ev narrowed: .text exists
-    case "tool_call": {
-      const fn = tools.get(ev.name);                        // Map.get is T | undefined
-      if (!fn) throw new Error(`unknown tool ${ev.name}`);
-      fn(ev.args); break;
-    }
-    case "done": console.log(ev.usage.outputTokens); break;
-    default: { const never: never = ev; return never; }   // compile error if a variant is added
-  }
-}
-
-function pick(key: ModelKey) { return models[key].id; }    // models["typo"] is a compile error
+const pick = (key: keyof typeof models) => models[key].id;   // pick("typo") is a compile error
 
 type ValidatedPrompt = string & { readonly __brand: "ValidatedPrompt" };
 function validatePrompt(s: string): ValidatedPrompt {
   if (!s.trim() || s.length > 32_000) throw new Error("bad prompt");
   return s as ValidatedPrompt;                              // the one sanctioned cast
 }
-declare function callModel(p: ValidatedPrompt): Promise<string>;
-// callModel(rawInput) fails to compile; callModel(validatePrompt(rawInput)) compiles
-const first = ["a", "b"][0];                                // string | undefined under noUncheckedIndexedAccess
-try { parseJson("{"); } catch (e) {                        // e: unknown
-  if (e instanceof SyntaxError) console.error(e.message);
-}
+const callModel = (p: ValidatedPrompt) => `sent ${p.length} chars`;   // callModel("raw") fails to compile
+
+const out: string[] = [];
+handle({ type: "text_delta", text: "hi" }, out);
+handle({ type: "done", usage: { outputTokens: 1 } }, out);
+console.log(out, pick("fast"), callModel(validatePrompt("hello")));   // [ 'hi', '[1 tokens]' ] small-model sent 5 chars
 ```
 
 ### Agent scenario: a typed tool registry with a constrained generic

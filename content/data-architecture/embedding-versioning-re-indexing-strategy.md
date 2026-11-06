@@ -272,7 +272,6 @@ alias = {"docs": "docs_v7"}
 collections = {"docs_v7": {"emb_version": recipe_hash(QUERY_RECIPE), "rows": []}}
 
 def search_docs(query: str, k: int = 5) -> dict:
-    """Tool exposed to the agent. Returns results or an error the agent can report."""
     target = collections[alias["docs"]]
     if target["emb_version"] != recipe_hash(QUERY_RECIPE):
         # never search across spaces; surface it so the agent says "retrieval unavailable"
@@ -287,53 +286,43 @@ print(search_docs("refund window"))                  # {'error': 'embedding_vers
 Log `emb_version` with every tool call in the agent trace, so a bad answer can be traced to the index
 version it was grounded on.
 
-### Recipe hash, content-keyed cache and alias swap
-A minimal version of the three mechanisms. The vector store is abstracted as a dict of collections so the
-logic is visible.
+### Content-keyed cache and alias swap
+The cache is keyed on chunk content plus the recipe version from the example above, so an incremental run
+embeds only changed chunks, and the swap is one assignment. The vector store is a dict of collections.
 
 ```python
-import hashlib, json
+import hashlib
 
-# "revision" is your own pin; hosted APIs may not expose one, so record the date you validated it
-RECIPE = {"model": "text-embedding-3-small", "revision": "2024-01", "dim": 1536,
-          "normalize": True, "chunker": "recursive", "chunk_tokens": 400, "overlap": 40}
-EMB_VERSION = hashlib.sha256(json.dumps(RECIPE, sort_keys=True).encode()).hexdigest()[:12]
+EMB_VERSION = "167378935450"     # recipe_hash(QUERY_RECIPE) from the example above
+cache = {}                       # (chunk_key, EMB_VERSION) -> vector
+collections = {}                 # name -> {chunk_key: (vector, meta)}
+alias = {"docs": "docs_v6"}      # what queries resolve against
 
 def chunk_key(source_id: str, text: str) -> str:
     return hashlib.sha256(f"{source_id}\x00{text}".encode()).hexdigest()[:16]
 
-collections = {}                 # name -> {chunk_key: (vector, meta)}
-alias = {"docs": "docs_v6"}      # what queries resolve against
-cache = {}                       # (chunk_key, EMB_VERSION) -> vector
-
 def embed(text):                 # stand-in for the model call
     return [float(b) for b in hashlib.md5(text.encode()).digest()[:4]]
 
-def build(target: str, sources: dict[str, list[str]]):
-    col = collections.setdefault(target, {})
-    seen, calls = set(), 0
+def build(target: str, sources: dict[str, list[str]]) -> int:
+    col, calls = {}, 0
     for sid, chunks in sources.items():
         for text in chunks:
-            k = chunk_key(sid, text); seen.add(k)
+            k = chunk_key(sid, text)
             if (k, EMB_VERSION) not in cache:
                 cache[(k, EMB_VERSION)] = embed(text); calls += 1
             col[k] = (cache[(k, EMB_VERSION)], {"source": sid, "emb_version": EMB_VERSION})
-    for k in set(col) - seen:    # chunks that vanished upstream
-        del col[k]
+    collections[target] = col    # rebuilt from sources, so chunks that vanished upstream drop out
     return calls
 
 docs = {"kb/1": ["Refunds take 5 days.", "Contact support via chat."]}
 print("first build, calls:", build("docs_v7", docs))          # 2
 docs["kb/1"][0] = "Refunds take 3 days."
 print("incremental, calls:", build("docs_v7", docs))          # 1 (only the changed chunk)
-
-def swap(name, new_target):      # gate this on the eval comparison in real life
-    old, alias[name] = alias.get(name), new_target
-    return old
-print("retired:", swap("docs", "docs_v7"), "live:", alias["docs"])
+alias["docs"] = "docs_v7"        # the swap; keep docs_v6 for rollback
 ```
 
-The eval gate is deliberately a comment: in production `swap` runs only after recall@k on the eval set for
+The eval gate is deliberately left out: in production the swap runs only after recall@k on the eval set for
 `docs_v7` is at least as good as for `docs_v6`, and the agent eval suite passes against it.
 
 ### Worked scenario: full rebuild versus routine run
@@ -388,6 +377,9 @@ CREATE OR REPLACE VIEW docs AS SELECT * FROM docs_v7;
   alias on a schedule; a slow decline with no recipe change signals stale centroids or accumulated deletes,
   so schedule a re-index, not a re-embed. Keep the previous collection for an explicit soak (for example a
   week, set by your rollback needs), then delete it, watching disk and memory headroom.
+- **Pin a revision in the recipe even for hosted models.** Hosted embedding APIs may not expose a model
+  revision, so record your own pin (for example the date you validated the model) in the recipe that the
+  version hash covers.
 
 ## Trade-offs
 - **Atomic cutover vs double memory.** Blue-green rebuilds give atomic cutover and instant rollback but

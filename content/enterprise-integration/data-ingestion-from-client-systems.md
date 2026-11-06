@@ -218,42 +218,28 @@ flowchart TD
 
 ## Examples
 ### Incremental pull with a safe watermark
-An incremental pull from a paginated REST API with a safe watermark, backoff on rate limits, raw landing
-and deduplication. `api`, `raw_store` and `state` stand in for your HTTP client, object store and
-checkpoint table.
+An incremental pull from a paginated REST API with a safe watermark, raw landing and deduplication.
+`api`, `raw_store` and `state` stand in for your HTTP client, object store and checkpoint table.
 
 ```python
-import time, hashlib, json
+import hashlib, json
 from datetime import datetime, timedelta
 
 OVERLAP = timedelta(minutes=10)
 
-def get_with_backoff(api, path, params, max_tries=6):
-    for attempt in range(max_tries):
-        r = api.get(path, params=params, timeout=30)
-        if r.status_code == 429 or r.status_code >= 500:
-            ra = r.headers.get("Retry-After", "")      # seconds, or an HTTP-date we ignore here
-            wait = float(ra) if ra.isdigit() else 2 ** attempt
-            time.sleep(min(wait, 120)); continue
-        r.raise_for_status()
-        return r.json()
-    raise RuntimeError(f"gave up on {path} after {max_tries} tries")
-
 def sync_tickets(api, raw_store, state, tenant):
     wm = datetime.fromisoformat(state.get(tenant, "tickets_wm", "1970-01-01T00:00:00+00:00"))
-    since, newest, cursor = (wm - OVERLAP).isoformat(), wm, None
+    params, newest = {"updated_since": (wm - OVERLAP).isoformat(), "page_size": 200}, wm
     while True:
-        params = {"updated_since": since, "page_size": 200, "order": "updated_at"}
-        if cursor: params["cursor"] = cursor
-        page = get_with_backoff(api, "/tickets", params)
+        page = api.get("/tickets", params=params, timeout=30).json()   # add 429/5xx backoff in production
         for rec in page["items"]:
             body = json.dumps(rec, sort_keys=True).encode()   # assumes rec has no volatile fields
             key = f"{tenant}/tickets/{rec['id']}/{hashlib.sha256(body).hexdigest()[:16]}.json"
             if not raw_store.exists(key):          # dedupe the overlap window
                 raw_store.put(key, body)
             newest = max(newest, datetime.fromisoformat(rec["updated_at"]))
-        cursor = page.get("next_cursor")
-        if not cursor: break
+        if not page.get("next_cursor"): break
+        params["cursor"] = page["next_cursor"]
     state.set(tenant, "tickets_wm", newest.isoformat())  # advance only after all writes succeeded
 ```
 
@@ -332,6 +318,9 @@ A client with three sources and different constraints (illustrative).
 - **Freshness metadata in every retrieval result.** Use for agents that state facts from indexed records.
   Store the source's `updated_at` and your indexed-at time on each chunk and return both in the tool
   result, so the agent can prefer a live tool call when data is old. Monitor index lag p95 per source.
+- **Back off on 429 and 5xx.** Wrap each page request: honour a numeric `Retry-After`, otherwise wait
+  `2 ** attempt` seconds, cap each wait at 120 s, give up after about six tries, and request pages
+  ordered by `updated_at`.
 
 ## Trade-offs
 - **API pull vs replica.** API pull respects the vendor's permission model and is supported, but rate

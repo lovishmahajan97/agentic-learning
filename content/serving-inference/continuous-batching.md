@@ -175,8 +175,7 @@ def static_batching():
     for i in range(0, N, MAX_SEQS):
         batch = lengths[i:i + MAX_SEQS]
         for step in range(max(batch)):                       # batch lives until its longest finishes
-            active = sum(1 for L in batch if L > step)       # idle slots are wasted
-            t += step_ms(active)
+            t += step_ms(sum(L > step for L in batch))       # idle slots are wasted
     return t
 
 def continuous_batching():
@@ -189,17 +188,16 @@ def continuous_batching():
         running = [L - 1 for L in running]
     return t
 
-total_tokens = sum(lengths)
 for name, fn in (("static", static_batching), ("continuous", continuous_batching)):
     ms = fn()
-    print(f"{name:11s}: {ms/1000:6.1f} s total, {total_tokens/ms*1000:8.0f} tok/s")
-# With this seed: static ~54 s (~1.6k tok/s), continuous ~20 s (~4.5k tok/s), close to 3x,
-# because static batches spend most steps at low occupancy waiting for the 1500-token
-# outliers. Make the length skew harsher and the gap widens; make lengths uniform and it vanishes.
+    print(f"{name:11s}: {ms/1000:6.1f} s total, {sum(lengths)/ms*1000:8.0f} tok/s")
+# static ~54 s (~1.6k tok/s), continuous ~20 s (~4.5k tok/s): static idles on 1500-token outliers
 ```
 
 - **Why it is clean:** it ignores prefill and memory, isolating the one effect continuous batching is
   responsible for.
+- **Skew drives the gap:** make the length skew harsher and it widens; make lengths uniform and it
+  vanishes.
 - **Extend it:** add a random long prefill to `step_ms` for newcomers and you reproduce the TPOT spike that
   chunked prefill exists to smooth.
 

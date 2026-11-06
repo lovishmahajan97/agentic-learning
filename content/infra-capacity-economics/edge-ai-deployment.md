@@ -246,31 +246,22 @@ parameters and quantization are illustrative.
 import os, time
 from llama_cpp import Llama
 
-def fits(model_path: str, n_ctx: int, kv_bytes_per_token: int, budget_bytes: int) -> bool:
-    """Weights on disk approximate weights in memory for GGUF; add the KV cache for n_ctx."""
-    weights = os.path.getsize(model_path)
-    need = weights + n_ctx * kv_bytes_per_token
-    print(f"weights {weights/1e9:.2f} GB + cache {n_ctx*kv_bytes_per_token/1e9:.2f} GB vs budget {budget_bytes/1e9:.1f} GB")
-    return need <= budget_bytes
-
-MODEL = "small-chat-3b.Q4_K_M.gguf"          # ~3B params at 4-bit: roughly 1.5-2 GB on disk
+MODEL = "small-chat-3b.Q4_K_M.gguf"           # ~3B params at 4-bit: roughly 1.5-2 GB on disk
 N_CTX = 2048
-# kv_bytes_per_token = 2 * n_layers * n_kv_heads * head_dim * bytes; read these from the model card
-assert fits(MODEL, N_CTX, kv_bytes_per_token=2 * 28 * 8 * 128 * 2, budget_bytes=4 * 1024**3)
+KV_BYTES_PER_TOKEN = 2 * 28 * 8 * 128 * 2     # 2 * n_layers * n_kv_heads * head_dim * bytes (model card)
 
-llm = Llama(model_path=MODEL, n_ctx=N_CTX, n_threads=os.cpu_count() or 4,
-            n_gpu_layers=-1, verbose=False)   # offload all layers to Metal/CUDA/Vulkan if present
+def fits(model_path, n_ctx, kv_bytes_per_token, budget_bytes):
+    """Weights on disk approximate weights in memory for GGUF; add the KV cache for n_ctx."""
+    return os.path.getsize(model_path) + n_ctx * kv_bytes_per_token <= budget_bytes
 
-t = time.time()                      # timing below includes prompt processing, not just decode
+assert fits(MODEL, N_CTX, KV_BYTES_PER_TOKEN, budget_bytes=4 * 1024**3)
+llm = Llama(model_path=MODEL, n_ctx=N_CTX, n_gpu_layers=-1, verbose=False)  # all layers to Metal/CUDA/Vulkan
+
+t = time.time()                               # includes prompt processing, not just decode
 out = llm.create_chat_completion(
-    messages=[{"role": "system", "content": "Reply in one sentence."},
-              {"role": "user", "content": "Summarise why the pump alarm fired."}],
-    max_tokens=64,
-)
-text = out["choices"][0]["message"]["content"]
-n_out = out["usage"]["completion_tokens"]
-print(text); print(f"{n_out/(time.time()-t):.1f} tok/s on this device")
-# Measure sustained tok/s after several minutes on a warm device, not this first burst.
+    messages=[{"role": "user", "content": "Summarise why the pump alarm fired."}], max_tokens=64)
+print(out["choices"][0]["message"]["content"])
+print(f'{out["usage"]["completion_tokens"] / (time.time() - t):.1f} tok/s')  # re-measure warm, after minutes
 ```
 
 - **The `fits` check is the on-device capacity question:** weights plus cache against the budget the
@@ -336,24 +327,17 @@ LOCAL_TOOLS = {
 SYSTEM = ('Reply with JSON only: {"tool": name, "args": {...}} or {"answer": text}. '
           "Tools: read_scan_log(n), open_ticket(summary).")
 
-def edge_agent(task: str, escalate, max_steps: int = 4) -> str:
+def edge_agent(task: str, escalate, max_steps: int = 4) -> str:   # short: small models drift
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": task}]
-    for _ in range(max_steps):            # short budget: small models drift on long loops
+    for _ in range(max_steps):
         out = llm.create_chat_completion(messages=messages, max_tokens=80)
         text = out["choices"][0]["message"]["content"]
         try:
             step = json.loads(text)
-            if not isinstance(step, dict): raise ValueError("not an object")
-        except ValueError:                # JSONDecodeError is a ValueError too
-            return escalate(task, messages, reason="invalid tool call")
-        if "answer" in step:
-            return step["answer"]
-        if step.get("tool") not in LOCAL_TOOLS:
-            return escalate(task, messages, reason="unknown tool")
-        try:
+            if "answer" in step: return step["answer"]
             result = LOCAL_TOOLS[step["tool"]](**step.get("args", {}))
-        except TypeError:                 # wrong or missing argument names from a small model
-            return escalate(task, messages, reason="bad arguments")
+        except (ValueError, KeyError, TypeError) as e:   # bad JSON, unknown tool, wrong arguments
+            return escalate(task, messages, reason=f"invalid tool call: {type(e).__name__}")
         messages += [{"role": "assistant", "content": text}, {"role": "user", "content": f"Result: {result}"}]
     return escalate(task, messages, reason="step budget")   # escalation uploads the transcript
 ```

@@ -311,20 +311,15 @@ class SearchArgs(BaseModel):
 TOOL = {"name": "search", "description": "Search internal docs or tickets.",
         "input_schema": SearchArgs.model_json_schema()}
 
-def search(args: SearchArgs) -> list[str]:
-    return [f"{args.source}:{args.query}:{i}" for i in range(args.limit)]
-
-def run_tool_call(name: str, raw_input: dict[str, object]) -> str:
-    if name != "search":
-        return f"error: unknown tool {name}"
+def run_tool_call(raw_input: dict[str, object]) -> str:
     try:
         args = SearchArgs.model_validate(raw_input)     # raw model JSON becomes a typed object
     except ValidationError as e:
-        return f"error: invalid arguments: {e.errors()[0]['msg']}"   # fed back so the model retries
-    return "\n".join(search(args))
+        return f"error: {e.errors()[0]['msg']}"         # fed back so the model retries
+    return f"searching {args.source} for {args.query!r}, top {args.limit}"
 
-print(run_tool_call("search", {"query": "kv cache", "limit": "3"}))   # "3" coerced to 3
-print(run_tool_call("search", {"query": "kv cache", "limit": 50}))    # error: ... less than or equal to 20
+print(run_tool_call({"query": "kv cache", "limit": "3"}))  # searching docs for 'kv cache', top 3
+print(run_tool_call({"query": "kv cache", "limit": 50}))   # error: Input should be less than or equal to 20
 ```
 
 ### A typed wrapper around a chat completion
@@ -332,40 +327,26 @@ The checker flags any caller that forgets `content` can be `None`, and `Annotate
 Pydantic enforces at runtime.
 
 ```python
-from __future__ import annotations
-from collections.abc import Sequence
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 from pydantic import BaseModel, Field
-
-Role = Literal["system", "user", "assistant"]
-
-class Message(BaseModel):
-    role: Role
-    content: str
 
 class GenConfig(BaseModel):
     model: str
     temperature: Annotated[float, Field(ge=0.0, le=2.0)] = 0.7
-    max_tokens: Annotated[int, Field(gt=0)] = 512
-
-def to_wire(messages: Sequence[Message]) -> list[dict[str, str]]:
-    # Sequence accepts list or tuple; the return is a concrete list for the SDK.
-    return [m.model_dump() for m in messages]
 
 def first_text(response: Any) -> str | None:
-    # SDK responses are typed in the real SDK; Any here stands in for "unknown JSON".
-    choice = response["choices"][0]
-    return choice["message"].get("content")   # may be None for tool-call turns
+    # Any stands in for "unknown JSON"; real SDK responses are typed.
+    return response["choices"][0]["message"].get("content")   # None on tool-call turns
 
-def reply(messages: Sequence[Message], cfg: GenConfig, response: Any) -> str:
+def reply(response: Any) -> str:
     text = first_text(response)
     if text is None:                 # the checker forces this narrowing
         raise ValueError("model returned no text content")
     return text.strip()
 
-raw = {"model": "gpt-4o-mini", "temperature": "0.2"}       # e.g. parsed from a YAML config
-cfg = GenConfig.model_validate(raw)                        # "0.2" coerced to 0.2 by Pydantic
-print(cfg.temperature, type(cfg.temperature))            # 0.2 <class 'float'>
+cfg = GenConfig.model_validate({"model": "gpt-4o-mini", "temperature": "0.2"})  # e.g. from YAML
+print(cfg.temperature, type(cfg.temperature))              # 0.2 <class 'float'>
+print(reply({"choices": [{"message": {"content": " hi "}}]}))   # hi
 # GenConfig(model="x", temperature=3.0) raises a ValidationError: le=2.0
 ```
 
@@ -383,34 +364,6 @@ Run `mypy` on the file above after each edit.
   tokens are spent. On a tool-call turn that `None` is the normal case, not an edge case.
 - **Lesson 1:** the annotation on the function that touches raw JSON matters more than any other.
 - **Lesson 2:** untyped input goes through `model_validate` at the boundary, not through `__init__`.
-
-### Narrowing helper with `TypeIs`
-Without `TypeIs` the checker cannot see inside the helper, so `turn.tool_name` would still be an error.
-This is the shape of the dispatch step in an agent loop.
-
-```python
-from dataclasses import dataclass
-from typing_extensions import TypeIs   # typing.TypeIs on 3.13+
-
-@dataclass
-class TextTurn:
-    text: str
-
-@dataclass
-class ToolTurn:
-    tool_name: str
-    args: dict[str, object]
-
-def is_tool_turn(t: TextTurn | ToolTurn) -> TypeIs[ToolTurn]:
-    return isinstance(t, ToolTurn)
-
-def describe(turn: TextTurn | ToolTurn) -> str:
-    if is_tool_turn(turn):
-        return f"call {turn.tool_name}"    # narrowed to ToolTurn
-    return turn.text                       # narrowed to TextTurn in the else branch
-
-print(describe(ToolTurn("search", {"q": "kv cache"})))   # call search
-```
 
 ## Production patterns
 - **Generate tool schemas from types, never by hand.** Define each tool's arguments as a Pydantic model

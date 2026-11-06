@@ -413,7 +413,7 @@ def guarded_turn(history: list[dict], user_msg: str) -> str:
     step = agent_step(history + [user])                  # model proposes a reply or a tool call
     if step.tool == "run_python":
         proposed = {"role": "assistant", "content": step.args["code"]}
-        verdict, p_act = moderate([user, proposed])      # S14 code-interpreter abuse is in the policy
+        _, p_act = moderate([user, proposed])            # S14 code-interpreter abuse is in the policy
         if p_act > THRESHOLDS["action"]:
             return REFUSAL                               # a signal only; the sandbox is the real control
         step = agent_step(history + [user], tool_result=run_in_sandbox(step.args["code"]))
@@ -442,19 +442,17 @@ A sweep over your own labelled sample, pure Python:
 ```python
 def sweep(scored, thresholds=(0.2, 0.5, 0.8)):
     """scored: list of (p_unsafe, is_unsafe) from a labelled sample of your own traffic."""
-    pos = sum(1 for _, y in scored if y)
-    neg = len(scored) - pos
+    pos = sum(y for _, y in scored)
     for t in thresholds:
-        tp = sum(1 for p, y in scored if p > t and y)
-        fp = sum(1 for p, y in scored if p > t and not y)
-        prec = tp / (tp + fp) if tp + fp else float("nan")
-        print(f"t={t}: recall {tp}/{pos} = {tp/pos:.2f}, precision {prec:.2f}, "
-              f"false blocks {fp}/{neg} = {fp/neg:.1%}")
+        tp = sum(p > t and y for p, y in scored)
+        fp = sum(p > t and not y for p, y in scored)
+        print(f"t={t}: recall {tp}/{pos}, precision {tp / max(tp + fp, 1):.2f}, "
+              f"false blocks {fp}/{len(scored) - pos}")
 
-# tiny synthetic sample; use a few hundred real, labelled prompts per rail
-sample = [(0.97, True), (0.81, True), (0.45, True), (0.12, True),
-          (0.66, False), (0.31, False), (0.08, False), (0.03, False), (0.02, False)]
+sample = [(0.97, True), (0.81, True), (0.45, True), (0.12, True),  # tiny and synthetic; use a few
+          (0.66, False), (0.31, False), (0.08, False), (0.03, False), (0.02, False)]  # hundred real prompts
 sweep(sample)
+# t=0.2: recall 3/4, precision 0.60, false blocks 2/5 ... t=0.8: recall 2/4, precision 1.00, false blocks 0/5
 ```
 
 ## Production patterns

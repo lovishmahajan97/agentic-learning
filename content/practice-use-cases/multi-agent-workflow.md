@@ -166,49 +166,38 @@ flowchart TD
 ## Examples
 ### A supervisor orchestrator in plain asyncio
 Runnable with stubs: the planner, specialists and reviewer are fake functions so the control flow,
-parallelism, budgets and review loop are visible. Replace each with a model call and tools.
+parallel fan-out and capped review loop are visible. Replace each with a model call and tools.
 
 ```python
-import asyncio, json
+import asyncio
 
 async def planner(goal):
-    return [{"id": "t1", "specialist": "pricing", "goal": f"pricing for {goal}"},
-            {"id": "t2", "specialist": "competitors", "goal": f"top 3 competitors for {goal}"}]
+    return [{"id": "t1", "specialist": "pricing"}, {"id": "t2", "specialist": "competitors"}]
 
-async def specialist(task, max_steps=5):
+async def specialist(task):
     await asyncio.sleep(0.1)                         # stands in for a tool-calling loop
-    return {"task": task["id"], "finding": f"{task['specialist']} result",
-            "sources": [f"https://example.com/{task['id']}"], "confidence": "medium"}
+    return {"task": task["id"], "finding": f"{task['specialist']} result"}
 
-async def synthesise(goal, findings, fixes=None):
+def synthesise(goal, findings, fixes=None):
     body = "; ".join(f"{f['finding']} [{f['task']}]" for f in findings)
     return f"Brief on {goal}: {body}" + (" (summary added)" if fixes else "")
 
-async def reviewer(draft, findings):
-    cited = all(f"[{f['task']}]" in draft for f in findings)
-    has_summary = "summary" in draft
-    if cited and has_summary:
-        return {"pass": True, "fixes": []}
-    return {"pass": False, "fixes": [] if has_summary else ["add a one-line summary"]}
+def reviewer(draft):
+    return [] if "summary" in draft else ["add a one-line summary"]
 
-async def run(goal, max_rounds=2, token_budget=50_000):
-    used = 0
+async def run(goal, max_rounds=2):
     tasks = await planner(goal)
     findings = await asyncio.gather(*(specialist(t) for t in tasks))   # parallel fan-out
-    used += 3_000 * len(tasks)                       # track cost per agent from usage fields
-    draft, fixes = await synthesise(goal, findings), None
+    draft = synthesise(goal, findings)
     for round_ in range(1, max_rounds + 1):
-        verdict = await reviewer(draft, findings)
-        print(f"round {round_}: {json.dumps(verdict)}")
-        if verdict["pass"]:
-            return {"status": "done", "draft": draft, "tokens": used}
-        if used > token_budget:
-            break
-        fixes = verdict["fixes"]
-        draft = await synthesise(goal, findings, fixes); used += 2_000
-    return {"status": "needs_human", "draft": draft, "notes": fixes, "tokens": used}
+        fixes = reviewer(draft)
+        print(f"round {round_}: fixes={fixes}")
+        if not fixes:
+            return {"status": "done", "draft": draft}
+        draft = synthesise(goal, findings, fixes)
+    return {"status": "needs_human", "draft": draft}   # round cap hit: escalate
 
-print(asyncio.run(run("an EU e-bike subscription service")))
+print(asyncio.run(run("an EU e-bike subscription service")))   # round 2 passes: status done
 ```
 
 ### Cost, latency and accuracy targets for a research brief
@@ -244,6 +233,9 @@ on the same tasks.
   stronger model for planning and review, then confirm with evals that quality holds.
 - **Evaluate trajectories, not just outputs.** Score plan quality (coverage, no duplicates), specialist
   success and reviewer agreement with humans, because a good final answer can hide wasteful paths.
+- **Contracts and budgets in the orchestrator.** Each finding carries `sources` and a `confidence`
+  field, specialists get a step cap (for example 5), and the run stops on a token budget (for example
+  50,000) as well as on the round cap.
 
 ## Trade-offs
 - **Specialisation vs hand-off loss.** Separate contexts keep each agent sharp, but every hand-off drops

@@ -310,92 +310,52 @@ sequenceDiagram
 ```
 
 ## Examples
-### Interruptible agent socket with tool approval
-The agent task streams tokens and pauses for approval before a side-effecting tool, while the reader
-loop stays free to receive `stop` or `approve`. Auth is a query token because the browser cannot send
-headers on the upgrade.
+### Tool approval while the reader loop stays free
+The agent task pauses on a future before a side-effecting tool; the reader loop resolves it when
+`approve` or `deny` arrives. Needs `pip install fastapi httpx`.
 
 ```python
 import asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, WebSocketException, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 app = FastAPI()
 
-async def model_stream(prompt: str):                 # stand-in for your SDK's async stream
-    for w in "Refund issued. A WebSocket lets the user interrupt this sentence midway.".split():
-        await asyncio.sleep(0.4); yield w + " "
-
-async def run_agent(ws: WebSocket, prompt: str, stop: asyncio.Event, approvals: dict):
-    # 1) the model proposes a side-effecting tool call: ask the human first
-    fut = asyncio.get_running_loop().create_future()
-    approvals["refund-1"] = fut
-    await ws.send_json({"type": "approval_needed", "id": "refund-1", "tool": "issue_refund"})
+async def run_agent(ws: WebSocket, approvals: dict):
+    approvals["refund-1"] = fut = asyncio.get_running_loop().create_future()
+    await ws.send_json({"type": "approval_needed", "id": "refund-1"})
     try:
-        approved = await asyncio.wait_for(fut, timeout=120)
+        ok = await asyncio.wait_for(fut, timeout=120)   # no answer in time counts as a deny
     except asyncio.TimeoutError:
-        approved = False                              # no answer in time counts as a deny
+        ok = False
     finally:
-        approvals.pop("refund-1", None)               # a late approve must not hit a dead future
-    if not approved or stop.is_set():                 # denied or stopped: do not run the tool
-        await ws.send_json({"type": "done", "note": "refund not issued"}); return
-    # 2) run the tool here (idempotency key = run id), then stream, checking stop between tokens
-    async for piece in model_stream(prompt):
-        if stop.is_set():
-            await ws.send_json({"type": "stopped"}); return
-        await ws.send_json({"type": "token", "delta": piece})
-    await ws.send_json({"type": "done"})
+        approvals.pop("refund-1", None)                 # a late approve must not hit a dead future
+    await ws.send_json({"type": "done", "refund_issued": ok})   # run the tool only if ok
 
 @app.websocket("/ws/agent")
-async def agent(ws: WebSocket, token: str):          # ?token=... (short-lived); verify before accept
-    if token != "demo":
-        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+async def agent(ws: WebSocket):
     await ws.accept()
-    stop, task, approvals = asyncio.Event(), None, {}
+    approvals, task = {}, None
     try:
-        while True:                                   # reader loop: never blocked by the agent
+        while True:                                     # reader loop: never blocked by the agent
             msg = await ws.receive_json()
             if msg["type"] == "prompt":
-                if task and not task.done():
-                    stop.set(); task.cancel()          # end the old run, even mid-approval
-                    await asyncio.gather(task, return_exceptions=True)
-                stop = asyncio.Event()
-                task = asyncio.create_task(run_agent(ws, msg["text"], stop, approvals))
+                task = asyncio.create_task(run_agent(ws, approvals))
             elif msg["type"] in ("approve", "deny") and msg["id"] in approvals:
                 approvals.pop(msg["id"]).set_result(msg["type"] == "approve")
-            elif msg["type"] == "stop":
-                stop.set()
     except WebSocketDisconnect:
-        pass
-    finally:
-        if task:
-            task.cancel()                             # client gone: stop paying for tokens
+        if task: task.cancel()                          # client gone: stop paying for tokens
 ```
 
-### Cross-process delivery with Redis pub/sub
-A background worker on another machine finishes a job; the process holding the user's socket must
-forward it. The relay feeds the connection's single outgoing queue instead of calling `send` itself.
+Drive it with the test client:
 
 ```python
-import asyncio
-import redis.asyncio as redis
+from fastapi.testclient import TestClient
 
-r = redis.Redis()
-
-async def relay(session_id: str, outbox: asyncio.Queue):
-    """Subscribe to this session's channel and hand messages to the one sender task."""
-    pubsub = r.pubsub()
-    await pubsub.subscribe(f"session:{session_id}")
-    try:
-        async for msg in pubsub.listen():
-            if msg["type"] == "message":            # skip subscribe confirmations
-                await outbox.put(msg["data"])        # the sender task does ws.send_bytes / send_text
-    finally:
-        await pubsub.unsubscribe(f"session:{session_id}")
-
-# In the worker process, wherever the job completes:
-#   await r.publish(f"session:{session_id}", b'{"type": "job_done"}')
-# Pub/sub is fire-and-forget: if no process is subscribed (socket mid-reconnect), the message is lost,
-# so also persist results where the reconnecting client can fetch them.
+with TestClient(app).websocket_connect("/ws/agent") as ws:
+    ws.send_json({"type": "prompt", "text": "refund order 42"})
+    print(ws.receive_json())   # {'type': 'approval_needed', 'id': 'refund-1'}
+    ws.send_json({"type": "approve", "id": "refund-1"})
+    print(ws.receive_json())   # {'type': 'done', 'refund_issued': True}
 ```
 
 ### Worked scenario: how long until a dead client is noticed?
@@ -435,6 +395,12 @@ Pings every 20 s also keep a healthy-but-quiet socket under that 60 s idle timeo
   errors.
 - **Lower `--ws-max-size` for text-only routes.** A 16 MiB default is generous for chat JSON; set it to
   what your largest legitimate message needs. Monitor closes caused by oversize messages.
+- **Persist what pub/sub delivers.** Redis pub/sub is fire-and-forget: a message published while no
+  process is subscribed (socket mid-reconnect) is lost, so also store job results where the reconnecting
+  client can fetch them. The relay feeds the connection's one sender queue rather than calling `send`.
+- **Time-box approvals.** Await the approval future with `asyncio.wait_for` (for example 120 s), treat a
+  timeout as a deny, and drop the pending entry so a late `approve` cannot resolve a dead future. A new
+  prompt sets stop and cancels the previous run first, even mid-approval.
 
 ## Trade-offs
 - **Full duplex vs pinned state.** Tiny per-message overhead, but the connection is stateful and pinned to

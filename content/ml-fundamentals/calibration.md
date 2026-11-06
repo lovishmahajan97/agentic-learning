@@ -249,21 +249,15 @@ fitted T should land near 2, ECE should drop by roughly an order of magnitude, a
 ```python
 import torch, torch.nn.functional as F
 
-def ece(probs, labels, n_bins=15):
-    """Expected calibration error of the top label, equal-width bins."""
-    conf, pred = probs.max(dim=1)
+def ece(probs, labels, n_bins=15):                    # top-label ECE, equal-width bins
+    conf, pred = probs.max(1)
     hit = (pred == labels).float()
-    edges = torch.linspace(0, 1, n_bins + 1)
-    total = torch.zeros(())
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        m = (conf > lo) & (conf <= hi)
-        if m.any():
-            total += m.float().mean() * (hit[m].mean() - conf[m].mean()).abs()
-    return total.item()
+    b = (conf * n_bins).ceil().clamp(1, n_bins)
+    return sum((b == i).float().mean() * (hit[b == i].mean() - conf[b == i].mean()).abs()
+               for i in range(1, n_bins + 1) if (b == i).any()).item()
 
-def fit_temperature(logits, labels):
-    """One scalar T fitted by NLL on a held-out calibration split. Argmax is unchanged, so accuracy is too."""
-    log_t = torch.zeros(1, requires_grad=True)            # parametrise log T so T stays positive
+def fit_temperature(logits, labels):                  # one scalar T by NLL; argmax, so accuracy, unchanged
+    log_t = torch.zeros(1, requires_grad=True)        # parametrise log T so T stays positive
     opt = torch.optim.LBFGS([log_t], lr=0.1, max_iter=200)
     def closure():
         opt.zero_grad()
@@ -273,19 +267,15 @@ def fit_temperature(logits, labels):
     opt.step(closure)
     return log_t.exp().item()
 
-torch.manual_seed(0)
-def make(n, k=5, overconf=2.0):
-    """Stand-in for a trained net: the calibrated logits are 1.5*z; the 'net' emits twice that."""
+def make(n, k=5):                                     # the "net" emits logits twice as sharp as calibrated
     y = torch.randint(0, k, (n,))
-    z = torch.randn(n, k) + 1.5 * F.one_hot(y, k)
-    return overconf * 1.5 * z, y
-logits_cal, y_cal = make(5_000)          # calibration split: never used for training
-logits_test, y_test = make(5_000)        # reporting split: never used to fit T
+    return 2 * 1.5 * (torch.randn(n, k) + 1.5 * F.one_hot(y, k)), y
 
+torch.manual_seed(0)
+(logits_cal, y_cal), (logits_test, y_test) = make(5_000), make(5_000)   # fit T on cal, report on test
 T = fit_temperature(logits_cal, y_cal)
-print(f"T={T:.2f}  ECE {ece(F.softmax(logits_test, 1), y_test):.3f} -> "
-      f"{ece(F.softmax(logits_test / T, 1), y_test):.3f}  (T > 1 means the model was overconfident)")
-# On this data T comes out close to 2 (about 1.94) and ECE falls from roughly 0.16 to below 0.02; accuracy is identical
+print(f"T={T:.2f}  ECE {ece(F.softmax(logits_test, 1), y_test):.3f} -> {ece(F.softmax(logits_test / T, 1), y_test):.3f}")
+# T comes out close to 2 and ECE falls from roughly 0.16 to below 0.02; accuracy is identical
 ```
 
 ### Production snippet: calibrate a scikit-learn model and check it

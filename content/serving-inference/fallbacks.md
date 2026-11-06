@@ -190,40 +190,46 @@ flowchart TD
   same transcript instead of regenerating the side effect.
 
 ## Examples
-### Fallback chain with a rate-based breaker
-The chain tries each target in order, skips any whose breaker is open, gives each the remaining share of
-one deadline, refuses to fail over on request-specific errors, and labels the response with what served
-it. Per-target retries live inside `call`, where the SDK already does them.
+### Rate-based breaker
+Opens on a failure rate over a window, not a streak, and lets exactly one probe through after the
+cooldown.
 
 ```python
 import time
 from collections import deque
 
 class Breaker:
-    """Opens when >= `threshold` of the last `window` calls failed; one half-open probe per cooldown."""
-    def __init__(self, window=20, min_calls=10, threshold=0.5, cooldown_s=30):
-        self.results, self.min_calls, self.threshold = deque(maxlen=window), min_calls, threshold
-        self.cooldown_s, self.state, self.open_until = cooldown_s, "closed", 0.0
+    """Opens when >= 50% of the last 20 calls failed (min 10); one half-open probe after 30 s."""
+    def __init__(self):
+        self.results, self.state, self.open_until = deque(maxlen=20), "closed", 0.0
     def available(self):
         if self.state == "open" and time.monotonic() >= self.open_until:
             self.state = "half_open"; return True      # exactly one probe gets through
         return self.state == "closed"
     def record(self, ok):
         if self.state == "half_open":                  # the probe's result decides
+            self.results.clear()
             self.state = "closed" if ok else "open"
-            self.results.clear(); self.open_until = time.monotonic() + self.cooldown_s
-            return
-        self.results.append(ok)
-        n, fails = len(self.results), self.results.count(False)
-        if n >= self.min_calls and fails / n >= self.threshold:
-            self.state, self.open_until = "open", time.monotonic() + self.cooldown_s
+        else:
+            self.results.append(ok)
+            n = len(self.results)
+            if n >= 10 and self.results.count(False) / n >= 0.5:
+                self.state = "open"
+        self.open_until = time.monotonic() + 30        # only read while open
+```
 
+### Fallback chain
+The chain tries each target in order, skips any whose breaker is open, gives each the remaining share of
+one deadline, refuses to fail over on request-specific errors, and labels the response with what served
+it. Per-target retries live inside `call`, where the SDK already does them.
+
+```python
 TRANSIENT = {408, 429, 500, 502, 503, 504, 529, "timeout", "connection"}
 LADDER = [("anthropic", "primary-model"), ("bedrock", "primary-model"), ("anthropic", "smaller-model")]
 breakers = {t: Breaker() for t in LADDER}
 
 def generate(req, deadline_s=20.0):
-    deadline, last_err = time.monotonic() + deadline_s, None
+    deadline = time.monotonic() + deadline_s
     for target in LADDER:
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not breakers[target].available():
@@ -231,13 +237,14 @@ def generate(req, deadline_s=20.0):
         try:
             resp = call(target, adapt(req, target), timeout=min(remaining, 10.0))
         except ProviderError as e:
-            if e.code not in TRANSIENT:                # malformed request, policy, auth: no rung fixes this
-                breakers[target].record(True); raise   # the target was healthy; our request was not
-            breakers[target].record(False); last_err = e; continue
+            breakers[target].record(e.code not in TRANSIENT)   # a bad request is not the target's fault
+            if e.code not in TRANSIENT:
+                raise                                  # malformed request, policy, auth: no rung fixes this
+            continue
         breakers[target].record(True)
         resp.meta = {"served_by": target, "fallback": target != LADDER[0]}
         return resp
-    return degraded_response(req, last_err)            # cached/template answer, or an explicit error
+    return degraded_response(req)                      # cached/template answer, or an explicit error
 ```
 
 ### Worked incident trace
@@ -251,15 +258,9 @@ latency distributions):
 | Cooldown ends | half-open | one probe tests recovery and decides close or reopen |
 
 ### Why consecutive-failure breakers misbehave
-Pure Python, runs as is: the chance that five calls in a row fail at independent error rate p is p⁵.
-
-```python
-for p in (0.2, 0.6):
-    run5 = p ** 5
-    print(f"error rate {p:.0%}: P(5 in a row) = {run5:.4f}, about 1 in {round(1 / run5):,} windows")
-# error rate 20%: P(5 in a row) = 0.0003, about 1 in 3,125 windows  -> almost never opens
-# error rate 60%: P(5 in a row) = 0.0778, about 1 in 13 windows     -> opens and closes repeatedly
-```
+At independent error rate p, the chance that five calls in a row fail is p⁵:
+- **20% errors:** 0.2⁵ = 0.0003, about 1 window in 3,125, so a five-in-a-row breaker almost never opens.
+- **60% errors:** 0.6⁵ = 0.078, about 1 window in 13, so it opens and closes repeatedly.
 
 ### Agent step with a tool-compatible fallback (LangChain)
 Bind the tools to *each* model before chaining them, because the fallback wrapper does not carry the
@@ -271,19 +272,15 @@ from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 
 tools = [search_tickets, create_ticket]          # your @tool functions
-
 primary = ChatAnthropic(model="primary-model", timeout=10, max_retries=1).bind_tools(tools)
 second = ChatOpenAI(model="evaluated-fallback-model", timeout=10, max_retries=1).bind_tools(tools)
 
-# Transient errors only. Newer SDK versions raise dedicated classes for 503 and 529 (overloaded)
-# that are not InternalServerError subclasses, so include them when the installed SDK defines them.
-TRANSIENT = ("RateLimitError", "InternalServerError", "ServiceUnavailableError",
-             "OverloadedError", "APIConnectionError")   # APITimeoutError subclasses APIConnectionError
-agent_llm = primary.with_fallbacks(
+agent_llm = primary.with_fallbacks(              # transient errors only: a 400 still raises
     [second],
-    exceptions_to_handle=tuple(getattr(anthropic, n) for n in TRANSIENT if hasattr(anthropic, n)),
+    exceptions_to_handle=(anthropic.RateLimitError, anthropic.InternalServerError,
+                          anthropic.OverloadedError, anthropic.ServiceUnavailableError,  # 529, 503
+                          anthropic.APIConnectionError),   # APITimeoutError subclasses APIConnectionError
 )
-
 msg = agent_llm.invoke(history)                  # same transcript, either model
 for i, call in enumerate(msg.tool_calls):        # key is stable across models: run, step, position
     run_tool_once(call, key=f"{run_id}:{step}:{i}:{call['name']}")
@@ -318,6 +315,9 @@ Illustrative: primary fails 20% of calls with fast 529s for 30 minutes; each run
 - **Quality by served-by tag.** Run the eval suite against every rung and break production quality
   metrics (JSON parse errors, refusal rate, thumbs-down) down by serving target, because silent model
   swaps hide there.
+- **Check the SDK's error classes before listing them.** In anthropic 2.1 and earlier `OverloadedError`
+  (529) and `ServiceUnavailableError` (503) are not `InternalServerError` subclasses (by 2.5 they are), so
+  list them explicitly in `exceptions_to_handle` or 529s will not fail over.
 
 ## Trade-offs
 - **Availability vs known quality.** Availability rises, but fallback quality is lower and, unless you

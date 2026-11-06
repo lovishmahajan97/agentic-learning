@@ -205,10 +205,10 @@ print(customers_exposed("CVE-123"))
 ### Agent tool: a parametrised, bounded, read-only graph query
 No agent-written Cypher: fixed query, parameters only, bounded path length, currently-valid edges, a row
 limit, a timeout, read routing. Uses the Neo4j Python driver (checked with
-5.28 and 6.4 against Neo4j 5.26); the tool schema and errors are what the agent loop sees.
+5.28 and 6.4 against Neo4j 5.26); the returned dict, including the empty-result note, is what the agent sees.
 
 ```python
-import os, re
+import os
 from neo4j import GraphDatabase, Query, RoutingControl
 
 driver = GraphDatabase.driver(os.environ["NEO4J_URI"],
@@ -222,27 +222,16 @@ MATCH (c:Customer)-[r:SUBSCRIBES]->(s)
 WHERE r.valid_to IS NULL OR r.valid_to > datetime()
 RETURN DISTINCT c.name AS customer, s.name AS service,
        [a.source_doc] + [x IN relationships(p) | x.source_doc] + [r.source_doc] AS provenance
-LIMIT $limit
+LIMIT 200
 """
 
-TOOL = {"name": "customers_exposed_to_cve",
-        "description": "Exact list of customers whose subscribed services depend (directly or transitively) "
-                       "on a library affected by a CVE. Returns provenance per hop for citations.",
-        "input_schema": {"type": "object", "properties": {"cve": {"type": "string"}}, "required": ["cve"]}}
-
-def customers_exposed(cve: str, limit: int = 200):
+def customers_exposed_to_cve(cve: str):
+    """Agent tool: exact customers whose services depend on a library affected by the CVE."""
     records, _, _ = driver.execute_query(Query(EXPOSED, timeout=5.0),   # server-side timeout, seconds
-                                         cve=cve, limit=min(limit, 200), routing_=RoutingControl.READ)
-    return [r.data() for r in records]       # rows plus per-hop sources for citations
-
-def handle(args):
-    cve = args.get("cve", "").strip().upper()
-    if not re.fullmatch(r"CVE-[0-9A-Z-]+", cve):
-        return {"error": f"'{cve}' is not a CVE id; look it up with search_docs first"}
-    rows = customers_exposed(cve)
-    if not rows:
+                                         cve=cve, routing_=RoutingControl.READ)
+    if not records:                                  # actionable, not a silent "none"
         return {"rows": [], "note": "no current exposure found; the CVE node may be missing from the graph"}
-    return {"rows": rows, "truncated": len(rows) == 200}
+    return {"rows": [r.data() for r in records]}     # rows plus per-hop sources for citations
 ```
 
 ### Worked scenario: an incident agent, with and without the graph tool
@@ -275,6 +264,8 @@ Feeding the graph result to the next tool is the "graph as filter" pattern, driv
 - **Change-feed sync plus reconcile.** Apply source change events as they arrive, and run a periodic
   reconcile that deletes edges whose provenance no longer exists. Monitor lag from source change to graph
   update.
+- **Validate arguments and flag truncation.** Check the argument shape (a `CVE-...` id) before querying,
+  and return `truncated: true` when rows hit the `LIMIT`, so the agent knows the list is partial.
 
 ## Trade-offs
 - **Exact joins vs build cost.** Joins, counts and multi-hop paths become reliable, but you pay for schema

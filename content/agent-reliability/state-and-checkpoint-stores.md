@@ -234,37 +234,36 @@ flowchart TD
 
 ## Examples
 ### One transaction per step with lease check and blob offload
-- **Fencing check first,** so a worker whose lease expired cannot overwrite its successor; then events
-  (large payloads offloaded behind a reference) and the small snapshot upsert.
 - **`claim`** takes an expiring lease so only one worker resumes a given run. Every table carries
-  `tenant_id`. Tested with psycopg 3.2.13 against PostgreSQL 17 (lease steal, mid-transaction failure,
+  `tenant_id`.
+- **`save_step`** checks the lease first (fencing), so a worker whose lease expired cannot overwrite its
+  successor; then it writes events (large payloads offloaded behind a reference) and upserts the
+  snapshot. Tested with psycopg 3.2.13 against PostgreSQL 17 (lease steal, mid-transaction failure,
   900 KB offload).
 
 ```python
 import json, psycopg
 
 DDL = """
-create table if not exists runs (
-  run_id text primary key, tenant_id text not null, conversation_id text not null,
-  status text not null, owner text, lease_until timestamptz,
-  schema_version int not null default 1, updated_at timestamptz default now());
-create table if not exists events (
-  run_id text references runs, tenant_id text not null, seq int, type text, payload jsonb,
-  blob_key text, created_at timestamptz default now(), primary key (run_id, seq));
-create table if not exists checkpoints (
-  run_id text references runs, tenant_id text not null, step int, state jsonb,
-  primary key (run_id, step));
+create table if not exists runs (run_id text primary key, tenant_id text not null,
+  status text not null, owner text, lease_until timestamptz, updated_at timestamptz);
+create table if not exists events (run_id text references runs, tenant_id text not null,
+  seq int, type text, payload jsonb, blob_key text, created_at timestamptz default now(),
+  primary key (run_id, seq));
+create table if not exists checkpoints (run_id text references runs, tenant_id text not null,
+  step int, state jsonb, primary key (run_id, step));
 """
 # conn = psycopg.connect(dsn, autocommit=True): claim() commits at once and
 # conn.transaction() below is a real BEGIN/COMMIT rather than a savepoint
 
 def claim(conn, run_id, worker, ttl_s=30) -> bool:
-    row = conn.execute(
+    return conn.execute(
         """update runs set owner = %s, lease_until = now() + make_interval(secs => %s)
-           where run_id = %s and (owner is null or lease_until < now())
-           returning run_id""", (worker, ttl_s, run_id)).fetchone()
-    return row is not None
+           where run_id = %s and (owner is null or lease_until < now())""",
+        (worker, ttl_s, run_id)).rowcount == 1
+```
 
+```python
 def save_step(conn, run_id, tenant_id, worker, step, new_events, state, blobs, big=64_000):
     with conn.transaction():                              # all or nothing
         if conn.execute("""update runs set updated_at = now() where run_id = %s
@@ -281,8 +280,8 @@ def save_step(conn, run_id, tenant_id, worker, step, new_events, state, blobs, b
                             values (%s, %s, %s, %s, %s::jsonb, %s)""",
                          (run_id, tenant_id, ev["seq"], ev["type"], raw, key))
         conn.execute("""insert into checkpoints (run_id, tenant_id, step, state)
-                        values (%s, %s, %s, %s::jsonb) on conflict (run_id, step)
-                        do update set state = excluded.state""",
+                        values (%s, %s, %s, %s::jsonb)
+                        on conflict (run_id, step) do update set state = excluded.state""",
                      (run_id, tenant_id, step, json.dumps(state)))
 ```
 

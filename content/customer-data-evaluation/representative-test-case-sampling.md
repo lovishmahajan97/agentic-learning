@@ -217,6 +217,15 @@ def stratified_sample(logs, key, budget, floor, seed=7):
         weight[s] = len(items) / n          # each sampled item stands for this many real ones
     return sample, weight
 
+logs = [{"intent": "billing"}] * 9000 + [{"intent": "cancel"}] * 800 + [{"intent": "legal"}] * 200
+sample, w = stratified_sample(logs, key=lambda r: r["intent"], budget=300, floor=60)
+n = {s: sum(t == s for t, _ in sample) for s in w}
+print(n)            # {'billing': 168, 'cancel': 70, 'legal': 62}
+```
+
+Grade the sample, then re-weight each stratum back to its share of traffic:
+
+```python
 def weighted_estimate(graded, weight, N):
     """graded: (stratum, correct) pairs. Population estimate and its standard error."""
     by = defaultdict(list)
@@ -228,12 +237,6 @@ def weighted_estimate(graded, weight, N):
         est += W * p
         se2 += W * W * p * (1 - p) / len(oks)
     return est, math.sqrt(se2)
-
-logs = ([{"intent": "billing"}] * 9000 + [{"intent": "cancel"}] * 800
-        + [{"intent": "legal"}] * 200)
-sample, w = stratified_sample(logs, key=lambda r: r["intent"], budget=300, floor=60)
-n = {s: sum(t == s for t, _ in sample) for s in w}
-print(n)            # {'billing': 168, 'cancel': 70, 'legal': 62}
 
 true_acc = {"billing": 0.95, "cancel": 0.85, "legal": 0.60}   # pretend grading results
 graded = [(s, i < round(true_acc[s] * n[s])) for s in n for i in range(n[s])]
@@ -275,34 +278,6 @@ print({s: sum(t == s for t, _ in sample) for s in w})
 - **Why it matters:** write-long sessions are 1% of traffic but are where loops and unsafe writes tend to
   concentrate; a proportional 300-item sample would contain about three, while the floor gives 51.
 
-### Deduplicate by cluster before drawing
-A crude but runnable version: normalise digits and whitespace, keep one representative per cluster and
-its size, so the size can weight the population metric later. Production versions use embedding similarity.
-
-```python
-import re, random
-from collections import defaultdict
-
-def normalise(text):
-    text = text.lower()
-    text = re.sub(r"\d+", "<n>", text)          # invoice numbers, dates, amounts
-    return re.sub(r"\s+", " ", text).strip()
-
-def sample_clusters(rows, k, seed=7):
-    """One representative per near-duplicate cluster, with the cluster size for re-weighting."""
-    clusters = defaultdict(list)
-    for r in rows:
-        clusters[normalise(r)].append(r)
-    rng = random.Random(seed)
-    keys = rng.sample(sorted(clusters), min(k, len(clusters)))
-    return [(rng.choice(clusters[c]), len(clusters[c])) for c in keys]
-
-rows = [f"Invoice {i} was charged twice" for i in range(50)] + ["Cancel my plan", "Your agent threatened me"]
-for row, size in sample_clusters(rows, k=3):
-    print(size, row)
-# 52 rows collapse to 3 clusters: one invoice template of size 50 and two singletons
-```
-
 ## Production patterns
 - **Versioned sampling frame.** Write the population filter (channels, products, languages, date window),
   strata, floors and random seed into a config file checked in beside the eval set, so any customer's set
@@ -318,6 +293,9 @@ for row, size in sample_clusters(rows, k=3):
 - **Coverage gap audit.** Ask operations which case types bypass the log (phone, email to a named team,
   manual workarounds) and source those separately. Monitor post-launch complaints by case type for
   categories absent from the set.
+- **Collapse near-duplicates before drawing.** Normalise templated requests (digits, whitespace) or
+  cluster them by embedding similarity, keep one representative per cluster with its size, and use that
+  size to weight the population metric.
 
 ## Trade-offs
 - **Floors vs headline precision.** Floors make rare strata measurable but spend budget away from the bulk,

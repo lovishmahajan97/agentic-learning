@@ -185,34 +185,31 @@ flowchart TD
 ## Examples
 ### A verifiable reward for an agent rollout
 The reward checks the sandbox's end state, not the transcript's claims, scores zero for any malformed
-call, and mildly penalises steps past a budget of four. Pure Python; the rollout and state dictionaries
-stand in for your sandbox's records.
+call, and mildly penalises steps past a budget of four. Then each reward becomes a group advantage.
 
 ```python
 from statistics import mean, stdev
 
 def agent_reward(rollout, state, expected):
-    """rollout: list of tool calls made; state: sandbox state after the run; expected: target state."""
     if any(c.get("error") == "invalid_arguments" for c in rollout):
-        return 0.0                                   # malformed calls earn nothing
-    done = all(state.get(k) == v for k, v in expected.items())   # check the world, not the answer text
-    steps_penalty = 0.05 * max(0, len(rollout) - 4)              # mild pressure against detours
-    return max(0.0, (1.0 if done else 0.0) - steps_penalty)
+        return 0.0                                                # malformed calls earn nothing
+    done = all(state.get(k) == v for k, v in expected.items())    # check the world, not the text
+    return max(0.0, float(done) - 0.05 * max(0, len(rollout) - 4))   # mild pressure against detours
 
-expected = {"ticket_A-1042": "refunded"}
+expected = {"A-1042": "refunded"}
 group = [  # 4 of G rollouts for one task, with the end state each produced
-    ([{"name": "get_order"}, {"name": "refund"}], {"ticket_A-1042": "refunded"}),
+    ([{"name": "get_order"}, {"name": "refund"}], {"A-1042": "refunded"}),
     ([{"name": "refund", "error": "invalid_arguments"}], {}),
-    ([{"name": "get_order"}] * 6 + [{"name": "refund"}], {"ticket_A-1042": "refunded"}),
-    ([{"name": "close_ticket"}], {"ticket_A-1042": "closed"}),          # looks done, is not
+    ([{"name": "get_order"}] * 6 + [{"name": "refund"}], {"A-1042": "refunded"}),
+    ([{"name": "close_ticket"}], {"A-1042": "closed"}),             # looks done, is not
 ]
 r = [agent_reward(calls, st, expected) for calls, st in group]
-adv = [round((x - mean(r)) / (stdev(r) + 1e-4), 2) for x in r]
+adv = [round((x - mean(r)) / (stdev(r) + 1e-4), 2) for x in r]   # group-relative advantage
 print("rewards:", r, "advantages:", adv)
 # rewards: [1.0, 0.0, 0.85, 0.0] advantages: [1.0, -0.86, 0.72, -0.86]
-# The direct two-call success gets the biggest push; the detour still beats the wrong close and the
-# malformed call. Train only on the agent's own tokens; tool-result tokens are masked.
 ```
+
+The direct success gets the biggest push; the detour still beats the wrong close and the malformed call.
 
 ### Multi-turn agent RL in TRL
 The same refund task as a TRL environment. `GRPOTrainer` creates one `SupportEnv` per rollout, calls
@@ -220,15 +217,13 @@ The same refund task as a TRL environment. `GRPOTrainer` creates one `SupportEnv
 scores the end state with `get_reward`. Checked against trl 1.17.1 and transformers 5.22.1, 2026-11.
 
 ```python
+# pip install "trl==1.17.1" "transformers==5.22.1" datasets
 from datasets import Dataset
 from trl import GRPOConfig, GRPOTrainer
 
 class SupportEnv:
-    """One instance per rollout. Public methods are tools; reset and get_reward are reserved."""
-
-    def reset(self, ticket_id, **row):        # receives the row's columns, prompt included
+    def reset(self, ticket_id, **row):          # receives the row's columns
         self.ticket_id, self.state = ticket_id, {ticket_id: "open"}   # fresh sandbox per rollout
-        return None                           # or a string appended to the last user message
 
     def refund(self, ticket_id: str) -> str:
         """Refund the order behind a support ticket.
@@ -236,128 +231,32 @@ class SupportEnv:
         Args:
             ticket_id: The ticket id, for example A-1042.
         """
-        if ticket_id not in self.state:
-            return "error: unknown ticket"
         self.state[ticket_id] = "refunded"
         return "refunded"
 
-    def close_ticket(self, ticket_id: str) -> str:
-        """Close a support ticket without changing the order.
-
-        Args:
-            ticket_id: The ticket id, for example A-1042.
-        """
-        self.state[ticket_id] = "closed"
-        return "closed"
-
-    def get_reward(self) -> float:            # optional: the environment owns the reward
-        return 1.0 if self.state[self.ticket_id] == "refunded" else 0.0
+    def get_reward(self) -> float:              # the environment owns the reward
+        return float(self.state[self.ticket_id] == "refunded")
 
 ds = Dataset.from_list([{"prompt": [{"role": "user", "content": "Ticket A-1042: please refund me."}],
                          "ticket_id": "A-1042"}] * 64)
-
-trainer = GRPOTrainer(
-    model="Qwen/Qwen3-0.6B",
-    args=GRPOConfig(output_dir="out/support-grpo", num_generations=8,
-                    max_completion_length=512, max_tool_calling_iterations=4),   # turn cap
-    train_dataset=ds,
-    environment_factory=SupportEnv,           # reward_funcs becomes optional with get_reward
-)
+trainer = GRPOTrainer(model="Qwen/Qwen3-0.6B", train_dataset=ds, environment_factory=SupportEnv,
+                      args=GRPOConfig(output_dir="out/support-grpo", num_generations=8,
+                                      max_completion_length=512, max_tool_calling_iterations=4))
 trainer.train()
 ```
 
-- **Experimental APIs.** `environment_factory` and `rollout_func` print an experimental warning and may
-  change without notice. `environment_factory` needs transformers 5.2.0 or later; plain `tools=` (a list
-  of typed, docstringed functions) needs 5.0.0 or later.
-- **Your own rollout loop.** `rollout_func(prompts, trainer)` replaces generation entirely; it must
-  return `prompt_ids`, `completion_ids` and `logprobs`, and extra keys reach the reward functions.
-- **The template must be one TRL can parse.** With tools, TRL adds a response schema for known chat
-  templates (Qwen3's is one) and raises `Unrecognized chat template` otherwise. Plumbing tested on CPU
-  with a tiny Qwen3 model and Qwen3's tokenizer: one `reset` and one `get_reward` per rollout.
-
-### Group advantages and the GRPO loss
-One prompt, eight sampled responses, verifier rewards with three of eight correct. Token log-probs are
-illustrative placeholders.
-
-```python
-import torch
-
-G, eps_clip, beta = 8, 0.2, 0.04
-rewards = torch.tensor([1., 0., 0., 1., 0., 0., 0., 1.])         # verifier: 3 of 8 correct
-adv = (rewards - rewards.mean()) / (rewards.std() + 1e-4)        # group-relative advantage, one per response
-print("advantages:", [round(a, 2) for a in adv.tolist()])
-# mean 0.375 -> correct responses get ~ +1.21, wrong ones ~ -0.72 (sample std); a 0/8 or 8/8
-# group would get all zeros and teach nothing.
-
-def grpo_loss(logp_new, logp_old, logp_ref, adv, mask):
-    """logp_* : [G, T] per-token log-probs; mask: [G, T] 1 on response tokens; adv: [G]."""
-    ratio = torch.exp(logp_new - logp_old)                          # pi_theta / pi_old, per token
-    a = adv[:, None]                                                # same advantage on every token
-    surr = torch.min(ratio * a, torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * a)
-    lr = logp_ref - logp_new                                        # log(pi_ref / pi_theta)
-    kl = torch.exp(lr) - lr - 1                                     # non-negative per-token estimator
-    per_tok = -(surr - beta * kl)
-    return (per_tok * mask).sum() / mask.sum()   # token-mean over the group (DAPO-style); the original
-                                                 # averages per response first, then over responses
-
-T = 12
-logp_old = -torch.rand(G, T) * 3
-logp_new = logp_old + 0.05 * torch.randn(G, T)                     # a small policy change
-logp_ref = logp_old + 0.1 * torch.randn(G, T)
-mask = torch.ones(G, T)            # for agent rollouts, 0 on tool-result tokens
-print("loss:", grpo_loss(logp_new, logp_old, logp_ref, adv, mask).item())
-# In a real step: sample G responses per prompt with vLLM, score them, compute logp_old once,
-# then take 1-4 gradient steps on this loss before sampling again.
-```
-
-- **Three of eight right:** each success gets about +1.2, each failure about −0.7.
-- **Seven of eight right:** the single failure gets a large negative push (about −2.5) and each success a
-  small positive one (about +0.35), exactly where the gradient should go.
-
 ### Worked numbers: advantages across pass rates
-How the advantage of one correct and one wrong response changes with pass rate, with and without the std
-division (G = 8, pure Python):
-
-```python
-from statistics import mean, stdev
-
-def group_advantages(k, G=8, scale=True):
-    """Advantage of a correct and a wrong response when k of G pass a 0/1 verifier."""
-    r = [1.0] * k + [0.0] * (G - k)
-    m, s = mean(r), stdev(r)                      # sample std, as torch.std
-    f = (lambda x: (x - m) / (s + 1e-4)) if scale else (lambda x: x - m)
-    return round(f(1.0), 2), round(f(0.0), 2)
-
-for k in (1, 2, 4, 6, 7):
-    print(f"{k}/8", group_advantages(k), group_advantages(k, scale=False))
-```
+Advantage of one correct and one wrong response when k of G = 8 pass a 0/1 verifier, with and without
+the std division:
 
 | Pass rate | Correct, with std (GRPO) | Wrong, with std | Correct, no std (Dr. GRPO) | Wrong, no std |
 |---|---|---|---|---|
 | 1/8 | +2.47 | −0.35 | +0.88 | −0.12 |
-| 2/8 | +1.62 | −0.54 | +0.75 | −0.25 |
 | 4/8 | +0.94 | −0.94 | +0.50 | −0.50 |
-| 6/8 | +0.54 | −1.62 | +0.25 | −0.75 |
 | 7/8 | +0.35 | −2.47 | +0.12 | −0.88 |
 
-- **The std division multiplies extreme groups more:** about ×2.8 at 1/8 versus ×1.9 at 4/8. That is the
-  up-weighting of near-always-failed and near-always-solved prompts described above.
-- **Without it (Dr. GRPO)** half-solved prompts carry relatively more of the gradient.
-
-### Worked scenario: what one agent RL step costs
-Illustrative orders of magnitude for one batch of agent tasks.
-
-| Quantity | Value |
-|---|---|
-| Tasks per batch | 64 |
-| Rollouts per task (G) | 8, so 512 rollouts |
-| Turns per rollout | up to 10 tool calls |
-| Tokens generated per rollout | ~3k agent tokens, plus tool results that are read, not trained |
-| Generated tokens per batch | ~1.5M, which is why rollout speed dominates wall clock |
-| Tasks with 0/8 or 8/8 success | filtered: no gradient, only cost |
-
-Two consequences: tool calls must run fast and in parallel in the sandbox, and pass-rate curation pays
-for itself because every all-solved task burns 8 rollouts for nothing.
+- **The std division multiplies extreme groups more:** about ×2.8 at 1/8 versus ×1.9 at 4/8.
+- **A 0/8 or 8/8 group** gets all-zero advantages and teaches nothing, only costs rollouts.
 
 ## Production patterns
 - **Curate tasks by pass rate before training.** Sample G responses per prompt from the starting
@@ -383,6 +282,17 @@ for itself because every all-solved task burns 8 rollouts for nothing.
 - **Cap and watch length.** Set a maximum completion length (and a turn cap for agents) and, if needed, an
   overlong penalty. Monitor mean response length, tool calls per task, truncation rate and accuracy
   together; length rising with flat accuracy means you pay inference cost for nothing.
+- **TRL agent-RL APIs are experimental (trl 1.17.1).** `environment_factory` and `rollout_func` may
+  change without notice; `environment_factory` needs transformers 5.2.0 or later and plain `tools=` needs
+  5.0.0 or later. `rollout_func(prompts, trainer)` must return `prompt_ids`, `completion_ids` and `logprobs`; extra keys
+  reach the reward functions. With `get_reward` on the environment, `reward_funcs` is optional.
+- **Use a chat template TRL can parse for tools.** Known templates such as Qwen3's work; others raise
+  `Unrecognized chat template`.
+- **Know the loss details.** Clip the ratio (eps 0.2), use the non-negative k3 KL estimate (beta around
+  0.04), mask tool-result tokens, and choose token-mean (DAPO-style) or per-response averaging on
+  purpose; take 1-4 gradient steps per sampled batch.
+- **Budget for generation.** 64 tasks × G = 8 × ~3k agent tokens is ~1.5M generated tokens per batch, so
+  rollout speed and parallel tool calls dominate wall clock.
 
 ## Trade-offs
 - **No value model vs more sampling.** Removing it halves trainable memory and eliminates critic

@@ -365,8 +365,8 @@ CMD ["node", "--max-old-space-size=768", "dist/server.js"]
 ```
 
 ### GitHub Actions: gate, build once, tag with the commit
-Typecheck and tests run against a real Postgres service container; only `main` builds and pushes an image
-tagged with the commit SHA.
+Typecheck, lint and tests gate every change; only `main` builds and pushes an image tagged with the
+commit SHA.
 
 ```yaml
 name: ci
@@ -374,19 +374,12 @@ on: { pull_request: {}, push: { branches: [main] } }
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env: { POSTGRES_PASSWORD: test }
-        ports: ["5432:5432"]
-        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - run: npm run typecheck && npm run lint && npm test
-        env: { DATABASE_URL: postgres://postgres:test@localhost:5432/postgres }
   image:
     needs: test
     if: github.ref == 'refs/heads/main'
@@ -395,10 +388,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
       - uses: docker/build-push-action@v6
         with:
           push: true
@@ -456,6 +446,9 @@ values). Three ways to survive a rollout:
 - **Canary prompt, tool-schema and model changes.** Route a small slice of traffic to the new digest,
   compare quality score, task success, steps per run, tool error rate, cost per request and error rate
   against the baseline, then widen. Monitor the eval score as the promotion gate.
+- **Test against a real database in CI.** Add a `services: postgres: { image: postgres:16 }` container with
+  `--health-cmd pg_isready --health-interval 5s --health-retries 10` and point `DATABASE_URL` at
+  `localhost:5432`, so tests hit the same engine as production.
 
 ## Trade-offs
 - **Multi-stage: smaller image vs build complexity.** Shrinks the runtime image and attack surface; for a

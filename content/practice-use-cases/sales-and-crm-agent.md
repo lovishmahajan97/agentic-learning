@@ -163,43 +163,30 @@ flowchart TD
 Runnable with the standard library; the CRM is a dictionary and the model's draft is stubbed.
 
 ```python
-import re, hashlib
+import re
 
 CRM = {"acme.com": {"company": "Acme", "owner_notes": "Met at expo", "fields": {}}}
 SUPPRESSED = {"jo@globex.com"}
 drafts = {}
 
-def domain(email): return email.split("@")[1].lower()
-
-def upsert_fields(dom, facts):
-    rec = CRM.setdefault(dom, {"company": dom.split(".")[0].title(), "fields": {}})
-    for f in facts:     # agent-owned fields only, each with its source
-        rec["fields"][f["field"]] = {"value": f["value"], "source": f["url"]}
-    return rec
-
-def create_draft(lead_email, body, facts):
-    cited = set(re.findall(r"\[(\d+)\]", body))   # uncited claims pass here; a judge checks those
-    if not cited <= {str(i) for i in range(1, len(facts) + 1)}:
-        return {"ok": False, "error": "draft cites facts that were not researched"}
-    key = hashlib.sha256(lead_email.encode()).hexdigest()[:12]   # one open draft per lead
-    drafts.setdefault(key, {"to": lead_email, "body": body, "status": "awaiting_rep_approval"})
-    return {"ok": True, "draft_id": key, "status": drafts[key]["status"]}
-
 def process(lead_email, facts, body):
     if lead_email in SUPPRESSED:
-        return {"skipped": "suppressed"}
-    result = create_draft(lead_email, body, facts)
-    if result["ok"]:                     # write to the CRM only when the draft is grounded
-        upsert_fields(domain(lead_email), facts)
-    return result
+        return {"skipped": "suppressed"}                  # no research, no draft
+    cited = set(re.findall(r"\[(\d+)\]", body))
+    if not cited <= {str(i) for i in range(1, len(facts) + 1)}:
+        return {"ok": False, "error": "draft cites facts that were not researched"}
+    drafts.setdefault(lead_email, {"body": body, "status": "awaiting_rep_approval"})  # one per lead
+    rec = CRM.setdefault(lead_email.split("@")[1], {"fields": {}})
+    for f in facts:                                       # agent-owned fields only, with source
+        rec["fields"][f["field"]] = {"value": f["value"], "source": f["url"]}
+    return {"ok": True, "draft": drafts[lead_email]["body"]}
 
-facts = [{"field": "industry", "value": "Logistics", "url": "https://acme.com/about"},
-         {"field": "recent_news", "value": "Opened a Rotterdam hub", "url": "https://acme.com/news/1"}]
-print(process("sam@acme.com", facts, "Saw Acme opened a Rotterdam hub [2]. ..."))
-print(process("sam@acme.com", facts, "Second run, same lead [2]."))   # same draft, no duplicate
-print(process("jo@globex.com", facts, "Hi Jo"))                       # suppressed, no research
-print(process("ann@initech.com", facts, "Congrats on your IPO [3]"))  # invented fact rejected
-print(CRM["acme.com"]["owner_notes"])                                 # rep data untouched
+facts = [{"field": "recent_news", "value": "Opened a Rotterdam hub", "url": "https://acme.com/news/1"}]
+print(process("sam@acme.com", facts, "Saw Acme opened a Rotterdam hub [1]."))  # ok
+print(process("sam@acme.com", facts, "Second run [1]."))       # same first draft, no duplicate
+print(process("jo@globex.com", facts, "Hi Jo"))                # skipped: suppressed
+print(process("ann@initech.com", facts, "Congrats on your IPO [2]"))  # invented fact rejected
+print(CRM["acme.com"]["owner_notes"])                          # Met at expo: rep data untouched
 ```
 
 In a real CRM the same checks wrap the API calls: search before create, write only owned properties,

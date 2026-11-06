@@ -357,7 +357,7 @@ flowchart TD
   stand-ins for the provider's usage.
 
 ```python
-import hashlib, json, re, time, uuid
+import hashlib, json, re, uuid
 import structlog
 from structlog.contextvars import bind_contextvars, clear_contextvars, merge_contextvars
 
@@ -369,32 +369,24 @@ def redact(logger, method, event):            # pipeline step: runs on every rec
             event[k] = SECRET.sub("[REDACTED]", v)[:2000]   # mask secrets, cap size
     return event
 
-structlog.configure(processors=[
-    merge_contextvars,                         # injects the bound request fields
-    structlog.processors.add_log_level,
-    structlog.processors.TimeStamper(fmt="iso"),
-    redact,
-    structlog.processors.JSONRenderer(),
-])
+structlog.configure(processors=[merge_contextvars,   # injects the bound request fields
+    structlog.processors.add_log_level, structlog.processors.TimeStamper(fmt="iso"),
+    redact, structlog.processors.JSONRenderer()])
 log = structlog.get_logger()
 
 def handle_turn(tenant, trace_id, prompt):
     clear_contextvars()                         # drop the previous request's fields
     bind_contextvars(request_id=uuid.uuid4().hex, trace_id=trace_id, tenant=tenant)
-    t0 = time.perf_counter()
     raw = '{"status": "shipped", "eta": "2 May"'     # stand-in: truncated model output
-    log.info("llm.call", model="example-model", input_tokens=812, output_tokens=21,
-             latency_ms=round((time.perf_counter() - t0) * 1000, 1),
-             prompt_sha=hashlib.sha256(prompt.encode()).hexdigest()[:12],
-             prompt_preview=prompt[:80], finish_reason="length")
+    log.info("llm.call", model="example-model", input_tokens=812, output_tokens=21, finish_reason="length",
+             prompt_sha=hashlib.sha256(prompt.encode()).hexdigest()[:12], prompt_preview=prompt[:80])
     try:
         return json.loads(raw)
     except ValueError as e:
         log.warning("llm.parse_failed", error=str(e), raw_output=raw)   # raw, not parsed
-        return None
 
-handle_turn("acme", "4bf92f3577b34da6a3ce929d0e0e4736",
-            "Where is my order? my token is key-ABCDEFGH12345")
+handle_turn("acme", "4bf92f3577b34da6a3ce929d0e0e4736", "Where is my order? my token is key-ABCDEFGH12345")
+# {..., "prompt_preview": "Where is my order? my token is [REDACTED]", "event": "llm.call", "tenant": "acme", ...}
 ```
 
 ### A canonical log line for one RAG turn
@@ -482,6 +474,8 @@ One million calls a day at 20 KB per payload, before indexing.
   calls; any gap is a missing write.
 - **Retention tiers with deletion by key.** Hot searchable logs for a short window, archive after, then
   deletion; deletion jobs filter on tenant and user ids. Monitor time to complete a deletion request.
+- **Latency on every model-call record.** Include `latency_ms` (measured with `time.perf_counter()`) on
+  each `llm.call` event so slow calls can be found from logs alone.
 
 ## Trade-offs
 - **Full payloads vs volume and PII.** Every incident becomes reproducible, but volume multiplies by

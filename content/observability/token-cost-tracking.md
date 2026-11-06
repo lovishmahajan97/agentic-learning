@@ -355,40 +355,20 @@ flowchart TD
 - **The key design choice is the neutral `usage` dict.** Each provider's SDK fields are mapped into it in
   one adapter, with `uncached_input` excluding cache reads and writes, so the formula never double counts
   cached tokens whatever a provider's headline input number includes.
+- **The price row is picked by date,** so a call is costed at the price in force when it ran.
 - **The two printed costs** show the same 8,400-token prompt with and without a warm cache.
 
 ```python
-from dataclasses import dataclass
 from datetime import date
 
-@dataclass(frozen=True)
-class Price:        # USD per million tokens; illustrative placeholders, load from config
-    input: float; output: float; cache_write: float; cache_read: float; effective: date
-
-PRICES = {          # model -> prices, newest first
-    "example-model": [Price(2.0, 10.0, 2.5, 0.2, date(2025, 1, 1))],
+PRICES = {  # model -> price rows, newest first; USD per million tokens, illustrative placeholders
+    "example-model": [(date(2025, 1, 1), {"uncached_input": 2.0, "cache_write": 2.5,
+                                          "cache_read": 0.2, "output": 10.0})],
 }
 
-def price_for(model, on):
-    return next(p for p in PRICES[model] if p.effective <= on)
-
 def cost_usd(model, usage, on=None):
-    p = price_for(model, on or date.today())
-    return (usage["uncached_input"] * p.input
-            + usage["cache_write"] * p.cache_write
-            + usage["cache_read"] * p.cache_read
-            + usage["output"] * p.output) / 1_000_000
-
-def record(span, model, usage, **dims):
-    """Attach tokens, cost and attribution dimensions to the generation span."""
-    c = cost_usd(model, usage)
-    total_in = usage["uncached_input"] + usage["cache_read"] + usage["cache_write"]
-    span.set_attribute("gen_ai.usage.input_tokens", total_in)
-    span.set_attribute("gen_ai.usage.output_tokens", usage["output"])
-    span.set_attribute("app.cost_usd", round(c, 6))
-    for k, v in dims.items():          # feature, prompt_version, tenant, run_id, is_retry
-        span.set_attribute(f"app.{k}", v)
-    return c
+    prices = next(p for effective, p in PRICES[model] if effective <= (on or date.today()))
+    return sum(n * prices[kind] for kind, n in usage.items()) / 1_000_000
 
 warm = {"uncached_input": 400, "cache_write": 0, "cache_read": 8000, "output": 300}
 cold = {"uncached_input": 8400, "cache_write": 0, "cache_read": 0, "output": 300}
@@ -409,10 +389,6 @@ def conversation_tokens(turns, system=1500, user=300, assistant=400):
 def cost(inp, out, p_in=2.0, p_out=10.0):        # illustrative USD per million tokens
     return inp * p_in / 1e6, out * p_out / 1e6
 
-inputs, out = conversation_tokens(20)
-c_in, c_out = cost(sum(inputs), out)
-print(f"first turn {inputs[0]}, last turn {inputs[-1]}, total input {sum(inputs)}, output {out}")
-print(f"input ${c_in:.3f} vs output ${c_out:.3f}; input/output tokens {sum(inputs) / out:.0f}x")
 for turns in (5, 10, 20, 40):
     i, o = conversation_tokens(turns)
     print(f"{turns:>2} turns: {sum(i):>7} input tokens, ${sum(cost(sum(i), o)):.3f}")
@@ -437,38 +413,6 @@ prices of 2 (input), 10 (output), 2.5 (cache write) and 0.2 (cache read) dollars
 
 - **Reading:** caching cuts this run about 4×; one runaway run costs as much as roughly 19 normal
   uncached runs, which is why the budget check lives inside the loop, not in a monthly report.
-
-### Per-run budget guard in the agent loop
-Uses `cost_usd` and the neutral usage dict from above. The running total lives in the run's state, so
-the check is synchronous and happens before the next step spends anything.
-
-```python
-class BudgetExceeded(Exception):
-    pass
-
-class RunBudget:
-    def __init__(self, max_usd=0.50, max_steps=20):
-        self.max_usd, self.max_steps = max_usd, max_steps
-        self.spent, self.steps, self.calls = 0.0, 0, []
-
-    def charge(self, model, usage, is_retry=False):
-        c = cost_usd(model, usage)
-        self.spent += c
-        self.calls.append({"model": model, "cost": c, "retry": is_retry, **usage})
-        return c
-
-    def check_before_step(self):
-        self.steps += 1
-        if self.steps > self.max_steps:
-            raise BudgetExceeded(f"step budget {self.max_steps} reached")
-        if self.spent >= self.max_usd:
-            raise BudgetExceeded(f"cost budget ${self.max_usd:.2f} reached (${self.spent:.3f})")
-
-# in the loop:
-#   budget.check_before_step()
-#   reply = call_model(messages); budget.charge(model, from_anthropic(reply.usage))
-# on BudgetExceeded: stop, tell the user, record stop_reason and budget.spent on the run span
-```
 
 ### Production snippet: provider adapters into the neutral schema
 Two providers report cache usage differently, which is exactly why the adapter exists. Field names are
@@ -509,6 +453,10 @@ def from_anthropic(u):     # messages usage: input_tokens EXCLUDES cache reads a
   and per tool; a tool returning whole documents shows up as the largest per-step growth.
 - **Cost per successful task as the headline.** Divide feature cost by completed tasks (not requests) on
   the weekly dashboard, and use it when comparing models. Monitor it for a week after any model switch.
+- **Cost and attribution on the generation span.** Record total input tokens (uncached plus cache reads
+  and writes), output tokens and `app.cost_usd` on each generation span, with dimensions such as feature,
+  prompt version, tenant, run id and `is_retry`. When a run budget stops the loop, record the stop reason
+  and the amount spent on the run span.
 
 ## Trade-offs
 - **Provider usage vs tokeniser estimates.** Provider-reported usage is exact and what you are billed

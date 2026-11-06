@@ -177,42 +177,25 @@ class Finding(BaseModel):
     issue: Literal["cap_on_liability", "auto_renewal", "governing_law", "indemnity"]
     quote: str                                   # must be verbatim from the contract
     position: Literal["standard", "fallback", "unacceptable", "missing"]
-    severity: Literal["high", "medium", "low", "info"]
-    rationale: str
 
 CONTRACT = """7. Liability. Each party's aggregate liability shall not exceed the fees paid
-in the six (6) months preceding the claim.
-12. Term. This Agreement renews automatically for successive one-year terms unless either
-party gives ninety (90) days' notice."""
-
-llm_findings = [   # what a structured-output call might return
-    {"issue": "cap_on_liability", "quote": "shall not exceed the fees paid in the six (6) months",
-     "position": "fallback", "severity": "medium", "rationale": "Playbook standard is 12 months of fees."},
-    {"issue": "auto_renewal", "quote": "renews automatically for successive one-year terms",
-     "position": "fallback", "severity": "medium", "rationale": "Notice of 90 days exceeds standard 30."},
-    {"issue": "indemnity", "quote": "Customer shall indemnify Vendor for all claims",
-     "position": "unacceptable", "severity": "high", "rationale": "Uncapped one-way indemnity."},
-]
-REQUIRED = {"cap_on_liability", "auto_renewal", "governing_law", "indemnity"}
+in the six (6) months preceding the claim."""
 
 def locate(quote, text):
     """Whitespace-insensitive exact match; returns character offsets or None."""
-    pattern = r"\s+".join(map(re.escape, quote.split()))
-    m = re.search(pattern, text)
+    m = re.search(r"\s+".join(map(re.escape, quote.split())), text)
     return (m.start(), m.end()) if m else None
 
-report, seen = [], set()
+llm_findings = [   # what a structured-output call might return
+    {"issue": "cap_on_liability", "quote": "shall not exceed the fees paid in the six (6) months",
+     "position": "fallback"},
+    {"issue": "indemnity", "quote": "Customer shall indemnify Vendor", "position": "unacceptable"},
+]
 for raw in llm_findings:
     f = Finding.model_validate(raw)             # schema check: bad enums or fields raise
-    span = locate(f.quote, CONTRACT)
-    if span is None:
-        print(f"DROPPED unverified quote for {f.issue!r}: {f.quote!r}")
-        continue
-    seen.add(f.issue); report.append((f.severity, f.issue, span, f.rationale))
-for issue in sorted(REQUIRED - seen):          # candidates only: search again before flagging
-    report.append(("review", issue, None, "No verified clause found; confirm it is missing."))
-for row in report:
-    print(row)
+    print(f.issue, locate(f.quote, CONTRACT) or "DROPPED: quote not in contract")
+# cap_on_liability (47, 99)
+# indemnity DROPPED: quote not in contract
 ```
 
 ### Cost, latency and accuracy targets for NDA and MSA review
@@ -253,6 +236,9 @@ legal team using their own labelled contracts.
   hosting where required, access by matter, and deletion schedules for uploaded contracts.
 - **Lawyer in the loop, always.** The agent produces a first-pass report and draft redlines; a lawyer
   approves every change sent to a counterparty, and accept or reject decisions feed the eval set.
+- **Missing issues are candidates.** When no verified clause is found for a required playbook issue,
+  search again before flagging it as missing; keep severity and a rationale per finding for the
+  reviewer.
 
 ## Trade-offs
 - **Whole-document context vs per-clause retrieval.** Long-context models see cross-references but

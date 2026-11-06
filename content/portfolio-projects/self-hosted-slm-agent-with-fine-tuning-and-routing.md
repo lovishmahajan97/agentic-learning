@@ -163,13 +163,13 @@ Both models are called through the OpenAI-compatible Chat Completions API, which
 adapter name is whatever you registered with `--lora-modules`.
 
 ```python
-import json
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 slm = OpenAI(base_url="http://localhost:8000/v1", api_key="local")   # vLLM server
 big = OpenAI()                                                        # frontier provider
 SLM_MODEL, BIG_MODEL = "triage-lora", "YOUR_FRONTIER_MODEL_ID"       # check the current docs
+ALLOWED_TOOLS = {"lookup_account", "create_ticket", "search_kb"}
 
 class Triage(BaseModel):
     category: str            # e.g. billing, bug, access
@@ -177,30 +177,22 @@ class Triage(BaseModel):
     tool: str                # which tool the agent should call next
     args: dict
 
-SYSTEM = "Return only JSON with keys category, priority, tool, args."
-ALLOWED_TOOLS = {"lookup_account", "create_ticket", "search_kb"}
+def call(client, model, ticket) -> Triage:
+    r = client.chat.completions.create(model=model, temperature=0, messages=[
+        {"role": "system", "content": "Return only JSON with keys category, priority, tool, args."},
+        {"role": "user", "content": ticket}])
+    return Triage.model_validate_json(r.choices[0].message.content)
 
-def call(client, model, ticket):
-    r = client.chat.completions.create(model=model, temperature=0,
-        messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": ticket}])
-    return r.choices[0].message.content
-
-def triage(ticket: str, stats: dict) -> Triage:
-    if len(ticket) > 4000:                          # task-type rule: long tickets go straight up
-        stats["big"] += 1
-        return Triage.model_validate_json(call(big, BIG_MODEL, ticket))
+def triage(ticket: str) -> tuple[Triage, str]:
     try:
-        out = Triage.model_validate_json(call(slm, SLM_MODEL, ticket))
+        out = call(slm, SLM_MODEL, ticket)
         if out.tool in ALLOWED_TOOLS and 1 <= out.priority <= 4:
-            stats["slm"] += 1
-            return out
-    except (ValidationError, json.JSONDecodeError):
+            return out, "slm"
+    except ValidationError:                     # also raised for malformed JSON
         pass
-    stats["big"] += 1                                # escalate on any validation failure
-    return Triage.model_validate_json(call(big, BIG_MODEL, ticket))
+    return call(big, BIG_MODEL, ticket), "big"   # escalate on any validation failure
 
-stats = {"slm": 0, "big": 0}
-print(triage("I was charged twice for March, account 8812.", stats), stats)
+print(triage("I was charged twice for March, account 8812."))   # (Triage(category='billing', ...), 'slm')
 ```
 
 ### Fine-tune and serve: the minimal commands
@@ -249,6 +241,8 @@ Compare three configurations on the same held-out set. Targets are illustrative 
   realistic concurrency, including idle hours, before claiming savings over an API.
 - **Keep data hygiene.** Strip PII from traces before training, record the dataset version and commit per
   adapter, and never train on the eval split.
+- **Route by task type before the SLM.** Send inputs the adapter was not trained for straight to the
+  frontier model, for example tickets over 4,000 characters, and count them as escalations.
 
 ## Trade-offs
 - **Cost vs operational burden.** Self-hosting cuts per-token cost at steady volume but adds GPUs,

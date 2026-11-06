@@ -158,15 +158,15 @@ flowchart TD
 
 ## Examples
 ### The edit and test tools, with a scripted model
-Runnable with the standard library. A real model replaces `PLAN`; the tools and their error messages
+Runnable with the standard library. A real model chooses each call; the tools and their error messages
 stay the same.
 
 ```python
-import subprocess, tempfile, pathlib, sys
+import pathlib, subprocess, sys, tempfile
 
 work = pathlib.Path(tempfile.mkdtemp())
 (work / "calc.py").write_text("def add(a, b):\n    return a - b\n")
-(work / "test_calc.py").write_text("from calc import add\nassert add(2, 3) == 5\nprint('ok')\n")
+(work / "test_calc.py").write_text("from calc import add\nassert add(2, 3) == 5\n")
 
 def safe(path):
     p = (work / path).resolve()
@@ -182,18 +182,13 @@ def replace_in_file(path, old, new):
     p.write_text(text.replace(old, new)); return "edited"
 
 def run_tests(timeout=20):
-    r = subprocess.run([sys.executable, "test_calc.py"], cwd=work, capture_output=True,
-                       text=True, timeout=timeout)
-    return f"exit={r.returncode}\n{(r.stdout + r.stderr)[-2000:]}"   # tail: failures are at the end
+    r = subprocess.run([sys.executable, "test_calc.py"], cwd=work, capture_output=True, timeout=timeout)
+    return f"exit={r.returncode}"
 
-TOOLS = {"read_file": read_file, "replace_in_file": replace_in_file, "run_tests": run_tests}
-PLAN = [("run_tests", {}), ("read_file", {"path": "calc.py"}),
-        ("replace_in_file", {"path": "calc.py", "old": "a - b", "new": "a + b"}), ("run_tests", {})]
-
-for step, (name, args) in enumerate(PLAN, 1):          # an LLM would choose each call
-    out = TOOLS[name](**args)
-    print(f"[{step}] {name} -> {out.strip()[:80]}")
-    if name == "run_tests" and out.startswith("exit=0"): break
+print(run_tests())                                   # exit=1
+print(replace_in_file("calc.py", "a", "b"))          # error: expected exactly 1 match ..., found 3
+print(replace_in_file("calc.py", "a - b", "a + b"))  # edited
+print(run_tests())                                   # exit=0
 ```
 
 The subprocess here is only a stand-in; in a real agent `run_tests` executes inside a container with no
@@ -229,6 +224,8 @@ Illustrative orders of magnitude for routine issues in one well-tested repositor
   and edits outside scope; run each task several times because results vary (see `evals/pass-k`).
 - **Human review stays mandatory.** Agents open PRs; branch protection and CI decide what merges. Track
   review time and revert rate for agent PRs versus human PRs.
+- **Return the tail of test output.** Give the model only the last ~2,000 characters of test output,
+  where failures appear, and keep a timeout (about 20 s) on every test run.
 
 ## Trade-offs
 - **Autonomy vs reviewability.** Longer autonomous runs fix more, but produce large diffs that reviewers

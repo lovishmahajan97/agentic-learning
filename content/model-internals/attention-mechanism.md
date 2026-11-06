@@ -168,7 +168,6 @@ demonstration of why the √d_k scaling matters.
 
 ```python
 import numpy as np
-np.random.seed(0)
 
 def attention(q, K, V, scale=True):
     scores = K @ q                                     # one dot product per key
@@ -177,25 +176,18 @@ def attention(q, K, V, scale=True):
     w = np.exp(scores - scores.max()); w /= w.sum()    # numerically stable softmax
     return w, w @ V
 
-# Three memories; the query equals the first key, half-matches the third, is orthogonal to the second.
+# The query equals the first key, half-matches the third, is orthogonal to the second.
 K = np.array([[1.0, 0.0], [0.0, 1.0], [0.7, 0.7]])
 V = np.array([[10.0, 0.0], [0.0, 10.0], [5.0, 5.0]])
-q = np.array([1.0, 0.0])
-w, out = attention(q, K, V, scale=False)
-print(np.round(w, 3), np.round(out, 2))
-# scores 1.0, 0.0, 0.7 -> weights [0.474 0.174 0.351] -> output [6.5 3.5]
-# mostly the first value, a third of the third, a little of the second: a blend, never a pick.
+w, out = attention(np.array([1.0, 0.0]), K, V, scale=False)
+print(np.round(w, 3), np.round(out, 2))   # [0.474 0.174 0.351] [6.5 3.5]: a blend, never a pick
 
-# With d_k = 64 and unit-variance vectors, raw scores have std ~8 and softmax is nearly saturated.
-d, n = 64, 16
-K, q, V = np.random.randn(n, d), np.random.randn(d), np.eye(n)
+# With d_k = 64, raw scores have std ~8 and softmax nearly saturates.
+rng = np.random.default_rng(0)
+K, q, V = rng.normal(size=(16, 64)), rng.normal(size=64), np.eye(16)
 for s in (False, True):
-    w, _ = attention(q, K, V, scale=s)
-    entropy = -(w * np.log(w + 1e-12)).sum()
-    print("scaled" if s else "raw   ", f"max weight {w.max():.3f}  entropy {entropy:.2f} (uniform = {np.log(n):.2f})")
-# Typical result: raw max weight ~0.8, entropy well under 1 (uniform = 2.77) <- near one-hot, gradients vanish
-#                 scaled max weight ~0.2, entropy ~2.4                       <- a distribution the model can sharpen
-# Exact values depend on the draw; the gap in entropy is the point.
+    print("scaled" if s else "raw", "max weight", round(attention(q, K, V, scale=s)[0].max(), 2))
+# raw max weight 0.87: near one-hot, gradients vanish; scaled 0.24: a distribution the model can sharpen
 ```
 
 ### Agent scenario: soft blend versus hard top-k for tool selection
@@ -215,13 +207,9 @@ scores = K @ q
 soft = np.exp(scores / 0.1); soft /= soft.sum()     # soft attention: every tool gets some weight
 top_k = np.argsort(-scores)[:2]                     # hard top-k: only these schemas enter the prompt
 
-for t, s, w in zip(tools, scores, soft):
-    print(f"{t:14s} score {s:.2f}  soft weight {w:.2f}")
+print(dict(zip(tools, soft.round(2).tolist())))
 print("schemas sent to the model:", [tools[i] for i in top_k])
-# search_orders  score 0.93  soft weight 0.32
-# refund_order   score 1.00  soft weight 0.64
-# get_weather    score 0.00  soft weight 0.00
-# create_ticket  score 0.72  soft weight 0.04
+# {'search_orders': 0.32, 'refund_order': 0.64, 'get_weather': 0.0, 'create_ticket': 0.04}
 # schemas sent to the model: ['refund_order', 'search_orders']
 # The soft weights blend two close tools; the hard top-k gives an auditable list you can log and eval.
 ```

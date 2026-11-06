@@ -177,42 +177,34 @@ and leave the tool result as context. Trainers such as TRL's `SFTTrainer` wrap t
 packing and checkpointing.
 
 ```python
-import torch, torch.nn.functional as F
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
 name = "Qwen/Qwen2.5-0.5B-Instruct"                    # its template renders tools and tool turns
 tok = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16).cuda()
-opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.0)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16)
 
-tools = [{"type": "function", "function": {"name": "get_order", "description": "Look up an order",
-          "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
-                         "required": ["order_id"]}}}]
+tools = [{"type": "function", "function": {"name": "get_order", "parameters": {"type": "object",
+          "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}}]
 trace = [
-    {"role": "system", "content": "You are a support agent. Look orders up before answering."},
     {"role": "user", "content": "Where is order A-1042?"},
     {"role": "assistant", "tool_calls": [{"type": "function", "function":
         {"name": "get_order", "arguments": {"order_id": "A-1042"}}}]},
-    {"role": "tool", "name": "get_order", "content": '{"status": "shipped", "eta": "2026-10-25"}'},
-    {"role": "assistant", "content": "Order A-1042 has shipped and should arrive on 25 October."},
+    {"role": "tool", "name": "get_order", "content": '{"status": "shipped"}'},
+    {"role": "assistant", "content": "Order A-1042 has shipped."},
 ]
 def render(msgs, gen=False):
     return tok.apply_chat_template(msgs, tools=tools, tokenize=False, add_generation_prompt=gen)
 
-ids = tok(render(trace), return_tensors="pt").input_ids.cuda()       # [1, T]
-labels = torch.full_like(ids, -100)                                   # all context by default
+ids = tok(render(trace), return_tensors="pt").input_ids        # [1, T]
+labels = torch.full_like(ids, -100)                            # all context by default
 for i, m in enumerate(trace):
-    if m["role"] != "assistant":
-        continue                                  # system, user and tool results stay masked
-    start = len(tok(render(trace[:i], gen=True)).input_ids)   # assumes each rendered prefix is an
-    end = len(tok(render(trace[:i + 1])).input_ids)           # exact token prefix of the full trace
-    labels[:, start:end] = ids[:, start:end]                  # includes this turn's end-of-turn token
+    if m["role"] == "assistant":                               # user and tool results stay masked
+        start = len(tok(render(trace[:i], gen=True)).input_ids)   # assumes each rendered prefix is an
+        end = len(tok(render(trace[:i + 1])).input_ids)           # exact token prefix of the full trace
+        labels[:, start:end] = ids[:, start:end]                  # includes the end-of-turn token
 
-logits = model(input_ids=ids).logits
-loss = F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)).float(),
-                       labels[:, 1:].reshape(-1), ignore_index=-100)
-loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-opt.step(); opt.zero_grad()
+loss = model(input_ids=ids, labels=labels).loss                # shifts labels, ignores -100
+loss.backward(); torch.optim.AdamW(model.parameters(), lr=1e-5).step()   # one update
 print(f"trained on {(labels != -100).sum().item()} of {ids.numel()} tokens, loss {loss.item():.3f}")
 print(tok.decode(ids[0][labels[0] != -100]))          # should show only the call and the answer
 ```
@@ -293,6 +285,9 @@ compared against the prompted baseline.
 - **Split held-out data by topic, not row.** Group examples by product area, intent or tool sequence and
   hold out whole groups, so the eval measures generalisation rather than paraphrase recall. Gate releases
   on held-out task success, never on training loss.
+- **Conservative optimizer settings for full SFT.** Start from a low learning rate (around 1e-5), clip
+  gradients at norm 1.0 and use little or no weight decay; skip any step whose batch has zero supervised
+  tokens.
 
 ## Trade-offs
 - **Precise control vs data cost.** Demonstrations control format and style precisely, but are the most

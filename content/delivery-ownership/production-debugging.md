@@ -416,25 +416,19 @@ print(f"at temperature 0: {replay(trace, params={**trace['params'], 'temperature
 
 ### How many replays prove a fix (runnable)
 Pure Python, no dependencies. The exact bound for zero observed failures is `1 - 0.05 ** (1/n)`; the rule
-of three approximates it as `3/n`.
+of three approximates it as `3/n`. Inverting it, claiming a rate below 10% needs 29 clean replays and
+below 1% needs 299.
 
 ```python
-import math
-
 def zero_failure_upper_bound(n, conf=0.95):
     """Highest true failure rate still consistent with 0 failures in n replays."""
     return 1 - (1 - conf) ** (1 / n)
-
-def replays_needed(target_rate, conf=0.95):
-    """Replays with 0 failures needed to claim the rate is below target_rate."""
-    return math.ceil(math.log(1 - conf) / math.log(1 - target_rate))
 
 for n in (20, 100, 300):
     print(n, f"exact {zero_failure_upper_bound(n):.1%}", f"rule of three {3 / n:.1%}")
 # 20 exact 13.9% rule of three 15.0%
 # 100 exact 3.0% rule of three 3.0%
 # 300 exact 1.0% rule of three 1.0%
-print(replays_needed(0.10), replays_needed(0.01))   # 29 299
 ```
 
 ### Agent replay from the first bad step, with tools stubbed

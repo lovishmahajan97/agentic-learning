@@ -372,8 +372,9 @@ flowchart TD
   timing and attributes, and appends itself to an in-memory exporter. Nothing is passed between `answer`,
   retrieval and generation, which is exactly what production SDKs do.
 - **The sleeps** stand in for a 120 ms search, 250 ms of untraced prompt assembly and a 600 ms model call.
-- **Output** is roughly `chat.turn total 970 ms self 250 ms`, `retrieval 120/120`, `generation 600/600`.
-  The root's 250 ms of self time is the gap no span explains, so add a `prompt.build` span there next.
+- **Output** is roughly `chat.turn total 970 ms self 250 ms`, `retrieval 120/120`, `generation 600/600`,
+  all with the same trace id. The root's 250 ms of self time is the gap no span explains, so add a
+  `prompt.build` span there next.
 - **Caveat:** summing children is correct here because they run sequentially; with parallel children
   subtract the union of their intervals instead.
 
@@ -388,33 +389,26 @@ SPANS = []  # production code hands finished spans to an exporter instead
 def span(name, **attrs):
     parent = _current.get()
     s = {"trace_id": parent["trace_id"] if parent else uuid.uuid4().hex,
-         "span_id": uuid.uuid4().hex[:16],
-         "parent_id": parent["span_id"] if parent else None,
+         "span_id": uuid.uuid4().hex[:16], "parent_id": parent["span_id"] if parent else None,
          "name": name, "attrs": attrs, "start": time.perf_counter()}
     token = _current.set(s)
     try:
         yield s
-        s["status"] = "ok"
-    except Exception as e:
-        s["status"] = f"error: {type(e).__name__}"; raise
     finally:
         s["end"] = time.perf_counter(); _current.reset(token); SPANS.append(s)
 
 def answer(question):
     with span("chat.turn", session_id="conv-17", question=question):
-        with span("retrieval", top_k=4) as r:
-            time.sleep(0.12); r["attrs"]["chunk_ids"] = [11, 42]      # stand-in search
+        with span("retrieval", top_k=4):
+            time.sleep(0.12)              # stand-in search
         time.sleep(0.25)                  # prompt assembly + history compaction, untraced
-        with span("generation", model="example-model") as g:
-            time.sleep(0.60); g["attrs"].update(input_tokens=312, output_tokens=48)
-            return "Your order shipped on 2 May."                       # stand-in completion
-
+        with span("generation", model="example-model"):
+            time.sleep(0.60)              # stand-in model call
 answer("Where is my order?")
 ms = lambda s: (s["end"] - s["start"]) * 1000
 for s in sorted(SPANS, key=lambda s: s["start"]):
     kids = sum(ms(c) for c in SPANS if c["parent_id"] == s["span_id"])
-    pad = "  " if s["parent_id"] else ""
-    print(f'{pad}{s["name"]:<12} total {ms(s):5.0f} ms  self {ms(s) - kids:5.0f} ms')
+    print(f'{s["trace_id"][:6]} {s["name"]:<12} total {ms(s):4.0f} ms  self {ms(s) - kids:4.0f} ms')
 ```
 
 ### Worked scenario: decomposing a 9 s turn
@@ -431,35 +425,6 @@ A user reports a slow answer. The waterfall for that turn (illustrative numbers)
   not the model.
 - **What logs alone would show:** "request took 9 s" and three interleaved retry lines with no link to
   this turn.
-
-### Tracing a tool-calling agent loop
-- **What it shows:** the `span` helper from the first example wrapped around each loop iteration, the
-  model call and the tool call, with the stopping reason set on the root.
-- **Why the shape matters:** every tool span is a child of the step whose generation chose it, so the
-  waterfall reads as "decided, called, read result, decided again".
-- **`call_model` and `TOOLS`** are stand-ins for your provider client and tool registry.
-
-```python
-MAX_STEPS = 8
-
-def run_agent(task, call_model, TOOLS):
-    with span("agent.run", session_id="conv-17", task=task) as root:
-        messages = [{"role": "user", "content": task}]
-        for step in range(1, MAX_STEPS + 1):
-            with span("agent.step", iteration=step):
-                with span("generation", model="example-model") as g:
-                    reply = call_model(messages)             # returns text or a tool call
-                    g["attrs"].update(finish=reply["type"], context_msgs=len(messages))
-                if reply["type"] == "final":
-                    root["attrs"].update(stop_reason="final_answer", steps=step)
-                    return reply["text"]
-                with span(f'tool.{reply["name"]}', args=reply["args"]) as t:
-                    result = TOOLS[reply["name"]](**reply["args"])
-                    t["attrs"]["result_chars"] = len(str(result))
-                messages += [reply["message"], {"role": "tool", "content": str(result)}]
-        root["attrs"].update(stop_reason="step_budget", steps=MAX_STEPS)
-        return "Stopped: step budget reached."
-```
 
 ### Worked scenario: an agent that looped on one tool
 A support agent's turn took 41 s and returned "I could not find your order" (illustrative numbers).
@@ -496,6 +461,9 @@ A support agent's turn took 41 s and returned "I could not find your order" (ill
 - **Trace-to-dataset loop.** Route flagged traces (thumbs-down, guardrail trips, judge failures) into a
   review queue and promote confirmed bad ones to the regression set. Monitor how many new cases each
   week comes from production traces.
+- **Error status on every span.** When the wrapped code raises, set an error status with the exception
+  type on the span and re-raise. In an agent loop, nest `tool.<name>` spans under the `agent.step` whose
+  generation chose them, so the waterfall reads "decided, called, read result, decided again".
 
 ## Trade-offs
 - **Full payload capture vs storage and privacy.** Traces become debuggable on their own, but storage

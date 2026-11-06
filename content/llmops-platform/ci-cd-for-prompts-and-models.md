@@ -253,7 +253,7 @@ flowchart TD
 ### PR-time smoke eval with a content-addressed cache
 A PR-time smoke eval that sits as one job in the pipeline.
 
-- **The YAML fragment** shows where it runs.
+- **The YAML fragment** (from `.github/workflows/llm-ci.yml`) triggers on anything that changes the bundle.
 - **The script** wraps the content-addressed cache around the model client and compares against the
   baseline written by the last green build of `main`, refusing if that baseline used a different dataset
   or scorer.
@@ -264,7 +264,6 @@ A PR-time smoke eval that sits as one job in the pipeline.
   of each.
 
 ```yaml
-# .github/workflows/llm-ci.yml (fragment): trigger on anything that changes the bundle
 on:
   pull_request:
     paths: ["app/**", "prompts/**", "release.json", "data/golden/**", "evals/scorers/**"]
@@ -295,11 +294,10 @@ def cached_llm(messages):   # key = model + params + the exact rendered request,
     out = llm_call(bundle["model"], bundle["params"], messages)
     p.write_text(json.dumps(out)); return out
 
-def run_item(item):
+results = []
+for item in items:
     out = call_app(bundle, item["input"], llm=cached_llm)   # the production code path; only its model calls are cached
-    return {"id": item["id"], "output": out, "score": score(item, out)}
-
-results = [run_item(i) for i in items]
+    results.append({"id": item["id"], "output": out, "score": score(item, out)})
 mean = sum(r["score"] for r in results) / len(results)
 base = json.load(open(f"eval_baselines/main-{subset}.json"))   # written by the last green build of main
 if base["yardstick"] != yardstick:                              # new items or a new judge: scores are not comparable
@@ -322,18 +320,15 @@ import json, pathlib
 fx = [json.loads(l) for l in pathlib.Path("data/tool_fixtures.jsonl").read_text().splitlines()]
 FIXTURES = {(f["tool"], json.dumps(f["args"], sort_keys=True)): f["result"] for f in fx}
 
-def make_tools(deviations):
+def run_task(task):
+    deviations = []
     def call_tool(name, args):
         key = (name, json.dumps(args, sort_keys=True))
         if key not in FIXTURES:                      # the agent took a path nobody recorded
             deviations.append(key)
             return {"error": "no recorded result for this call"}
         return FIXTURES[key]
-    return call_tool
-
-def run_task(task):
-    deviations = []
-    trace = run_agent(task["input"], call_tool=make_tools(deviations),
+    trace = run_agent(task["input"], call_tool=call_tool,
                       llm=cached_llm, max_steps=12)  # same loop and step budget as production
     return {"id": task["id"],
             "success": task_succeeded(task, trace),  # outcome, not the exact tool sequence

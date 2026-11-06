@@ -227,37 +227,14 @@ flowchart TD
 ```
 
 ## Examples
-### A memory layer with the tiers wired together
-A session store as the source of truth, a write policy that extracts facts after each turn and
-supersedes contradictions (by slot for typed facts, by model adjudication for free text), and a read
-policy that assembles a bounded working set using relevance, recency and scope. `llm`, `embed`, `cosine`
-and `store` stand in for your model, embedding model and database.
+### The write policy: slots upsert, free text is adjudicated
+After each turn, extract facts from the user's own words and supersede contradictions: by slot for typed
+facts, by model adjudication for free text. `llm`, `embed` and `store` stand in for your model, embedding
+model and database.
 
 ```python
-import math, time
-
-RECENT_TURNS, SUMMARY_EVERY, MEM_BUDGET_TOKENS = 10, 10, 800   # summary cadence <= recent window: no turn falls between them
-
-def build_context(user, tenant, convo_id, query, store, w_rel=1.0, w_rec=0.5, w_imp=0.3):
-    turns = store.turns(convo_id)                                    # session state: full transcript
-    recent, older = turns[-RECENT_TURNS:], turns[:-RECENT_TURNS]
-    summary = store.summary(convo_id) if older else ""
-    q, now = embed(query), time.time()
-    cands = store.memories(tenant=tenant, user=user, purpose="assistant")   # scope inside the query
-    def score(m):
-        recency = math.exp(-(now - m.updated_at) / (7 * 86400))     # decays over about a week
-        return w_rel * cosine(q, m.vec) + w_rec * recency + w_imp * m.importance
-    picked, used = [], 0
-    for m in sorted(cands, key=score, reverse=True):
-        if used + m.tokens > MEM_BUDGET_TOKENS: break
-        picked.append(m); used += m.tokens
-    return {"summary": summary, "memories": [m.text for m in picked], "recent": recent}
-
 def after_turn(user, tenant, convo_id, store):
     turns = store.turns(convo_id)
-    if len(turns) % SUMMARY_EVERY == 0:                              # compaction: summarize, never delete
-        store.set_summary(convo_id, llm(f"Update this summary:\n{store.summary(convo_id)}\n\n"
-                                        f"New turns:\n{turns[-SUMMARY_EVERY:]}").text)
     facts = llm("Extract durable facts as JSON [{slot or null, text, importance 0-1}] "
                 f"from the user's own words only:\n{turns[-2:]}").json   # not from tool output
     for f in facts:
@@ -324,6 +301,10 @@ for name, w in profiles.items():
 - **Provenance-gated writes.** Extract only from the user's own turns and tag each memory with its source
   type, rejecting tool output, retrieved documents and web pages. Monitor memories created per session by
   source type; anything from a non-user source is an injection signal.
+- **Bounded working set per call.** Assemble each prompt from the last 10 turns verbatim, a rolling summary
+  of older turns (refresh it at least as often as the recent window rolls over, for example every 10 turns,
+  so no turn falls between them; summarize, never delete the transcript) and scored memories capped at a
+  token budget (for example 800 tokens), with recency decaying over about a week.
 
 ## Trade-offs
 - **Write-time extraction vs cost and over-remembering.** Every read stays cheap, but a model call per

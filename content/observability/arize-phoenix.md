@@ -319,134 +319,80 @@ flowchart TD
 ```
 
 ## Examples
-### Tracing a RAG answer and judging it for hallucination
-Plain OpenTelemetry plus OpenInference attributes, with the OpenAI instrumentor producing the `LLM` span,
-then a notebook step that judges every answered question against its retrieved context and writes verdicts
-back.
-
-Checked against arize-phoenix 21.0.0, arize-phoenix-evals 3.9.5 and arize-phoenix-client 3.7.0, 2026-11.
-Span queries and write-back live in the separate `phoenix.client` package; the judge is a
-`FaithfulnessEvaluator`, because this answer is graded against retrieved context.
+### Tracing a RAG answer with OpenInference attributes
+The OpenAI instrumentor produces the `LLM` span; you mark the chain and retriever spans yourself, with the
+document list flattened into indexed keys. Checked against arize-phoenix 21.0.0, 2026-11.
 
 ```python
 # pip install "arize-phoenix==21.*" "arize-phoenix-evals==3.9.5" openinference-instrumentation-openai openai
 # terminal: phoenix serve   -> UI http://localhost:6006, OTLP http://localhost:6006/v1/traces
 from phoenix.otel import register
 from openinference.instrumentation.openai import OpenAIInstrumentor
-from openinference.semconv.trace import SpanAttributes, OpenInferenceSpanKindValues
 from openai import OpenAI
 
 tracer_provider = register(project_name="support-bot", endpoint="http://localhost:6006/v1/traces")
-OpenAIInstrumentor().instrument(tracer_provider=tracer_provider)   # LLM spans with messages and token counts
+OpenAIInstrumentor().instrument(tracer_provider=tracer_provider)   # LLM spans with messages and tokens
 tracer = tracer_provider.get_tracer(__name__)
-client = OpenAI()
-
-def retrieve(question: str) -> list[str]:
-    with tracer.start_as_current_span("retrieve") as span:
-        docs = ["Reset your password under Settings > Security > Reset password."]
-        span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKindValues.RETRIEVER.value)
-        for i, d in enumerate(docs):                            # flattened list: one key per document
-            span.set_attribute(f"retrieval.documents.{i}.document.content", d)
-        return docs
 
 def answer(question: str) -> str:
     with tracer.start_as_current_span("support.answer") as span:
-        span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKindValues.CHAIN.value)
-        span.set_attribute(SpanAttributes.INPUT_VALUE, question)
-        docs = retrieve(question)
-        resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-            {"role": "system", "content": "Answer only from:\n" + "\n".join(docs)},
-            {"role": "user", "content": question}])
-        out = resp.choices[0].message.content
-        span.set_attribute(SpanAttributes.OUTPUT_VALUE, out)
+        span.set_attributes({"openinference.span.kind": "CHAIN", "input.value": question})
+        with tracer.start_as_current_span("retrieve") as r:
+            doc = "Reset your password under Settings > Security > Reset password."
+            r.set_attributes({"openinference.span.kind": "RETRIEVER",
+                              "retrieval.documents.0.document.content": doc})
+        out = OpenAI().chat.completions.create(model="gpt-4o-mini", messages=[
+            {"role": "system", "content": "Answer only from: " + doc},
+            {"role": "user", "content": question}]).choices[0].message.content
+        span.set_attribute("output.value", out)
         return out
 
-answer("How do I reset my password?")
+print(answer("How do I reset my password?"))   # e.g. Go to Settings > Security > Reset password.
+```
 
-# Later, in a notebook: judge each answered question against its retrieved context, write results back
+- **In the UI** the trace reads `support.answer` → `retrieve` and `support.answer` → `ChatCompletion`.
+- **For agent loops,** set `openinference.span.kind` to `AGENT` on the run and `TOOL` (with `tool.name` and
+  `tool.parameters`) on each tool call the same way.
+
+### Judging those answers and writing verdicts back
+Span queries and write-back live in `phoenix.client`; the judge is a `FaithfulnessEvaluator` because the
+answer is graded against retrieved context. Checked against arize-phoenix-evals 3.9.5 and
+arize-phoenix-client 3.7.0, 2026-11.
+
+```python
 from phoenix.client import Client
 from phoenix.client.helpers.spans import get_input_output_context
 from phoenix.evals import LLM, evaluate_dataframe
 from phoenix.evals.metrics import FaithfulnessEvaluator
 from phoenix.evals.utils import to_annotation_dataframe
 
-px_client = Client(base_url="http://localhost:6006")       # talks to the running server
-qa = get_input_output_context(px_client, project_name="support-bot")   # index span id; input, output, context
+px_client = Client(base_url="http://localhost:6006")
+qa = get_input_output_context(px_client, project_name="support-bot")   # index: root span id
 judge = FaithfulnessEvaluator(llm=LLM(provider="openai", model="gpt-4o-mini"))
 results = evaluate_dataframe(dataframe=qa, evaluators=[judge])         # adds a faithfulness_score column
 px_client.spans.log_span_annotations_dataframe(dataframe=to_annotation_dataframe(dataframe=results))
+print(len(results))   # one judged row per answered question, e.g. 1
 ```
 
-- **In the UI** the trace reads `support.answer` → `retrieve` and `support.answer` → `ChatCompletion`; the chain
-  span carries a `faithfulness` annotation with the judge's explanation, and the project view filters to the
-  unfaithful ones.
+- **The chain span** now carries a `faithfulness` annotation with the judge's explanation, and the project
+  view filters to the unfaithful ones.
 - **For an agent turn** with no retrieved context, swap in `HallucinationEvaluator(llm=...)`, which grounds
   the answer in the conversation and its tool results.
-
-### Marking agent and tool spans with OpenInference kinds
-For a hand-written agent loop, set the span kind on the run and on each tool call so Phoenix renders them
-as agent and tool steps; model calls still come from the instrumentor. `decide` and `TOOLS` stand for your
-model call and tool registry.
-
-```python
-import json
-from openinference.semconv.trace import SpanAttributes, OpenInferenceSpanKindValues as Kind
-
-def run_tool(name: str, args: dict):
-    with tracer.start_as_current_span(f"tool {name}") as span:
-        span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, Kind.TOOL.value)
-        span.set_attribute("tool.name", name)
-        span.set_attribute("tool.parameters", json.dumps(args))
-        result = TOOLS[name](**args)
-        span.set_attribute(SpanAttributes.OUTPUT_VALUE, json.dumps(result))
-        return result
-
-def run_agent(task: str, max_steps: int = 6) -> str:
-    with tracer.start_as_current_span("support.agent") as span:
-        span.set_attribute(SpanAttributes.OPENINFERENCE_SPAN_KIND, Kind.AGENT.value)
-        span.set_attribute(SpanAttributes.INPUT_VALUE, task)
-        observations = []
-        for _ in range(max_steps):
-            step = decide(task, observations)          # instrumented client: an LLM span per call
-            if step["type"] == "final":
-                span.set_attribute(SpanAttributes.OUTPUT_VALUE, step["text"])
-                return step["text"]
-            observations.append(run_tool(step["tool"], step["args"]))
-        span.set_attribute(SpanAttributes.OUTPUT_VALUE, "step budget reached")
-        return "Sorry, I could not finish."
-```
-
-### Worked scenario: judging a week of agent tool calls
-Illustrative numbers for a support agent, judged by a model from another family on a sample.
-
-| Quantity | Value |
-|---|---|
-| Agent runs in the week | 8,000 |
-| `TOOL` spans in sampled runs (10% of runs) | 2,600 |
-| Judge labels "wrong tool or wrong arguments" | 182, a 7% judged rate |
-| Of those, the `search_kb` tool with an empty query | 120 |
-| Human check of 100 flagged spans | 85 agree with the judge |
-
-- **The fix was a tool description,** not a model change: `search_kb` now states that `query` is required,
-  and the next week's judged rate is the metric to watch.
-- **Labels live on the `TOOL` spans,** so filtering by the label lists exactly the bad calls with their
-  parent agent runs.
 
 ### How the join works, with a day of numbers
 The part worth understanding is how a verdict lands on exactly the right span.
 
 | Step | What happens |
 |---|---|
-| Query | `get_input_output_context` runs `spans.get_spans_dataframe` and returns a DataFrame indexed by the span id of each root span with an input and an output |
-| Context | Built by concatenating the document contents on the retriever spans of the same trace |
-| This request | One row: input "How do I reset my password?", the model's answer, the one-sentence context |
-| Judge | Receives all three in its template; returns a `Score` with `label` (`faithful` or `unfaithful`), a numeric `score` (1.0 or 0.0) and an `explanation`, still indexed by span id |
-| Write back | `to_annotation_dataframe` flattens the scores; `log_span_annotations_dataframe` attaches each row to exactly that span |
-| A day of traffic | 2,000 answered questions give 2,000 labels; if 140 are `unfaithful`, the project shows a 7% rate you can filter, open and read |
+| Query | `get_input_output_context` returns one row per root span with an input and an output, indexed by span id |
+| Context | The document contents on the retriever spans of the same trace, concatenated |
+| Judge | Returns a `label` (`faithful` or `unfaithful`), a `score` (1.0 or 0.0) and an `explanation`, still indexed by span id |
+| Write back | `log_span_annotations_dataframe` attaches each row to exactly that span |
+| A day of traffic | 2,000 answered questions give 2,000 labels; 140 `unfaithful` is a 7% rate you can filter and read |
 
-If the retriever span had carried no documents, `get_input_output_context` would drop the row in its inner
-join (checked against arize-phoenix-client 3.7.0, 2026-11), so the run is never judged and never counted. A
-hand-built query that keeps it grades against nothing, a pitfall listed below.
+If the retriever span carried no documents, `get_input_output_context` drops the row in its inner join
+(checked against arize-phoenix-client 3.7.0), so the run is never judged. A hand-built query that keeps it
+grades against nothing, a pitfall listed below.
 
 ### Fanning one trace stream out to Phoenix and Tempo
 A Collector config that keeps the existing tracing store and adds Phoenix, with no application change. The
@@ -454,24 +400,13 @@ A Collector config that keeps the existing tracing store and adds Phoenix, with 
 
 ```yaml
 receivers:
-  otlp:
-    protocols:
-      grpc:
-        endpoint: 0.0.0.0:4317
-processors:
-  batch: {}
+  otlp: {protocols: {grpc: {endpoint: 0.0.0.0:4317}}}
 exporters:
-  otlp/tempo:
-    endpoint: tempo:4317
-    tls: {insecure: true}
-  otlphttp/phoenix:
-    endpoint: http://phoenix:6006
+  otlp/tempo: {endpoint: tempo:4317, tls: {insecure: true}}
+  otlphttp/phoenix: {endpoint: http://phoenix:6006}
 service:
   pipelines:
-    traces:
-      receivers: [otlp]
-      processors: [batch]
-      exporters: [otlp/tempo, otlphttp/phoenix]
+    traces: {receivers: [otlp], exporters: [otlp/tempo, otlphttp/phoenix]}
 ```
 
 Spans without OpenInference attributes still arrive in Phoenix, but only enriched spans render as LLM,
@@ -495,6 +430,10 @@ retriever and tool steps.
   separately. Monitor the share of agent traces with typed tool spans and the judged tool-error rate per tool.
 - **Pin `arize-phoenix` and instrumentor versions** and run the evaluation job in CI against a fixture
   project, because evaluator import paths have changed across releases.
+- **Keep the `batch` processor** in the Collector's traces pipeline in production; the fan-out example omits it
+  for brevity.
+- **Judge tool spans, then fix descriptions.** A judged wrong-tool rate that clusters on one tool (for example
+  `search_kb` called with an empty query) is usually fixed in the tool description, not the model.
 
 ## Trade-offs
 - **Portability vs product loop.** OTel-native ingestion means no lock-in and one instrumentation for every

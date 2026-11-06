@@ -229,24 +229,17 @@ class Step(BaseModel):
     goal: str
 class Plan(BaseModel):
     steps: list[Step] = Field(max_length=8)   # bound the loop in the contract itself
-class ToolResult(BaseModel):
-    tool: str
-    ok: bool
-    data: dict                      # data, never instructions: the next prompt quotes it as data
 class Answer(BaseModel):
     text: str
-    used_tools: list[str]
 
-async def run_task(task, tools, trace):
+async def run_task(task, tools):
     plan = await llm_structured(MODELS["plan"], Plan, task=task, tools=list(tools))
-    trace.append({"stage": "plan", "model": MODELS["plan"], "steps": len(plan.steps)})
     results = []
     for s in plan.steps:
         if s.tool not in tools:
             raise ValueError(f"planner invented tool {s.tool}")      # contract violation, caught at the boundary
         args = await llm_structured(MODELS["execute"], tools[s.tool].Args, goal=s.goal, prior=results)
-        results.append(ToolResult(tool=s.tool, **await tools[s.tool].run(args)))
-        trace.append({"stage": "execute", "model": MODELS["execute"], "tool": s.tool})
+        results.append({"tool": s.tool, "data": await tools[s.tool].run(args)})  # data, never instructions
     return await llm_structured(MODELS["answer"], Answer, task=task, results=results)
 ```
 
@@ -270,38 +263,30 @@ are thin adapters around whatever providers or servers you use.
 
 ```python
 import asyncio, time, random
-from dataclasses import dataclass, field
 
 MODELS = {"guard": "safety-classifier-v3", "embed": "text-embed-v2",
           "rerank": "cross-encoder-v1", "generate": "frontier-chat-2026-06", "judge": "small-chat"}
 BACKGROUND = set()                 # references to fire-and-forget tasks (asyncio only keeps weak ones)
 
-@dataclass
-class Trace:                       # one record per request: which model served which stage, how long
-    stages: list = field(default_factory=list)
-    def add(self, stage, model, t0):
-        self.stages.append({"stage": stage, "model": model, "ms": round((time.perf_counter() - t0) * 1000)})
-
-async def stage(name, fn, trace, **kw):
+async def stage(name, fn, trace, **kw):             # every adapter takes the model id as its first argument
     t0 = time.perf_counter()
-    out = await fn(MODELS[name], **kw)              # every adapter takes the model id as its first argument
-    trace.add(name, MODELS[name], t0)
+    out = await fn(MODELS[name], **kw)
+    trace.append({"stage": name, "model": MODELS[name], "ms": round((time.perf_counter() - t0) * 1000)})
     return out
 
 async def answer(question):
-    trace = Trace()
-    verdict, qvec = await asyncio.gather(          # guard and embedding are independent: run concurrently
-        stage("guard", classify, trace, text=question),
-        stage("embed", embed, trace, text=question))
+    trace = []                                      # one record per stage: which model served it, how long
+    verdict, qvec = await asyncio.gather(           # guard and embedding are independent: run concurrently
+        stage("guard", classify, trace, text=question), stage("embed", embed, trace, text=question))
     if verdict != "allow":
-        return {"answer": "I can't help with that request.", "trace": trace.stages}
+        return {"answer": "I can't help with that request.", "trace": trace}
     candidates = await vector_search(qvec, k=50)                                 # a database call, not a model
     top = await stage("rerank", rerank, trace, query=question, docs=candidates, k=5)
     draft = await stage("generate", generate, trace, question=question, context=top)
     if random.random() < 0.05:                                                   # sampled judge, off the hot path
         t = asyncio.create_task(stage("judge", judge, trace, question=question, answer=draft, context=top))
         BACKGROUND.add(t); t.add_done_callback(BACKGROUND.discard)              # keep a reference or it may be GC'd
-    return {"answer": draft, "sources": [d.id for d in top], "trace": trace.stages}
+    return {"answer": draft, "sources": [d.id for d in top], "trace": trace}
 ```
 
 - **The trace makes it debuggable:** group judge scores by the `generate` model version, or latency by
@@ -332,26 +317,18 @@ A runnable simulation: four stages at 200 ms that occasionally take 1,500 ms.
 ```python
 import random
 
-def p(xs, q):
-    xs = sorted(xs); return xs[int(q * (len(xs) - 1))]
+def p(xs, q): return sorted(xs)[int(q * (len(xs) - 1))]   # q-th percentile
 
 def stage(slow):                              # 200 ms normally, 1,500 ms when slow
     return random.uniform(180, 220) + (1300 if slow else 0)
 
 random.seed(0)
 N, P_SLOW, STAGES = 100_000, 0.02, 4
-indep, corr = [], []
-for _ in range(N):
-    indep.append(sum(stage(random.random() < P_SLOW) for _ in range(STAGES)))  # independent causes
-    shared = random.random() < P_SLOW                                           # one shared GPU pool
-    corr.append(sum(stage(shared) for _ in range(STAGES)))
-
-one = [stage(random.random() < P_SLOW) for _ in range(N)]
-print(f"single-stage p99 ~ {p(one, .99):,.0f} ms; sum of 4 p99s ~ {4 * p(one, .99):,.0f} ms")
-print(f"end-to-end p99, independent slowness: {p(indep, .99):,.0f} ms")
-print(f"end-to-end p99, correlated slowness:  {p(corr, .99):,.0f} ms")
-# single-stage p99 ~ 1,499 ms; sum of 4 p99s ~ 5,997 ms
-# independent: ~2,130 ms (tails rarely coincide); correlated: ~6,000 ms (the full sum)
+indep = [sum(stage(random.random() < P_SLOW) for _ in range(STAGES)) for _ in range(N)]  # independent
+shared = [random.random() < P_SLOW for _ in range(N)]          # one shared GPU pool slows every stage at once
+corr = [sum(stage(s) for _ in range(STAGES)) for s in shared]
+print(f"end-to-end p99: independent {p(indep, .99):,.0f} ms, correlated {p(corr, .99):,.0f} ms")
+# independent ~2,130 ms (tails rarely coincide); correlated ~6,000 ms, the sum of four 1,500 ms p99s
 ```
 
 ## Production patterns

@@ -512,23 +512,15 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair, LLMUserAggregatorParams)
-from pipecat.runner.types import RunnerArguments
-from pipecat.runner.utils import create_transport
+from pipecat.processors.aggregators.llm_response_universal import LLMUserAggregatorParams
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
-from pipecat.transports.base_transport import TransportParams
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
-from pipecat.workers.runner import WorkerRunner
 import booking_bot as lab                       # tools, tuning and observer from the lab
 
-def make_processors():
+def make_processors():                          # only these change; the lab's knobs stay
     stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
     llm = OpenAILLMService(api_key=os.environ["OPENAI_API_KEY"],
                            settings=OpenAILLMService.Settings(model=os.environ["OPENAI_MODEL"]))
@@ -536,25 +528,35 @@ def make_processors():
                              settings=CartesiaTTSService.Settings(voice=os.environ["CARTESIA_VOICE_ID"]))
     for name in ("check_availability", "book_slot"):
         llm.register_function(name, getattr(lab, name))
-    context = LLMContext(messages=[{"role": "system", "content": "You book clinic appointments. "
-        "Speak in one or two short sentences. Read the slot back and get a yes before booking."}],
-        tools=lab.TOOLS)
-    user_agg, assistant_agg = LLMContextAggregatorPair(context, user_params=LLMUserAggregatorParams(
+    user_params = LLMUserAggregatorParams(
         vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=lab.VAD_STOP_SECS)),
         user_turn_strategies=UserTurnStrategies(stop=[TurnAnalyzerUserTurnStopStrategy(
-            turn_analyzer=LocalSmartTurnAnalyzerV3(
-                params=SmartTurnParams(stop_secs=lab.SMART_TURN_STOP_SECS)))])))
-    return stt, user_agg, llm, tts, assistant_agg
+            turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams(stop_secs=lab.SMART_TURN_STOP_SECS)))]))
+    return stt, llm, tts, user_params
+```
 
-async def bot(runner_args: RunnerArguments):
+The rest of `bot_live.py` wires them in the lab's order, with a WebRTC transport in place of the
+fake caller and speaker. Run it with `python bot_live.py` and open the printed URL.
+
+```python
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineWorker
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.runner.utils import create_transport
+from pipecat.transports.base_transport import TransportParams
+from pipecat.workers.runner import WorkerRunner
+
+async def bot(runner_args):                     # called by Pipecat's runner for each session
     transport = await create_transport(runner_args, {"webrtc": lambda: TransportParams(
         audio_in_enabled=True, audio_out_enabled=True)})
-    stt, user_agg, llm, tts, assistant_agg = make_processors()
+    stt, llm, tts, user_params = make_processors()
+    context = LLMContext(messages=[{"role": "system", "content": "You book clinic appointments. "
+        "Speak in short sentences. Read the slot back and get a yes before booking."}], tools=lab.TOOLS)
+    user_agg, assistant_agg = LLMContextAggregatorPair(context, user_params=user_params)
     pipeline = Pipeline([transport.input(), stt, user_agg, llm, tts, transport.output(), assistant_agg])
-    worker = PipelineWorker(pipeline, observers=[lab.LatencyObserver()],
-                            params=PipelineParams(enable_metrics=True))
     runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
-    await runner.add_workers(worker)
+    await runner.add_workers(PipelineWorker(pipeline, observers=[lab.LatencyObserver()]))
     await runner.run()
 
 if __name__ == "__main__":

@@ -174,57 +174,32 @@ flowchart TD
 ## Examples
 ### Criteria for support-ticket triage, as checks
 Each check returns the criterion name, a pass flag and a severity. The gate blocks on any hard failure
-and on soft pass rates below their floors, overall and per category.
+and on a soft pass rate below its floor; a real gate also applies the floor per category slice.
 
 ```python
 import json, re
-from collections import defaultdict
 
 ALLOWED = {"billing", "refund", "shipping", "cancel", "other"}
 # crude on purpose: also flags ISO dates and long order ids; use a real PII detector in production
 PII = re.compile(r"\b[\w.+-]+@[\w-]+\.\w+\b|\b\+?\d[\d\s().-]{8,}\d\b")
 
-def checks(ticket: dict, raw_output: str, label: dict):
-    try:
-        out = json.loads(raw_output)
-    except json.JSONDecodeError:
-        out = None
-    yield ("valid_json", isinstance(out, dict), "hard")   # a bare string or list is not a valid record
-    if not isinstance(out, dict): return                  # generator: report the failure, then stop
-    yield ("category_in_set", out.get("category") in ALLOWED, "hard")
-    yield ("no_pii_in_summary", not PII.search(out.get("summary", "")), "hard")
-    yield ("summary_max_40_words", len(out.get("summary", "").split()) <= 40, "soft")
-    yield ("outage_is_p1", out.get("priority") == "P1" if "outage" in ticket["text"].lower() else True, "hard")
-    yield ("category_correct", out.get("category") == label["category"], "soft")
-    yield ("priority_correct", out.get("priority") == label["priority"], "soft")
+def checks(raw_output, label):                   # -> [(name, passed, severity)]
+    out = json.loads(raw_output)
+    return [("category_in_set", out["category"] in ALLOWED, "hard"),
+            ("no_pii_in_summary", not PII.search(out["summary"]), "hard"),
+            ("category_correct", out["category"] == label, "soft")]
 
-FLOORS = {"category_correct": 0.90, "priority_correct": 0.85, "summary_max_40_words": 0.95}
-SLICE_FLOOR_DISCOUNT = 0.05            # each category may sit up to 5 points under the overall floor
+def gate(rows, floor=0.90):
+    hard_fail = [name for r in rows for name, ok, sev in r if sev == "hard" and not ok]
+    soft = [ok for r in rows for name, ok, sev in r if sev == "soft"]
+    rate = sum(soft) / len(soft)
+    return hard_fail, round(rate, 2), not hard_fail and rate >= floor
 
-def gate(results):                     # results: [(slice, [(name, passed, severity), ...]), ...]
-    hard_fail, tally = [], defaultdict(lambda: defaultdict(list))
-    for slc, rows in results:
-        for name, ok, sev in rows:
-            if sev == "hard" and not ok: hard_fail.append((slc, name))
-            tally[name]["all"].append(ok); tally[name][slc].append(ok)
-    verdict = {"blocking": hard_fail, "soft": {}}
-    for name, floor in FLOORS.items():
-        for slc, oks in tally[name].items():
-            rate, need = sum(oks) / len(oks), floor - (0 if slc == "all" else SLICE_FLOOR_DISCOUNT)
-            verdict["soft"][f"{name}/{slc}"] = (round(rate, 3), rate >= need)
-    verdict["ship"] = not hard_fail and all(ok for _, ok in verdict["soft"].values())
-    return verdict
-
-# demo: 46 clean tickets, 3 miscategorised, and one whose summary carries an email address
-lab = {"category": "billing", "priority": "P2"}
-ok = json.dumps({"category": "billing", "priority": "P2", "summary": "Customer was charged twice"})
-wrong = json.dumps({"category": "refund", "priority": "P2", "summary": "Customer was charged twice"})
-bad = json.dumps({"category": "billing", "priority": "P2", "summary": "Reply to ann@example.com"})
-t = {"text": "I was charged twice"}
-rows = [list(checks(t, ok, lab))] * 46 + [list(checks(t, wrong, lab))] * 3 + [list(checks(t, bad, lab))]
-v = gate([("billing", r) for r in rows])
-print(v["blocking"], v["soft"]["category_correct/all"], v["ship"])
-# [('billing', 'no_pii_in_summary')] (0.94, True) False
+ok = '{"category": "billing", "summary": "Customer was charged twice"}'
+wrong = '{"category": "refund", "summary": "Customer was charged twice"}'
+leak = '{"category": "billing", "summary": "Reply to ann@example.com"}'
+rows = [checks(ok, "billing")] * 46 + [checks(wrong, "billing")] * 3 + [checks(leak, "billing")]
+print(gate(rows))   # (['no_pii_in_summary'], 0.94, False)
 ```
 
 - **Intended behaviour:** a single ticket whose summary contains an email address blocks the release
@@ -250,7 +225,8 @@ release run on 250 golden tasks, each run 3 times (750 runs).
   `lookup_order` result for that order id exists in the current run's state.
 
 ### What can a clean run actually prove? Sizing hard criteria and slice floors
-Pure Python; the numbers below match the statistical facts above.
+Pure Python; the numbers below match the statistical facts above. The exact (Clopper-Pearson) bound for
+0 of *n*, 1 − 0.05^(1/*n*), gives 0.99% at *n* = 300, so the rule of three is a close shortcut.
 
 ```python
 import math
@@ -258,24 +234,16 @@ import math
 def zero_violation_upper(n):              # rule of three: 95% upper bound when 0 of n items violate
     return 3 / n
 
-def exact_upper(n, conf=0.95):            # exact (Clopper-Pearson) bound for 0 of n: 1 - (1-conf)^(1/n)
-    return 1 - (1 - conf) ** (1 / n)
-
 def half_width(p, n, z=1.96):             # normal-approximation 95% half-width of a slice pass rate
     return z * math.sqrt(p * (1 - p) / n)
 
 def items_for(p, hw, z=1.96):             # slice size needed for a given half-width
     return math.ceil(z * z * p * (1 - p) / hw**2)
 
-print(f"PII clean on 300 items -> leak rate could be up to {zero_violation_upper(300):.1%} "
-      f"(exact {exact_upper(300):.2%})")
-print(f"items to bound a leak rate below 0.1%: {math.ceil(3 / 0.001)}")
-print(f"floor 85% on 40 items: +/-{half_width(0.85, 40):.0%}")
-print(f"items for +/-5 points at 85%: {items_for(0.85, 0.05)}")
-# PII clean on 300 items -> leak rate could be up to 1.0% (exact 0.99%)
-# items to bound a leak rate below 0.1%: 3000
-# floor 85% on 40 items: +/-11%
-# items for +/-5 points at 85%: 196
+print(f"{zero_violation_upper(300):.1%}")   # 1.0%    PII clean on 300 items still allows a 1% leak rate
+print(math.ceil(3 / 0.001))                 # 3000    items to bound a leak rate below 0.1%
+print(f"+/-{half_width(0.85, 40):.0%}")     # +/-11%  noise on an 85% floor with 40 items
+print(items_for(0.85, 0.05))                # 196     items for +/-5 points at 85%
 ```
 
 | Question | Answer | Consequence |
@@ -304,6 +272,11 @@ print(f"items for +/-5 points at 85%: {items_for(0.85, 0.05)}")
   and the hard criteria (lookup before write, amount limits, allowed recipients) inside the tool
   handler before it executes, and return a clear error to the agent on refusal. Monitor refusals per
   tool; a spike after a prompt change is a regression the offline set missed.
+- **Unparseable output is a hard failure.** Check `valid_json` first and require a JSON object (a bare
+  string or list is not a valid record); when it fails, report it and skip the remaining checks for that
+  item rather than crashing the gate.
+- **Per-slice floors with a small discount.** Apply each soft floor overall and per category, letting a
+  slice sit a few points (for example 5) under the overall floor, so one weak category still blocks.
 
 ## Trade-offs
 - **Decomposed criteria vs maintenance.** They make failures actionable and gates precise, but a long

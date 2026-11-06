@@ -321,61 +321,35 @@ flowchart TD
 ```
 
 ## Examples
-### SSE-to-NDJSON proxy with `pipeline`
-A Transform that reframes a provider's SSE stream into newline-delimited JSON for the browser, wired with
-`pipeline` so a client disconnect or upstream error tears down the whole chain.
-
-On client disconnect the `AbortSignal` cancels the upstream `fetch` and closes that connection; most
-providers stop generating when the connection drops, but whether partial output is still billed is
-vendor-specific.
+### SSE-to-NDJSON Transform with `pipeline`
+A Transform that reframes a provider's SSE stream into newline-delimited JSON, wired with `pipeline` so an
+error anywhere tears down the whole chain. The demo splits a multi-byte character across two chunks.
 
 ```ts
-import { Transform, Readable, type TransformCallback } from "node:stream";
+import { Readable, Transform, type TransformCallback } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
-import type { ReadableStream as WebStream } from "node:stream/web";
-import type { IncomingMessage, ServerResponse } from "node:http";
 
-class SseToNdjson extends Transform {
+export class SseToNdjson extends Transform {
   private buf = "";
-  private dec = new StringDecoder("utf8");   // never splits a multi-byte character across chunks
+  private dec = new StringDecoder("utf8");           // never splits a multi-byte character across chunks
   override _transform(chunk: Buffer, _enc: BufferEncoding, cb: TransformCallback) {
-    this.buf += this.dec.write(chunk).replace(/\r\n/g, "\n");   // SSE also allows CRLF
-    let idx: number;
+    this.buf += this.dec.write(chunk);
+    let i: number;
     try {
-      while ((idx = this.buf.indexOf("\n\n")) !== -1) {           // one complete SSE event
-        const event = this.buf.slice(0, idx); this.buf = this.buf.slice(idx + 2);
-        for (const line of event.split("\n")) {
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") continue;                         // stream ends when upstream ends
-          this.push(JSON.stringify({ t: JSON.parse(data).delta ?? "" }) + "\n");
-        }
+      while ((i = this.buf.indexOf("\n\n")) !== -1) {    // one complete SSE event
+        const data = this.buf.slice(0, i).split("\n").find((l) => l.startsWith("data:"))?.slice(5).trim();
+        this.buf = this.buf.slice(i + 2);
+        if (data && data !== "[DONE]") this.push(JSON.stringify({ t: JSON.parse(data).delta }) + "\n");
       }
-    } catch (e) { return cb(e as Error); }  // report parse errors to pipeline instead of throwing
-    cb();                                    // Transform waits for the reader before the next chunk
-  }
-  override _flush(cb: TransformCallback) {  // upstream ended: anything left is an incomplete event
-    this.buf += this.dec.end();
-    cb(this.buf.trim() ? new Error("stream ended mid-event") : null);
+    } catch (e) { return cb(e as Error); }             // hand parse errors to pipeline, never throw
+    cb();                                              // Transform waits for the reader before the next chunk
   }
 }
 
-export async function proxy(req: IncomingMessage, res: ServerResponse) {
-  const ac = new AbortController();
-  res.on("close", () => ac.abort());          // client went away -> stop upstream (no-op if finished)
-  const upstream = await fetch("https://provider.example/v1/stream", {
-    method: "POST", body: JSON.stringify({ prompt: "hi", stream: true }), signal: ac.signal,
-  });
-  if (!upstream.ok || !upstream.body) { res.statusCode = 502; return res.end(); }
-  res.writeHead(200, { "content-type": "application/x-ndjson", "x-accel-buffering": "no" });
-  try {
-    const body = upstream.body as unknown as WebStream<Uint8Array>; // DOM vs node:stream/web typing only
-    await pipeline(Readable.fromWeb(body), new SseToNdjson(), res, { signal: ac.signal });
-  } catch (e) {
-    if (!ac.signal.aborted) console.error("stream failed", e);   // disconnect is normal
-  }
-}
+const sse = Buffer.from('data: {"delta":"caf\u00e9"}\n\ndata: [DONE]\n\n');
+await pipeline(Readable.from([sse.subarray(0, 20), sse.subarray(20)]), new SseToNdjson(), process.stdout);
+// {"t":"café"}   (chunk.toString() per chunk would corrupt the split character)
 ```
 
 ### Agent scenario: streaming a multi-step run to the UI
@@ -386,27 +360,18 @@ disconnect aborts the run (and its model and tool calls) through one signal.
 import { once } from "node:events";
 import type { ServerResponse } from "node:http";
 
-type AgentEvent =
-  | { type: "token"; text: string }
-  | { type: "tool_start"; name: string }
-  | { type: "tool_result"; name: string; ok: boolean }
-  | { type: "done" };
+type AgentEvent = { type: "token"; text: string } | { type: "tool_start"; name: string } | { type: "done" };
 
-export async function streamRun(
-  run: (signal: AbortSignal) => AsyncGenerator<AgentEvent>,
-  res: ServerResponse,
-) {
+export async function streamRun(run: (signal: AbortSignal) => AsyncGenerator<AgentEvent>, res: ServerResponse) {
   const ac = new AbortController();
-  res.on("close", () => ac.abort());            // user left: stop the model and tools
+  res.on("close", () => ac.abort());                   // user left: stop the model and tools
   res.writeHead(200, { "content-type": "application/x-ndjson", "x-accel-buffering": "no" });
   try {
     for await (const ev of run(ac.signal)) {
-      if (!res.write(JSON.stringify(ev) + "\n")) {
-        await once(res, "drain", { signal: ac.signal });   // backpressure; rejects if the client leaves
-      }
+      if (!res.write(JSON.stringify(ev) + "\n")) await once(res, "drain", { signal: ac.signal });
     }
   } catch (e) {
-    if (!ac.signal.aborted) console.error("agent run failed", e);
+    if (!ac.signal.aborted) throw e;                   // a disconnect is normal, anything else is not
   } finally {
     res.end();
   }
@@ -468,6 +433,11 @@ Raw 24 kHz 16-bit mono PCM is 48,000 bytes per second, streamed to mobile client
   over a cap. Alert on the p99 of buffered bytes per stream.
 - **Explicit `highWaterMark` for bulk data.** Set it per stage for audio, file and export streams, then
   compute worst-case memory as stages × threshold × max concurrency and size the container from that.
+- **Parse SSE fully.** The format allows CRLF line endings and multi-line `data:` fields, so normalise
+  `\r\n` and join the `data:` lines of an event; in `_flush`, fail the stream if bytes remain (it ended
+  mid-event). Answer the client with a 502 when the upstream response is not ok.
+- **Billing after abort is vendor-specific.** Aborting the upstream `fetch` closes the connection and most
+  providers stop generating, but check whether partial output is still billed.
 
 ## Trade-offs
 - **Low latency vs whole-output checks.** Streaming gives low time-to-first-token and bounded memory, but you

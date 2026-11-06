@@ -294,57 +294,36 @@ flowchart TD
 ```
 
 ## Examples
-### Agent service split into user, tool and admin routers
-Users start runs; the agent loop calls tool endpoints with a service token; operators manage prompts.
+### Agent service split into tool and admin routers
+The agent loop calls tool endpoints with a service token; operators manage prompts with an admin key.
 Each group is guarded once at the router level.
 
 ```python
-# app/main.py: the agents, tools and admin routers would each live in app/routers/; one file for brevity
+# app/main.py: pip install fastapi httpx
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel
-
-async def require_user(authorization: str = Header()):
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="login required")
 
 async def require_service_token(x_service_token: str = Header()):
     if x_service_token != "token-from-settings":       # illustrative; load from settings
         raise HTTPException(status_code=403, detail="agent runtime only")
-
 async def require_admin(x_api_key: str = Header()):
     if x_api_key != "admin-key-from-settings":         # illustrative; load from settings
         raise HTTPException(status_code=403, detail="admin only")
 
-agents = APIRouter(tags=["agents"], dependencies=[Depends(require_user)])
 tools = APIRouter(tags=["tools"], dependencies=[Depends(require_service_token)])
 admin = APIRouter(tags=["admin"], dependencies=[Depends(require_admin)], include_in_schema=False)
 
-class RunIn(BaseModel):
-    goal: str
-
-@agents.post("/{agent_id}/runs", status_code=202)
-async def start_run(agent_id: str, body: RunIn) -> dict:
-    return {"run_id": "r_123", "agent_id": agent_id}   # hand off to the agent loop
-
-class RefundIn(BaseModel):
-    order_id: str
-    amount_cents: int
-
 @tools.post("/refund")                                  # an action tool: guard matters most here
-async def refund(body: RefundIn) -> dict:
-    return {"ok": True, "order_id": body.order_id}
-
+async def refund(order_id: str) -> dict:
+    return {"ok": True, "order_id": order_id}
 @admin.get("/prompts/active")                           # literal path first
 async def active_prompt() -> dict:
     return {"version": "v14"}
-
 @admin.get("/prompts/{version}")                        # parameterised sibling second
 async def get_prompt(version: str) -> dict:
     return {"version": version}
 
 def create_app() -> FastAPI:
     v1 = APIRouter(prefix="/v1")
-    v1.include_router(agents, prefix="/agents")
     v1.include_router(tools, prefix="/tools")
     v1.include_router(admin, prefix="/admin")
     app = FastAPI(title="agent-api")
@@ -352,9 +331,8 @@ def create_app() -> FastAPI:
     return app
 ```
 
-- `POST /v1/agents/{agent_id}/runs` needs a user token, just as `POST /v1/chat/completions` would in a
-  plain chat service; `POST /v1/tools/refund` only accepts the agent
-  runtime's service token, so a user cannot call the refund tool directly.
+- `POST /v1/tools/refund` only accepts the agent runtime's service token, so a user cannot call the
+  refund tool directly.
 - Every `/v1/admin/...` route requires the header without any admin endpoint mentioning it, and the admin
   group stays out of the OpenAPI document that tool generators read.
 - Swapping the two prompt routes would make `/v1/admin/prompts/active` return version `"active"`, a bug

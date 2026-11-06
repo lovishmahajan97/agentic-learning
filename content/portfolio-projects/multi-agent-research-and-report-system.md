@@ -165,8 +165,8 @@ import anthropic
 client = anthropic.AsyncAnthropic()
 MODEL = "YOUR_MODEL_ID"            # check the current docs; workers may use a cheaper model
 
-async def ask(system: str, user: str, max_tokens: int = 1500) -> str:
-    r = await client.messages.create(model=MODEL, max_tokens=max_tokens, system=system,
+async def ask(system: str, user: str) -> str:
+    r = await client.messages.create(model=MODEL, max_tokens=2000, system=system,
                                      messages=[{"role": "user", "content": user}])
     return r.content[0].text
 
@@ -174,24 +174,18 @@ async def plan(question: str) -> list[dict]:
     out = await ask("Return only JSON: a list of 3-6 objects with 'sub_question' and 'brief'.", question)
     return json.loads(out)[:6]   # cap fan-out in code; production validates the JSON with a schema
 
-async def worker(task: dict) -> dict:
+async def worker(task: dict) -> str:
     # STUB: with no search tool the model invents its "sources"; this only shows the data flow.
-    # Real version: a bounded tool loop with search/fetch tools, a step cap, and claims whose
-    # source and quote come from fetched pages.
-    text = await ask("Research the sub-question. Return JSON: {'claims': [{'text','source','quote'}]}",
-                     json.dumps(task), max_tokens=1200)
-    return {"task": task["sub_question"], **json.loads(text)}
+    return await ask("Research the sub-question. Return JSON: {'claims': [{'text','source','quote'}]}",
+                     json.dumps(task))
 
 async def research(question: str) -> str:
-    tasks = await plan(question)
-    findings = await asyncio.gather(*(worker(t) for t in tasks), return_exceptions=True)
-    good = [f for f in findings if not isinstance(f, Exception)]
-    report = await ask("Write a report. Cite every claim as [source]. Use only the findings given.",
-                       json.dumps({"question": question, "findings": good}), max_tokens=3000)
-    return report
+    findings = await asyncio.gather(*(worker(t) for t in await plan(question)), return_exceptions=True)
+    good = [f for f in findings if not isinstance(f, Exception)]   # one failed worker does not sink the run
+    return await ask("Write a report. Cite every claim as [source]. Use only the findings given.",
+                     json.dumps({"question": question, "findings": good}))
 
-if __name__ == "__main__":
-    print(asyncio.run(research("Compare three open-source vector databases for a 10M-chunk RAG system.")))
+print(asyncio.run(research("Compare three open-source vector databases for a 10M-chunk RAG system.")))
 ```
 
 ### Evals and SLOs to hit
@@ -222,6 +216,8 @@ illustrative.
   no duplicate searches, every claim traced to a worker finding. Run 10 fixed questions per change.
 - **Source hygiene.** Deduplicate URLs across workers, treat fetched pages as untrusted input (strip
   instructions, never let page text change tools or budgets), and log the source list with each report.
+- **Real workers run a bounded tool loop.** Give each worker search and fetch tools and a step cap,
+  and take every claim's source and quote from a fetched page, never from the model's memory.
 
 ## Trade-offs
 - **Multi-agent vs single agent.** Parallel workers cut latency and fit more evidence, but multiply

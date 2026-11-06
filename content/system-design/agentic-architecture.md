@@ -224,83 +224,58 @@ flowchart TD
 
 ## Examples
 ### A minimal runtime that shows the boundaries
-A budget, schema-validated tools with a side-effect flag, an approval gate that interrupts rather than
-blocks, and a checkpoint after every step. `call_model` is whatever model API you use and returns either
-a tool call or a final answer; `validate` is a JSON Schema check.
+One write tool (`issue_refund`), a step budget, a hard cap, an approval gate that interrupts rather than
+blocks, and a checkpoint after every step. `model` is a scripted stand-in for a real model API: it
+returns a tool call or `("final", answer)`. Runs as-is.
 
 ```python
 import json
 
-TOOLS = {   # name -> (input schema, needs_approval(args), implementation(args, idem_key))
-    "search_tickets": ({"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]},
-                       lambda a: False, lambda a, key: tickets.search(a["q"])),
-    "issue_refund":   ({"type": "object", "properties": {"ticket": {"type": "string"},
-                        "amount": {"type": "number", "exclusiveMinimum": 0, "maximum": 5000}},
-                        "required": ["ticket", "amount"]},
-                       lambda a: a["amount"] > 500,          # policy threshold, enforced in code
-                       lambda a, key: payments.refund(a["ticket"], a["amount"], idempotency_key=key)),
-}
-
-def execute(run_id, state, name, args):
-    if name not in TOOLS:
-        return {"error": f"unknown tool {name}"}               # an observation, not a crash
-    schema, needs_approval, fn = TOOLS[name]
-    validate(args, schema)                                     # rejects amount > 5000 outright
-    if needs_approval(args) and not approvals.granted(run_id, name, args):
-        return "PAUSE"
-    try:
-        return fn(args, f"{run_id}:{state['step']}")         # same key on retry -> no double refund
-    except TransientError as e:
-        return {"error": str(e), "retryable": True}           # the model decides: retry or give up
-
-def run(run_id, task, store, max_steps=12, budget_usd=0.50):
-    state = store.load(run_id) or {"messages": [{"role": "user", "content": task}], "step": 0, "cost": 0.0}
-    while state["step"] < max_steps and state["cost"] < budget_usd:
-        if state.get("pending"):                              # resuming after a pause: no new model call
-            msg, name, args = state["pending"]
+def run(run_id, store, model, approved=False, max_steps=12):
+    state = {**store.get(run_id, {"messages": [], "step": 0}), "status": "running"}
+    while state["step"] < max_steps:
+        if "pending" in state:                       # resume: run the approved call, no new model call
+            name, args = state.pop("pending")
         else:
-            reply = call_model(state["messages"], tools=[{"name": n, "schema": t[0]} for n, t in TOOLS.items()])
-            state["cost"] += reply.cost_usd
-            if reply.final is not None:
-                store.save(run_id, {**state, "status": "done", "answer": reply.final}); return reply.final
-            msg, name, args = reply.as_message(), reply.tool_name, reply.tool_args
-        result = execute(run_id, state, name, args)
-        if result == "PAUSE":
-            store.save(run_id, {**state, "status": "awaiting_approval", "pending": [msg, name, args]})
-            return None                                        # interrupt; an approval event re-invokes run()
-        state.pop("pending", None)
-        state["messages"] += [msg, {"role": "tool", "name": name, "content": json.dumps(result)[:4000]}]
+            name, args = model(state["messages"])
+            if name == "final":
+                store[run_id] = {**state, "status": "done"}
+                return args
+        if args["amount"] > 5000:                    # hard cap, like a schema `maximum: 5000`
+            result = {"error": "amount over cap"}    # an observation the model can react to
+        elif args["amount"] > 500 and not approved:  # policy threshold, enforced in code
+            store[run_id] = {**state, "status": "awaiting_approval", "pending": (name, args)}
+            return None                              # interrupt; an approval event re-invokes run()
+        else:                                        # same key on retry -> no double refund
+            result = {"refunded": args["amount"], "idempotency_key": f"{run_id}:{state['step']}"}
+        state["messages"].append({"tool": name, "result": json.dumps(result)})
         state["step"] += 1
-        store.save(run_id, state)                              # checkpoint: a crash here loses nothing
-    store.save(run_id, {**state, "status": "budget_exhausted"})
+        store[run_id] = state                        # checkpoint: a crash here loses nothing
+    store[run_id] = {**state, "status": "budget_exhausted"}
+
+replies = iter([("issue_refund", {"amount": 750}), ("final", "Refunded 750.")])
+store, model = {}, lambda messages: next(replies)
+print(run("r1", store, model), store["r1"]["status"])  # None awaiting_approval
+print(run("r1", store, model, approved=True))          # Refunded 750.
+print(store["r1"]["messages"][0]["result"])            # {"refunded": 750, "idempotency_key": "r1:0"}
 ```
 
 Three boundaries are visible:
-- **Hard cap in the schema.** `maximum: 5000` rejects a larger refund however persuasively the model
-  argued for it.
+- **Hard cap in code.** Above 5000 the call is rejected however persuasively the model argued for it;
+  in production this is a schema `maximum: 5000`, and the rejection goes back as an observation.
 - **Policy threshold in code, gate as interrupt.** Above 500 needs approval. The gate saves the exact
   pending call instead of holding a thread while a human decides; on resume the approved call runs
   without asking the model again, so the human approved precisely what executes.
 - **Idempotency key from run id and step.** A worker that crashes after the refund but before the
   checkpoint re-executes the step without paying twice.
 
-What the sketch leaves out, so you do not copy it as-is:
-- **Validation errors should be observations.** Here `validate` raises and ends the run; in production
-  catch the error and return it like the unknown-tool case, so the model can fix its arguments.
-- **One status covers two caps.** Hitting `max_steps` and hitting `budget_usd` both record
-  `budget_exhausted`; record them separately if you alert on them separately.
-- **Resume leaves a stale status.** The loaded state still says `awaiting_approval` while the resumed run
-  executes; set it back to running when you pop `pending`, and add a rejection path that records the
-  denial as an observation instead of leaving the run paused forever.
-
 ### Walking one run through the runtime
 | Step | What happens | Status after |
 |---|---|---|
-| 0 | `search_tickets` (read-only) runs | running |
-| 1 | model proposes a 750 refund; the predicate fires | `awaiting_approval`, zero further cost |
+| 0 | model proposes a 750 refund; the 500 threshold fires | `awaiting_approval`, zero further cost |
 | — | approver accepts; `run()` is re-invoked | running |
-| 1 (resume) | refund executes with key `run_id:1`, no new model call | running |
-| 2 | model writes the final answer | `done` |
+| 0 (resume) | refund executes with key `r1:0`, no new model call | running |
+| 1 | model writes the final answer | `done` |
 
 ### Runnable: what offloading tool output saves
 Pure Python, illustrative numbers. Same 12-step run, with raw tool output pasted (1k per step) versus
@@ -338,6 +313,10 @@ for label, growth in [("raw output in context", 1.0), ("artifacts by reference",
 - **Trajectory traces as the eval dataset.** Export every run's step events (tool, arguments, result
   size, terminal state) to a tracing tool such as LangSmith or Langfuse, label failed runs, and replay
   them as regression cases on each prompt, tool or model change. Monitor completion rate per task type.
+- **Errors and denials as observations.** Return unknown tools, schema failures, transient tool errors
+  (flagged retryable) and approval rejections to the model as tool results rather than ending or
+  stalling the run; truncate large tool output (for example to 4,000 characters) before it enters context,
+  and record step-cap and cost-cap exhaustion as separate terminal states.
 
 ## Trade-offs
 - **Flexibility vs predictability.** Flexibility on unknown task paths costs predictability and

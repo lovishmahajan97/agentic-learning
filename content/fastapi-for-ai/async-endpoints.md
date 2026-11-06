@@ -292,9 +292,9 @@ flowchart TD
 
 ## Examples
 ### Agent step: run the model's parallel tool calls concurrently
-When the model returns several tool calls in one turn, run them together. Async tools are awaited, the
-one sync tool is offloaded, a semaphore caps concurrency, and each call gets its own timeout so one slow
-tool cannot hang the run. Failures go back to the model as tool results instead of crashing the step.
+When the model returns several tool calls in one turn, run them together. The async tool is awaited, the
+sync tool is offloaded, a semaphore caps concurrency, and each call gets its own timeout so one slow tool
+cannot hang the run. Failures go back to the model as tool results instead of crashing the step.
 
 ```python
 import asyncio, anyio, httpx
@@ -305,7 +305,7 @@ async def web_search(q: str, client: httpx.AsyncClient) -> str:
     r = await client.get("https://search.example.com", params={"q": q}, timeout=10)
     return r.text[:2000]
 
-def read_local_file(path: str) -> str:           # sync library, no async form
+def read_local_file(path: str) -> str:            # sync library, no async form
     with open(path) as f:
         return f.read()[:2000]
 
@@ -313,12 +313,12 @@ async def run_tool(call: dict, client: httpx.AsyncClient) -> dict:
     async with TOOL_SLOTS:
         try:
             if call["name"] == "web_search":
-                out = await asyncio.wait_for(web_search(call["args"]["q"], client), 15)
-            elif call["name"] == "read_file":       # offload: never block the loop
-                out = await asyncio.wait_for(       # timeout frees the step, not the thread
-                    anyio.to_thread.run_sync(read_local_file, call["args"]["path"]), 15)
+                work = web_search(call["args"]["q"], client)
+            elif call["name"] == "read_file":     # offload the sync tool: never block the loop
+                work = anyio.to_thread.run_sync(read_local_file, call["args"]["path"])
             else:
-                out = f"unknown tool {call['name']}"
+                raise ValueError(f"unknown tool {call['name']}")
+            out = await asyncio.wait_for(work, 15)    # timeout frees the step, not the thread
         except Exception as e:                    # timeout or tool error becomes an observation
             out = f"error: {type(e).__name__}: {e}"
     return {"tool_call_id": call["id"], "content": out}
@@ -337,50 +337,6 @@ The model asks for three tools in one turn (illustrative latencies). A 40-run bu
 | `asyncio.gather` | max(2, 3, 1.5) = 3 s | unaffected |
 | `gather`, but one tool uses `requests` (1.5 s) | 3 s | the loop freezes 1.5 s per call: every stream and health check stalls |
 | `gather`, that tool via `anyio.to_thread.run_sync` | 3 s | unaffected; uses 1 of AnyIO's 40 threads |
-
-### RAG endpoint: offload the reranker, fan out the calls
-The commented-out version blocks the loop twice: a CPU reranker and a sync HTTP call. The live version
-runs the reranker in the thread pool, borrows the shared async client created in lifespan, and fans out
-the completion and a safety classifier so latency is the slower of the two, not their sum.
-
-```python
-import anyio, httpx
-from fastapi import FastAPI, Request
-from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel
-
-app = FastAPI()
-
-class Ask(BaseModel):
-    question: str
-    candidates: list[str]
-
-def rerank_sync(question: str, docs: list[str]) -> list[str]:
-    # stand-in for a CPU/GPU cross-encoder; blocks for the duration of the forward pass
-    return sorted(docs, key=lambda d: -len(set(d.split()) & set(question.split())))
-
-# BAD: both calls hold the event loop; every other request in the process waits.
-# @app.post("/ask")
-# async def ask_blocking(body: Ask):
-#     ranked = rerank_sync(body.question, body.candidates)
-#     r = httpx.post("https://api.example.com/v1/complete", json={"q": body.question, "ctx": ranked[:3]})
-#     return r.json()
-
-@app.post("/ask")
-async def ask(body: Ask, request: Request):
-    client: httpx.AsyncClient = request.app.state.http       # created once in lifespan, with base_url
-    ranked = await run_in_threadpool(rerank_sync, body.question, body.candidates)
-    results = {}
-    async def call(name, path, payload):
-        r = await client.post(path, json=payload, timeout=30)
-        results[name] = r.json()
-    async with anyio.create_task_group() as tg:               # fan out: completion + guardrail
-        tg.start_soon(call, "answer", "/v1/complete", {"q": body.question, "ctx": ranked[:3]})
-        tg.start_soon(call, "safety", "/v1/classify", {"text": body.question})
-    if results["safety"].get("flagged"):
-        return {"answer": None, "reason": "blocked"}
-    return {"answer": results["answer"], "sources": ranked[:3]}
-```
 
 ### Runnable: measure the stall with an event-loop lag probe
 Pure asyncio, no server. Fifty "requests" each do 40 ms of blocking work, once on the loop and once
@@ -407,15 +363,13 @@ async def handler(offload: bool):
 async def run(offload: bool, n: int = 50):
     samples = []
     probe = asyncio.create_task(lag_probe(samples))
-    t0 = time.perf_counter()
     await asyncio.gather(*(handler(offload) for _ in range(n)))
-    elapsed = time.perf_counter() - t0
     await asyncio.sleep(0.15)                 # let the probe take one more sample
     probe.cancel()
-    print(f"offload={offload}: {n} calls in {elapsed:.2f}s, worst loop lag {max(samples):.0f} ms")
+    print(f"offload={offload}: worst loop lag {max(samples):.0f} ms")
 
-asyncio.run(run(offload=False))   # ~2.2 s total, loop lag ~2,000 ms: everything serialised
-asyncio.run(run(offload=True))    # ~0.2 s total, loop lag ~1 ms
+asyncio.run(run(offload=False))   # worst loop lag ~2000 ms: everything serialised
+asyncio.run(run(offload=True))    # worst loop lag ~1 ms
 ```
 
 - **Read the numbers as illustrative.** `time.sleep` releases the GIL, so offloading overlaps perfectly
@@ -441,6 +395,9 @@ asyncio.run(run(offload=True))    # ~0.2 s total, loop lag ~1 ms
 - **Catch blocking calls before production.** Use in CI and staging: enable ruff's flake8-async (`ASYNC`)
   rules to flag blocking calls in `async def`, and run staging with `PYTHONASYNCIODEBUG=1` so asyncio logs
   callbacks slower than `loop.slow_callback_duration` (default 0.1 s).
+- **Offload CPU work, fan out provider calls.** In a RAG endpoint, run a CPU reranker with
+  `await run_in_threadpool(rerank, ...)` and start the completion and a safety classifier together in an
+  `anyio.create_task_group()` on the shared lifespan client, so latency is the slower call, not the sum.
 
 ## Trade-offs
 - **Huge I/O concurrency vs fragility.** `async def` gives huge concurrency per process for I/O-bound

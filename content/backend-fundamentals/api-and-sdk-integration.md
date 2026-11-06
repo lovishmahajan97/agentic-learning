@@ -370,7 +370,7 @@ flowchart TD
 
 ## Examples
 ### A minimal adapter with a total deadline
-Explicit per-phase timeouts, a shared client, an error taxonomy, bounded retries with jitter that honour
+Explicit per-phase timeouts, retryable vs terminal errors, bounded retries with jitter that honour
 `Retry-After`, an idempotency key so a retried `POST` cannot double-execute, and one total deadline the
 retries must fit inside.
 
@@ -382,75 +382,36 @@ retries must fit inside.
   immediately instead of sleeping past the point where the user has given up.
 
 ```python
-import asyncio, os, random
+# pip install httpx   (Python 3.11+ for asyncio.timeout_at)
+import asyncio, random
 import httpx
 
-class RetryableError(Exception):
-    def __init__(self, msg: str, retry_after: float | None = None):
-        super().__init__(msg); self.retry_after = retry_after
-
-class TerminalError(Exception): ...
-
+class RetryableError(Exception): ...                   # args[0] carries the Retry-After header
 TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)   # explicit, per phase
-client = httpx.AsyncClient(base_url="https://api.example-llm.com", timeout=TIMEOUT,
-                           headers={"Authorization": "Bearer " + os.environ["LLM_API_KEY"]})
-
-def classify(r: httpx.Response) -> None:
-    if r.status_code < 400:
-        return
-    if r.status_code == 429 or r.status_code >= 500:
-        ra = r.headers.get("retry-after")
-        raise RetryableError(f"HTTP {r.status_code}", float(ra) if ra and ra.isdigit() else None)
-    raise TerminalError(f"HTTP {r.status_code}: {r.text[:200]}")   # 400/401/403/422: retrying won't help
 
 async def complete(payload: dict, idem_key: str, attempts: int = 3, budget_s: float = 20.0) -> dict:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + budget_s                  # total budget across ALL attempts and sleeps
-    async with asyncio.timeout_at(deadline):           # Python 3.11+; raises TimeoutError at the deadline
+    async with asyncio.timeout_at(deadline):           # raises TimeoutError at the deadline
         for n in range(attempts):
             try:
                 r = await client.post("/v1/complete", json=payload,
                                       headers={"Idempotency-Key": idem_key})   # safe to retry
-                classify(r)
+                if r.status_code == 429 or r.status_code >= 500:
+                    raise RetryableError(r.headers.get("retry-after"))
+                r.raise_for_status()                   # 400/401/403/422: terminal, do not retry
                 return r.json()
-            except (RetryableError, httpx.TimeoutException, httpx.TransportError) as e:
-                hinted = getattr(e, "retry_after", None)
-                delay = hinted if hinted else random.uniform(0, min(8.0, 2 ** n))  # full jitter
+            except (RetryableError, httpx.TransportError) as e:   # TransportError covers timeouts
+                ra = e.args[0] if isinstance(e, RetryableError) else None
+                delay = float(ra) if ra and ra.isdigit() else random.uniform(0, min(8.0, 2 ** n))
                 if n == attempts - 1 or loop.time() + delay >= deadline:
                     raise                              # retrying cannot finish inside the budget
                 await asyncio.sleep(delay)
-    raise RuntimeError("unreachable")
-```
 
-### Turning adapter errors into tool results
-In the agent loop, the tool runner calls the adapter with the step's share of the run budget and an
-idempotency key from run id plus step, then decides what the model sees.
-
-```python
-import asyncio
-import httpx
-
-class StopRun(Exception): ...                         # credentials or policy: a human must act
-
-async def run_tool(tool, args: dict, run_id: str, step: int, run_deadline: float) -> dict:
-    loop = asyncio.get_running_loop()
-    remaining = run_deadline - loop.time()
-    if remaining <= 1.0:
-        return {"error": "run budget exhausted; answer with what you have"}
-    key = f"{run_id}:{step}:{tool.name}"              # same key if this step is replayed
-    try:
-        async with asyncio.timeout(min(remaining, tool.max_s)):
-            return {"ok": await tool.call(args, idem_key=key)}   # adapter retries inside
-    except TimeoutError:
-        return {"error": f"{tool.name} timed out; do not repeat the same call"}
-    except TerminalError as e:
-        msg = str(e)
-        if msg.startswith(("HTTP 401", "HTTP 403")):
-            raise StopRun(msg)                         # never let the model loop on auth errors
-        return {"error": msg[:300]}                    # 400/404/422: the model can fix its arguments
-    except (RetryableError, httpx.TransportError) as e:  # adapter exhausted retries (it re-raises
-        # the last error, which may be an httpx timeout or connection error, not RetryableError)
-        return {"error": f"{tool.name} unavailable ({type(e).__name__}: {e}); try another approach"}
+codes = iter([503, 200])                               # fake provider: one 503, then success
+fake = httpx.MockTransport(lambda req: httpx.Response(next(codes), json={"text": "hi"}))
+client = httpx.AsyncClient(base_url="https://api.example-llm.com", timeout=TIMEOUT, transport=fake)
+print(asyncio.run(complete({"prompt": "hi"}, "run_7:3")))   # {'text': 'hi'} after one retry
 ```
 
 ### A circuit breaker in front of the adapter
@@ -461,15 +422,12 @@ cool-down they probe again, and one failed probe re-opens it.
 import time
 
 class CircuitBreaker:
-    """Open after `threshold` consecutive failures; after `cooldown_s`, let calls probe again."""
     def __init__(self, threshold: int = 5, cooldown_s: float = 30.0):
         self.threshold, self.cooldown_s = threshold, cooldown_s
         self.failures, self.opened_at = 0, None
 
-    def allow(self) -> bool:
-        if self.opened_at is None:
-            return True                                   # closed: normal traffic
-        return time.monotonic() - self.opened_at >= self.cooldown_s   # half-open after cool-down
+    def allow(self) -> bool:                              # closed, or half-open after cool-down
+        return self.opened_at is None or time.monotonic() - self.opened_at >= self.cooldown_s
 
     def record(self, ok: bool) -> None:
         if ok:
@@ -484,11 +442,9 @@ for _ in range(3):
     b.record(False)
 print(b.allow())            # False: open, calls fail fast
 time.sleep(0.25)
-print(b.allow())            # True: half-open, calls may probe again
+print(b.allow())            # True: half-open, one probe may go through
 b.record(False)
 print(b.allow())            # False: the probe failed, open again
-time.sleep(0.25); b.record(True)
-print(b.allow())            # True: closed
 ```
 
 In the service, check `allow()` before `complete(...)`, call `record(True)` on success and
@@ -534,6 +490,9 @@ Each step is one model call plus one tool call; figures are illustrative.
 - **Fault-injected tests plus a scheduled sandbox contract test.** Mock the transport (for example
   `httpx.MockTransport` or the respx library) to inject 429s, timeouts and truncated streams in CI, and
   run a few live calls against the vendor sandbox on a schedule. Alert when the contract test fails.
+- **Map adapter errors to tool results.** Give each tool call an idempotency key of run id, step and
+  tool name; turn a timeout into "timed out, do not repeat the same call", return 400/404/422 text to
+  the model so it can fix its arguments, and stop the run on 401/403 so the model never loops on auth.
 
 ## Trade-offs
 - **SDK convenience vs control.** An SDK saves weeks of client code and tracks API changes, but chooses

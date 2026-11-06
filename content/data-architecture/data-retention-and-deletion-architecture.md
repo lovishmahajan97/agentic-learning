@@ -247,11 +247,10 @@ them and regenerates shared ones from what remains; the `summarize` call is a st
 ```python
 memories = {
     "m1": {"subjects": {"u42"}, "sources": ["conv-1"], "text": "u42 prefers email, order 991."},
-    "m2": {"subjects": {"u42", "u7"}, "sources": ["conv-2", "conv-3"],
-           "text": "Team call: u42 and u7 agreed the launch slips a week."},
+    "m2": {"subjects": {"u42", "u7"}, "sources": ["conv-2", "conv-3"], "text": "u42 and u7: launch slips."},
     "m3": {"subjects": {"u7"}, "sources": ["conv-4"], "text": "u7 works in Berlin."},
 }
-conversations = {"conv-2": {"subject": "u42"}, "conv-3": {"subject": "u7"}}
+conv_subject = {"conv-1": "u42", "conv-2": "u42", "conv-3": "u7", "conv-4": "u7"}
 
 def summarize(conv_ids: list[str]) -> str:          # stand-in for an LLM regeneration call
     return f"regenerated from {conv_ids}"
@@ -261,7 +260,7 @@ def forget(subject: str) -> dict:
     for mid, m in list(memories.items()):
         if subject not in m["subjects"]:
             continue
-        remaining = [c for c in m["sources"] if conversations.get(c, {}).get("subject") != subject]
+        remaining = [c for c in m["sources"] if conv_subject[c] != subject]
         if m["subjects"] == {subject} or not remaining:
             del memories[mid]; report["deleted"].append(mid)
         else:                                       # shared memory: rebuild without the subject
@@ -276,55 +275,34 @@ print(forget("u42"))   # {'deleted': ['m1'], 'regenerated': ['m2'], 'verified': 
 The same pattern applies to checkpoints of in-flight agent runs: key them by subject, and either finish and
 purge the run or delete its state as part of the erasure job.
 
-### A deletion orchestrator with retries, verification and receipts
-It fans out over registered stores, retries, verifies, and produces a receipt. Stores are small stand-ins;
-the shape of the job is what matters.
+### A deletion job with verification, a keyed tombstone and a receipt
+It fans out over registered stores, verifies each delete by re-reading, writes a keyed tombstone and
+returns a receipt. Stores are plain dicts; the shape of the job is what matters.
 
 ```python
-import hashlib, hmac, time
-from dataclasses import dataclass, field
+import hashlib, hmac
 
-TOMB_KEY = b"from-a-secret-store"                       # tombstones must not hold the raw id
+TOMB_KEY = b"from-a-secret-store"                   # tombstones must not hold the raw id
 def tomb_id(subject): return hmac.new(TOMB_KEY, subject.encode(), hashlib.sha256).hexdigest()
 
-@dataclass
-class Store:
-    name: str
-    rows: dict = field(default_factory=dict)           # id -> {"subject": ..., ...}
-    flaky: int = 0                                     # simulate transient failures
-    def find(self, subject):
-        return [i for i, r in self.rows.items() if r["subject"] == subject]
-    def delete(self, ids):
-        if self.flaky: self.flaky -= 1; raise ConnectionError(self.name)
-        for i in ids: self.rows.pop(i, None)
-
-class KeyVault(Store):                                  # crypto-shredding for backups
-    def find(self, subject): return [subject] if subject in self.rows else []
-
-def erase(subject: str, stores: list[Store], tombstones: set, max_tries=3) -> dict:
+def erase(subject: str, stores: dict[str, dict], tombstones: set) -> dict:
     receipt = {"subject_ref": tomb_id(subject)[:16], "stores": {}, "complete": True}
-    for s in stores:
-        ids = s.find(subject)
-        for attempt in range(1, max_tries + 1):
-            try:
-                s.delete(ids); break
-            except ConnectionError:
-                time.sleep(0)                           # backoff in real code
-        remaining = s.find(subject)
-        ok = not remaining
-        receipt["stores"][s.name] = {"found": len(ids), "verified": ok, "attempts": attempt}
+    for name, rows in stores.items():
+        ids = [i for i, r in rows.items() if r["subject"] == subject]
+        for i in ids:
+            rows.pop(i, None)                        # idempotent: a rerun is safe
+        ok = not any(r["subject"] == subject for r in rows.values())   # verify by re-reading
+        receipt["stores"][name] = {"found": len(ids), "verified": ok}
         receipt["complete"] &= ok
-    tombstones.add(tomb_id(subject))                    # blocks re-ingestion from live sources
-    receipt["tombstone"] = tomb_id(subject) in tombstones
+    tombstones.add(tomb_id(subject))                # ingestion skips records whose tomb_id is here
     return receipt
 
-app_db   = Store("app_db",   {"m1": {"subject": "u42", "text": "order 991"}, "m2": {"subject": "u7"}})
-vectors  = Store("vectors",  {"c1": {"subject": "u42", "doc": "m1"}}, flaky=1)
-cache    = Store("sem_cache",{"k9": {"subject": "u42"}})
-backups  = KeyVault("backup_keys", {"u42": {"subject": "u42", "key": "..."}})
+stores = {"app_db": {"m1": {"subject": "u42"}, "m2": {"subject": "u7"}},
+          "vectors": {"c1": {"subject": "u42"}}, "sem_cache": {"k9": {"subject": "u42"}}}
 tomb = set()
-print(erase("u42", [app_db, vectors, cache, backups], tomb))
-# ingestion computes tomb_id(subject) and skips any record whose id is in `tomb`
+r = erase("u42", stores, tomb)
+print(r["complete"], r["stores"]["vectors"], tomb_id("u42") in tomb)
+# True {'found': 1, 'verified': True} True
 ```
 
 The `complete` flag is what an audit reads; a `False` means the job must be rerun or escalated, never
@@ -392,6 +370,10 @@ Object storage enforces the trace-export TTL mechanically, so nobody has to reme
 - **Quarterly deletion drill.** Use for every regulated deployment. Erase a synthetic test subject seeded into
   every store, including agent memory and checkpoints, and require a `complete: True` receipt within the
   target time. Monitor request-to-verified completion time.
+- **Retries and crypto-shredding in the erasure job.** Retry each store's delete on transient errors (for
+  example 3 attempts with backoff) and record the attempt count per store in the receipt; for backups,
+  delete the subject's key in the key vault instead of rows, and load the tombstone HMAC key from a
+  secret store.
 
 ## Trade-offs
 - **Easy deadlines vs debugging window.** Short TTLs on traces and caches make deletion deadlines trivial but

@@ -217,7 +217,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response
 
 state = {"model": None, "in_flight": 0}
-MAX_IN_FLIGHT = 32                       # illustrative per-replica concurrency budget
 
 async def load_model():
     await asyncio.sleep(5)               # stand-in; real blocking loads go in asyncio.to_thread
@@ -225,29 +224,23 @@ async def load_model():
 
 @asynccontextmanager
 async def lifespan(app):
-    task = asyncio.create_task(load_model())   # load in background so probes answer meanwhile
+    state["loader"] = asyncio.create_task(load_model())  # background, so probes answer meanwhile
     yield
-    task.cancel()
 
 app = FastAPI(lifespan=lifespan)
-
 @app.get("/livez")                      # restart only if the process itself is stuck
 async def livez():
     return {"ok": True}                 # reaching this handler proves the event loop runs
 
 @app.get("/startupz")                   # gates liveness and readiness until the model is loaded
 async def startupz(resp: Response):
-    if state["model"] is None:
-        resp.status_code = 503
-    return {"model_loaded": state["model"] is not None}
+    resp.status_code = 200 if state["model"] else 503
 
 @app.get("/readyz")                     # route traffic here only if a request would succeed now
 async def readyz(resp: Response):
-    reasons = []
-    if state["model"] is None: reasons.append("model not loaded")
-    if state["in_flight"] >= MAX_IN_FLIGHT: reasons.append("at capacity")
-    if reasons:
-        resp.status_code = 503
+    reasons = (["model not loaded"] if state["model"] is None else []) + \
+              (["at capacity"] if state["in_flight"] >= 32 else [])   # illustrative budget
+    resp.status_code = 503 if reasons else 200
     return {"ready": not reasons, "reasons": reasons}
 ```
 
@@ -268,28 +261,18 @@ spec:
   containers:
     - name: assistant
       image: registry.example.internal/assistant:1.4.2
-      ports:
-        - containerPort: 8000
       startupProbe:
         httpGet: { path: /startupz, port: 8000 }
-        periodSeconds: 10
-        failureThreshold: 30              # 300 s window, above the 4-minute worst case
+        failureThreshold: 30              # x default periodSeconds 10 = 300 s, above the 4-min worst case
       livenessProbe:
         httpGet: { path: /livez, port: 8000 }
-        periodSeconds: 10
         failureThreshold: 3               # about 30 s of hang before restart
-        timeoutSeconds: 2
       readinessProbe:
         httpGet: { path: /readyz, port: 8000 }
         periodSeconds: 5
         failureThreshold: 2               # about 10 s before routing away
-        successThreshold: 1
       lifecycle:
-        preStop:
-          exec:
-            command: ["sleep", "10"]      # let endpoint removal propagate before SIGTERM
-            # exec needs a sleep binary in the image (distroless has none); Kubernetes 1.30+
-            # also offers the built-in handler  preStop: { sleep: { seconds: 10 } }
+        preStop: { sleep: { seconds: 10 } }   # let endpoint removal propagate before SIGTERM
 ```
 
 ### A golden agent task as a synthetic check
@@ -298,25 +281,19 @@ asserts on the answer and the path. The endpoint and response fields are those o
 the ones here are illustrative.
 
 ```python
-import time, httpx
-
-GOLDEN = {"task": "What is the excess on policy P-1001 for water damage?"}
+import httpx
 
 def synthetic_check(base_url, token):
-    t0 = time.monotonic()
-    r = httpx.post(f"{base_url}/v1/agent/runs", json=GOLDEN,
-                   headers={"Authorization": f"Bearer {token}"}, timeout=60)
-    took = time.monotonic() - t0
-    r.raise_for_status()
-    run = r.json()                                   # {"answer", "citations", "tool_calls"}
+    r = httpx.post(f"{base_url}/v1/agent/runs", timeout=60,
+                   json={"task": "What is the excess on policy P-1001 for water damage?"},
+                   headers={"Authorization": f"Bearer {token}"})
+    run = r.raise_for_status().json()                # {"answer", "citations", "tool_calls"}
     tools = [c["tool"] for c in run["tool_calls"]]
-    failures = []
-    if "lookup_policy" not in tools: failures.append("expected tool not called")
-    if "doc-P-1001" not in run["citations"]: failures.append("expected document not cited")
-    if len(tools) > 6: failures.append(f"{len(tools)} tool calls, budget 6")
-    if any(t.startswith("update_") for t in tools): failures.append("write tool on read-only task")
-    if took > 20: failures.append(f"slow: {took:.1f}s")
-    return failures                                  # empty list = pass; alert after 2 in a row
+    checks = {"expected tool not called": "lookup_policy" not in tools,
+              "expected document not cited": "doc-P-1001" not in run["citations"],
+              f"{len(tools)} tool calls, budget 6": len(tools) > 6,
+              "write tool on read-only task": any(t.startswith("update_") for t in tools)}
+    return [msg for msg, failed in checks.items() if failed]   # empty = pass; alert after 2 in a row
 ```
 
 - **Every probe can be green while this fails:** an expired credential to the policy system, a renamed tool
@@ -348,6 +325,10 @@ def synthetic_check(base_url, token):
 - **Capacity-aware readiness with autoscaling.** Fail readiness at a per-replica in-flight budget, and
   pair it with a horizontal autoscaler and a front-door rate limit so the fleet never reaches zero ready
   endpoints. Monitor the fraction of replicas reporting "at capacity".
+- **Probe details worth setting explicitly.** Give liveness a `timeoutSeconds` (for example 2) so a slow
+  handler fails fast. The built-in `preStop: { sleep: ... }` handler needs Kubernetes 1.30+; on older
+  clusters use `exec: { command: ["sleep", "10"] }`, which needs a `sleep` binary in the image (distroless
+  has none). Give the golden task a latency bound (for example 20 s) as well as its answer assertions.
 
 ## Trade-offs
 - **Detection vs coupling.** Deep readiness checks catch more broken instances but couple every replica to

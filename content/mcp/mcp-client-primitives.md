@@ -317,7 +317,7 @@ Tested with the Python SDK 1.x (`mcp>=1.10,<2`), which uses handshake-era server
 return an `InputRequiredResult` yourself, so check the migration guide.
 
 ```python
-# deploy_server.py
+# deploy_server.py  (pip install "mcp>=1.10,<2")
 from pydantic import BaseModel
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import SamplingMessage, TextContent
@@ -332,18 +332,14 @@ class Confirm(BaseModel):
 async def release_notes_and_deploy(service: str, ctx: Context) -> str:
     """Summarize changes for `service` and deploy it after the user confirms."""
     roots = await ctx.session.list_roots()                            # roots: where may I look?
-    repo = str(roots.roots[0].uri) if roots.roots else "unknown"
     answer = await ctx.elicit(f"Deploy {service}?", schema=Confirm)   # elicitation: ask the user
     if answer.action != "accept" or not answer.data.confirm:
         return f"Not deployed ({answer.action})."
-    msg = await ctx.session.create_message(                           # sampling: host's LLM
-        messages=[SamplingMessage(role="user", content=TextContent(
-            type="text", text=f"Write one-line release notes for {service}"))],
-        max_tokens=60)
-    return f"Deployed {service} to {answer.data.environment} from {repo}. Notes: {msg.content.text}"
+    msg = await ctx.session.create_message(max_tokens=60, messages=[SamplingMessage(   # sampling: host's LLM
+        role="user", content=TextContent(type="text", text=f"One-line release notes for {service}"))])
+    return f"Deployed {service} to {answer.data.environment} from {roots.roots[0].uri}. Notes: {msg.content.text}"
 
-if __name__ == "__main__":
-    mcp.run()
+mcp.run()
 ```
 
 ```python
@@ -356,7 +352,6 @@ async def on_roots(ctx):
     return types.ListRootsResult(roots=[types.Root(uri="file:///work/payments", name="payments")])
 
 async def on_elicit(ctx, params):           # real host: render a form, user may decline
-    print("ELICIT:", params.message, list(params.requestedSchema["properties"]))
     return types.ElicitResult(action="accept", content={"environment": "staging", "confirm": True})
 
 async def on_sample(ctx, params):           # real host: show the prompt, call its own model
@@ -365,12 +360,11 @@ async def on_sample(ctx, params):           # real host: show the prompt, call i
 
 async def main():
     server = StdioServerParameters(command=sys.executable, args=["deploy_server.py"])
-    async with stdio_client(server) as (r, w), ClientSession(
-            r, w, list_roots_callback=on_roots,
+    async with stdio_client(server) as (r, w), ClientSession(r, w, list_roots_callback=on_roots,
             elicitation_callback=on_elicit, sampling_callback=on_sample) as s:
         await s.initialize()
         res = await s.call_tool("release_notes_and_deploy", {"service": "refunds"})
-        print(res.content[0].text)  # Deployed refunds to staging from file:///work/payments. ...
+        print(res.content[0].text)  # Deployed refunds to staging from file:///work/payments. Notes: Fix ...
 
 asyncio.run(main())
 ```

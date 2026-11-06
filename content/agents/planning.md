@@ -162,70 +162,56 @@ flowchart TD
 observation.
 
 ```python
-MAX_REPLANS, MAX_STEPS = 3, 20
+MAX_REPLANS = 3     # production also caps total steps (for example 20)
 
 def make_plan(goal, done=(), history=""):
-    finished = [s["goal"] for s in done]
-    return llm_json(f"""Goal: {goal}
-Already completed, do not repeat: {finished or 'none'}
-Previous attempts and failures: {history or 'none'}
-Return JSON: {{"steps":[{{"id":1,"goal":"...","done_when":"...","depends_on":[]}}]}}
-Plan only the remaining work; steps independently verifiable; at most 8.""")["steps"]
-
-def verify(step, observation):
-    return llm_json(f'Step goal: {step["goal"]}\nDone when: {step["done_when"]}\n'
-                    f'Observation: {observation}\nReturn {{"done": true|false, "why": "..."}}')
+    return llm_json(f"Goal: {goal}\nAlready done, do not repeat: {[s['goal'] for s in done]}\n"
+                    f"Failures so far: {history or 'none'}\n"
+                    'Return {"steps":[{"goal":"...","done_when":"..."}]}, at most 8 steps.')["steps"]
 
 def agent(goal):
-    plan, history, used = make_plan(goal), [], 0
+    plan, history = make_plan(goal), []
     for replan in range(MAX_REPLANS + 1):
-        for step in plan:
-            if step.get("status") == "done":
-                continue
-            for attempt in (1, 2):             # retry once: one failure may be transient
-                if used >= MAX_STEPS:
-                    return {"status": "budget_exhausted", "plan": plan}
-                obs = run_step(step, context=[s for s in plan if s.get("status") == "done"])
-                used += 1
-                check = verify(step, obs)
+        for step in [s for s in plan if s.get("status") != "done"]:
+            for attempt in (1, 2):                 # retry once: one failure may be transient
+                obs = run_step(step)
+                check = llm_json(f"Step: {step['goal']}\nDone when: {step['done_when']}\n"
+                                 f'Observation: {obs}\nReturn {{"done": bool, "why": "..."}}')
                 if check["done"]:
-                    step["status"], step["result"] = "done", obs
+                    step["status"] = "done"
                     break
-                history.append(f'step {step["id"]} try {attempt} failed: {check["why"]}')
+                history.append(f"{step['goal']} try {attempt}: {check['why']}")
             if step.get("status") != "done":
-                break                          # failed twice: the plan's premise is suspect
+                break                              # failed twice: the plan's premise is suspect
         else:
-            return {"status": "complete", "plan": plan}
-        if replan == MAX_REPLANS:
-            break                          # no replans left; do not pay for an unused plan
-        done = [s for s in plan if s.get("status") == "done"]
-        plan = done + make_plan(goal, done, "\n".join(history))  # replan only the rest
-    return {"status": "gave_up", "plan": plan, "history": history}
+            return "complete"
+        if replan < MAX_REPLANS:                   # do not pay for a plan you cannot use
+            done = [s for s in plan if s.get("status") == "done"]
+            plan = done + make_plan(goal, done, "\n".join(history))   # replan only the rest
+    return "gave_up"
 ```
 
-Run it offline by appending these scripted stubs, which replay the trace below (tested on Python 3.9 and 3.12).
+Run it offline by appending these scripted stubs, which replay the trace below (Python 3.9+).
 
 ```python
-calls = {"plan": 0, "run": 0}
 FIRST = ["bump dependency", "fix compile errors", "update call sites", "run tests"]
 REPLAN = ["add adapter", "migrate call sites", "run tests"]
-fails_left = {"update call sites": 2}
+calls, fails_left = {"plan": 0, "run": 0}, {"update call sites": 2}
 
 def llm_json(prompt):
     if prompt.startswith("Goal:"):                               # planner
         calls["plan"] += 1
-        goals = FIRST if calls["plan"] == 1 else REPLAN
-        return {"steps": [{"id": g, "goal": g, "done_when": "ok", "depends_on": []} for g in goals]}
-    goal = prompt.split("\n")[0].removeprefix("Step goal: ")     # verifier
+        return {"steps": [{"goal": g, "done_when": "ok"}
+                          for g in (FIRST if calls["plan"] == 1 else REPLAN)]}
+    goal = prompt.split("\n")[0].removeprefix("Step: ")          # verifier
     fails_left[goal] = fails_left.get(goal, 0) - 1
     return {"done": fails_left[goal] < 0, "why": "no direct replacement"}
 
-def run_step(step, context):
+def run_step(step):
     calls["run"] += 1
     return "ok"
 
-result = agent("upgrade the auth library and make the tests pass")
-print(result["status"], calls)   # complete {'plan': 2, 'run': 7}
+print(agent("upgrade the auth library"), calls)   # complete {'plan': 2, 'run': 7}
 ```
 
 The deliberate choices:
@@ -235,7 +221,7 @@ The deliberate choices:
 - **Finished steps are kept across replans *and named to the replanner*,** so it plans only the remaining
   work and nothing verified is redone.
 - **Prefer code checks.** Where `done_when` can be checked by code (a test passes, a row exists), replace
-  the LLM `verify` call with that check; a model judging its own executor's output is the weakest verifier
+  the LLM verifier call with that check; a model judging its own executor's output is the weakest verifier
   available.
 
 ### Trace: "upgrade the auth library and make the tests pass"
@@ -253,41 +239,26 @@ Total: two planner calls and about seven executor calls (1 + 1 + 2 failed tries 
 versus a reactive loop that would likely have kept patching call sites one compile error at a time.
 
 ### Scheduling a structured plan into parallel waves
-Runnable pure Python: because steps carry `depends_on`, code (not the model) decides what can run
-together, and the same data renders the progress header re-injected each turn.
+Runnable pure Python: because steps carry their dependencies, code (not the model) decides which steps
+form a wave that can run in parallel. Steps: 1 bump dependency (done), 2 fix compile errors, 3 update
+docs, 4 migrate call sites, 5 run tests.
 
 ```python
-plan = [
-    {"id": 1, "goal": "bump auth dependency", "depends_on": [], "status": "done"},
-    {"id": 2, "goal": "fix compile errors", "depends_on": [1], "status": "pending"},
-    {"id": 3, "goal": "update docs for new login flow", "depends_on": [1], "status": "pending"},
-    {"id": 4, "goal": "migrate token call sites", "depends_on": [2], "status": "pending"},
-    {"id": 5, "goal": "run test suite", "depends_on": [3, 4], "status": "pending"},
-]
+deps = {2: [1], 3: [1], 4: [2], 5: [3, 4]}   # step -> steps it depends on
+done = {1}
 
-def waves(plan):
-    """Group pending steps into waves; steps in one wave can run in parallel."""
-    done = {s["id"] for s in plan if s["status"] == "done"}
-    pending = {s["id"]: s for s in plan if s["status"] != "done"}
-    out = []
+def waves(deps, done):
+    done, pending, out = set(done), dict(deps), []
     while pending:
-        ready = [i for i, s in pending.items() if set(s["depends_on"]) <= done]
+        ready = sorted(i for i, d in pending.items() if set(d) <= done)
         if not ready:
             raise ValueError(f"cycle or missing dependency among steps {sorted(pending)}")
-        out.append(sorted(ready))
+        out.append(ready)
         done |= set(ready)
-        for i in ready:
-            del pending[i]
+        pending = {i: d for i, d in pending.items() if i not in done}
     return out
 
-print(waves(plan))   # [[2, 3], [4], [5]]
-
-def progress_header(plan):
-    """The block re-injected at the top of every turn so the plan never scrolls away."""
-    marks = {"done": "x", "pending": " ", "failed": "!"}
-    return "\n".join(f"[{marks[s['status']]}] {s['id']}. {s['goal']}" for s in plan)
-
-print(progress_header(plan))
+print(waves(deps, done))   # [[2, 3], [4], [5]]
 ```
 
 ### Worked cost comparison for a 10-step task

@@ -248,31 +248,21 @@ from deltalake import DeltaTable, write_deltalake
 
 path = "s3://ai-lake/silver/chunks"           # or a local directory while developing
 
-batch = pa.table({
-    "chunk_id":   ["c-001", "c-002"],
-    "doc_id":     ["d-1", "d-1"],
-    "doc_version":["9f3a", "9f3a"],
-    "text":       ["Refund window is 30 days.", "Returns need a receipt."],
-    "model_id":   ["emb-v2", "emb-v2"],
-    "embedding":  [[0.01, 0.42, -0.13], [0.33, 0.05, 0.27]],   # real width: hundreds to ~3,000 floats
-})
+batch = pa.table({"chunk_id": ["c-001", "c-002"], "model_id": ["emb-v2", "emb-v2"],
+                  "text": ["Refund window is 30 days.", "Returns need a receipt."],
+                  "embedding": [[0.01, 0.42, -0.13], [0.33, 0.05, 0.27]]})   # real width: hundreds+
 write_deltalake(path, batch, mode="append", partition_by=["model_id"])
 
-# Upsert re-chunked rows: match on chunk_id, update text/embedding, insert new ids.
-dt = DeltaTable(path)
+dt = DeltaTable(path)                          # upsert re-chunked rows by chunk_id
 (dt.merge(source=batch, predicate="t.chunk_id = s.chunk_id", source_alias="s", target_alias="t")
-   .when_matched_update_all()
-   .when_not_matched_insert_all()
-   .execute())
+   .when_matched_update_all().when_not_matched_insert_all().execute())
 
-# Reproducible evaluation: pin the snapshot the eval ran against.
-eval_version = dt.version()
+eval_version = dt.version()                    # pin the snapshot the eval ran against
 frozen = DeltaTable(path, version=eval_version).to_pyarrow_table()
-print(eval_version, frozen.num_rows)
+print(eval_version, frozen.num_rows)           # 1 2
 
-# Maintenance: fold small streaming files into large ones, then expire old files.
-dt.optimize.compact()
-dt.vacuum(retention_hours=168, dry_run=False)
+dt.optimize.compact()                          # fold small streaming files into large ones
+dt.vacuum(retention_hours=168, dry_run=False)  # then delete files only expired versions reference
 ```
 
 **What the log looks like afterwards:**
@@ -297,36 +287,23 @@ Runnable as-is. The table is at version 41. Writer A appends chunks for new docu
 GDPR delete that rewrites three files (one in the simulation); both read version 41 and race for 42.
 
 ```python
-class Log:
-    """A table's commit log: version -> actions. put_if_absent is the one atomic primitive."""
-    def __init__(self, upto):
-        self.entries = {v: {"add": [f"f{v}.parquet"], "remove": []} for v in range(upto + 1)}
-    def put_if_absent(self, version, entry):
-        if version in self.entries:
-            return False
-        self.entries[version] = entry
-        return True
+log = {v: {"add": [f"f{v}.parquet"], "remove": []} for v in range(42)}   # table at version 41
 
-def commit(log, read_version, adds, removes, retries=3):
+def commit(log, read_version, adds, removes):
     v = read_version + 1
-    for _ in range(retries):
-        if log.put_if_absent(v, {"add": adds, "remove": removes}):
-            return v
-        winner = log.entries[v]
-        # Simplified check: real formats also ask whether the winner's added files could hold
-        # rows matching our predicate (via partition values or file statistics).
-        if set(winner["remove"]) & set(removes):
+    while v in log:                                   # put-if-absent failed: another writer won v
+        if set(log[v]["remove"]) & set(removes):      # the winner rewrote a file we rewrote
             raise RuntimeError(f"conflict at v{v}: re-run against the new state")
         v += 1                                        # disjoint change: publish as the next version
-    raise RuntimeError("too many retries")
+    log[v] = {"add": adds, "remove": removes}         # the one atomic step: put-if-absent
+    return v
 
-log = Log(upto=41)                                    # table is at version 41
-print("A:", commit(log, 41, adds=["chunks-new.parquet"], removes=[]))            # A: 42
-print("B:", commit(log, 41, adds=["f7b.parquet"], removes=["f7.parquet"]))       # B: 43
+print("A:", commit(log, 41, adds=["chunks-new.parquet"], removes=[]))        # A: 42
+print("B:", commit(log, 41, adds=["f7b.parquet"], removes=["f7.parquet"]))   # B: 43
 try:
-    commit(log, 41, adds=["f7c.parquet"], removes=["f7.parquet"])                # C rewrote f7 too
+    commit(log, 41, adds=["f7c.parquet"], removes=["f7.parquet"])            # C rewrote f7 too
 except RuntimeError as e:
-    print("C:", e)                                                               # C: conflict at v43
+    print("C:", e)                                                           # C: conflict at v43
 ```
 
 | Step | What happens |
@@ -349,18 +326,15 @@ import pyarrow as pa
 from deltalake import DeltaTable, write_deltalake
 
 traces = "s3://ai-lake/silver/agent_steps"
-
-steps = pa.table({
-    "run_id": ["r-17", "r-17"], "step": [1, 2], "user_id": ["u-42", "u-42"],
-    "tool": ["search_docs", "create_ticket"], "ok": [True, True],
-    "latency_ms": [420, 1310], "date": ["2026-10-01", "2026-10-01"],
-})
+steps = pa.table({"run_id": ["r-17", "r-17"], "step": [1, 2], "user_id": ["u-42", "u-42"],
+                  "tool": ["search_docs", "create_ticket"], "date": ["2026-10-01", "2026-10-01"]})
 write_deltalake(traces, steps, mode="append", partition_by=["date"])   # batch flush, not per step
 
 dt = DeltaTable(traces)
 eval_snapshot = dt.version()            # an offline eval scoring these runs stores this with its results
-
 dt.delete("user_id = 'u-42'")           # commits a new version without the user's rows
+old = DeltaTable(traces, version=eval_snapshot).to_pyarrow_table()
+print(dt.version(), dt.to_pyarrow_table().num_rows, old.num_rows)   # 1 0 2
 # The rows still exist in eval_snapshot until vacuum removes files older than the retention window,
 # so the deletion SLA and the eval-reproducibility window are the same setting.
 ```
@@ -388,6 +362,9 @@ dt.delete("user_id = 'u-42'")           # commits a new version without the user
 - **Batched trace sink for agents.** Agent teams buffer step events (from OpenTelemetry or their own logger)
   and append them to a date-partitioned trace table every few minutes, then compact daily. Monitor append
   lag, small-file count and the share of runs with a complete step sequence.
+- **Bound commit retries.** A writer that loses the race retries a bounded number of times, then fails the
+  job; real conflict checks also use partition values or file statistics to decide whether the winner's
+  added files could hold rows matching the loser's predicate.
 
 ## Trade-offs
 - **Open files vs operations work.** Any engine can read the data without copies, but you now operate

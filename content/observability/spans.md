@@ -356,124 +356,62 @@ stateDiagram-v2
 ```
 
 ## Examples
-### A streaming generation with the OpenTelemetry SDK
-- **Output:** the console exporter prints two spans sharing one `trace_id`. The `generation` span has the
-  root's id as its parent, carries model and usage attributes, and holds a `first_token` event from which
-  TTFT can be derived.
-- **The span stays open across the whole iteration of the stream,** which is why its duration and usage
-  are real.
-- **Attribute names follow the `gen_ai.` conventions;** verify them against the current spec before
-  relying on them.
-- **`start_as_current_span` already records uncaught exceptions** and sets the error status; the explicit
-  handler is there to show the mechanism.
+### A span that lives as long as the stream
+The wrapper is itself a generator, so a web framework can stream its tokens to the client. `start_span`
+does not make the span current, so no context is left attached across `yield`; `finally` ends it even if
+the client disconnects and the generator is closed.
 
 ```python
 import time
-from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, ConsoleSpanExporter
 from opentelemetry.trace import Status, StatusCode
 
 provider = TracerProvider()
 provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))  # demo; Batch in prod
-trace.set_tracer_provider(provider)
-tracer = trace.get_tracer("support-bot")
+tracer = provider.get_tracer("support-bot")
 
-def fake_stream():                        # stand-in for a streaming model call
-    time.sleep(0.15); yield "Your"        # first token after ~150 ms
-    for w in (" order", " shipped."):
-        time.sleep(0.02); yield w
+def fake_stream():                    # stand-in for a streaming model call
+    time.sleep(0.15); yield "Your"    # first token after ~150 ms
+    yield from (" order", " shipped.")
 
-def generate(prompt):
-    with tracer.start_as_current_span("generation") as span:
-        span.set_attribute("gen_ai.request.model", "example-model")
-        span.set_attribute("gen_ai.request.temperature", 0.2)
-        span.set_attribute("app.prompt_ref", "s3://prompts/7f3a")   # by reference, not inline
-        out, first = [], True
-        try:
-            for tok in fake_stream():
-                if first:
-                    span.add_event("first_token"); first = False
-                out.append(tok)
-            span.set_attribute("gen_ai.usage.output_tokens", len(out))  # real code: provider usage
-            span.set_attribute("gen_ai.response.finish_reasons", ["stop"])
-            span.set_status(Status(StatusCode.OK))
-            return "".join(out)
-        except Exception as e:
-            span.record_exception(e)
-            span.set_status(Status(StatusCode.ERROR, str(e)))
-            raise
-
-with tracer.start_as_current_span("chat.turn") as root:
-    root.set_attribute("app.tenant", "acme")
-    print(generate("Where is my order?"))
-```
-
-### Production snippet: a span that lives as long as the stream
-When the caller must receive the iterator (a web framework streaming tokens to the client), make the
-wrapper itself a generator. `start_span` does not make the span current, so no context is left attached
-across `yield`; `finally` ends it even if the client disconnects and the generator is closed.
-
-```python
-from opentelemetry.trace import Status, StatusCode
-
-def traced_stream(tracer, make_stream, model):
-    span = tracer.start_span("generation")         # parent = context current at first next()
+def traced_stream(make_stream, model):
+    span = tracer.start_span("generation")   # parent = context current at first next()
     span.set_attribute("gen_ai.request.model", model)
-    first, n = True, 0
+    n = 0
     try:
         for tok in make_stream():
-            if first:
-                span.add_event("first_token"); first = False
+            if n == 0: span.add_event("first_token")
             n += 1
             yield tok
         span.set_attribute("gen_ai.usage.output_tokens", n)   # real code: provider usage
-        span.set_status(Status(StatusCode.OK))
     except Exception as e:
-        span.record_exception(e)
-        span.set_status(Status(StatusCode.ERROR, str(e)))
-        raise
+        span.record_exception(e); span.set_status(Status(StatusCode.ERROR, str(e))); raise
     finally:
-        span.end()                                  # runs on exhaustion, error or close()
+        span.end()                            # runs on exhaustion, error or close()
+
+with tracer.start_as_current_span("chat.turn"):
+    print("".join(traced_stream(fake_stream, "example-model")))  # Your order shipped. (between 2 JSON spans sharing one trace_id)
 ```
+
+- **Output:** the console exporter prints two spans sharing one `trace_id`. The `generation` span has the
+  root's id as its parent, carries model and usage attributes, and holds a `first_token` event from which
+  TTFT can be derived.
+- **Attribute names follow the `gen_ai.` conventions;** verify them against the current spec before
+  relying on them.
+- **The explicit `except` is needed here** because this span is ended by hand;
+  `start_as_current_span` records uncaught exceptions and sets the error status for you.
+
+### Worked scenario: where the span ends decides what it measures
+The stream above sends its first token after 150 ms and finishes about 155 ms after the call.
 
 | Version | Generation span duration | Usage and first token |
 |---|---|---|
 | Span around the call that returns the stream | a few ms | missing: set after the span ended |
-| `traced_stream` around the iteration | full stream time | recorded |
+| `traced_stream` around the iteration | ~155 ms | recorded, `first_token` at ~150 ms |
 
-### Agent tool span: failure recorded, run continues
-The agent loop catches tool errors and hands them back to the model as an observation. The tool span
-still carries `ERROR`, so per-tool failure rates are real while the step stays `OK`. Uses the `tracer`
-from the first example; `TOOLS` is a stand-in registry.
-
-```python
-import json
-from opentelemetry.trace import Status, StatusCode
-
-def call_tool(tracer, name, args, TOOLS):
-    with tracer.start_as_current_span(f"tool.{name}") as span:   # low-cardinality name
-        span.set_attribute("app.tool.args", json.dumps(args)[:500])   # truncated, not the full payload
-        try:
-            result = TOOLS[name](**args)
-            span.set_attribute("app.tool.result_chars", len(str(result)))
-            span.set_status(Status(StatusCode.OK))
-            return {"ok": True, "content": str(result)}
-        except Exception as e:
-            span.record_exception(e)
-            span.set_status(Status(StatusCode.ERROR, type(e).__name__))
-            return {"ok": False, "content": f"Tool {name} failed: {e}. Fix the arguments or try another tool."}
-
-def agent_step(tracer, step, reply, TOOLS):
-    with tracer.start_as_current_span("agent.step") as span:
-        span.set_attribute("app.agent.iteration", step)
-        span.set_attribute("app.agent.decision", reply["name"])
-        obs = call_tool(tracer, reply["name"], reply["args"], TOOLS)
-        if not obs["ok"]:
-            span.add_event("tool_error_returned_to_model")
-        span.set_status(Status(StatusCode.OK))       # the step itself succeeded
-        return obs
-```
+- **Reading:** a dashboard built on the first version shows a model that answers in a few milliseconds and
+  uses no tokens; only the span around the iteration gives real latency, TTFT and usage.
 
 ## Production patterns
 - **Batch processor, flushed on shutdown.** Use `BatchSpanProcessor` in every service and call
@@ -495,6 +433,10 @@ def agent_step(tracer, step, reply, TOOLS):
   after a prompt change often means the model now passes worse arguments.
 - **Status agreement check.** Periodically compare the count of `status=ERROR` spans per operation with
   your error-rate metric for the same window. Monitor the gap; it reveals missing `set_status` calls.
+- **Tool errors fail the tool span, not the step.** When the agent loop hands a tool error back to the
+  model as an observation, set `ERROR` and the exception type on the `tool.<name>` span, add a
+  `tool_error_returned_to_model` event on the step, and leave the step `OK`, so per-tool failure rates stay
+  real. Truncate arguments on the span (for example to 500 characters).
 
 ## Trade-offs
 - **Fine-grained spans vs overhead.** Precise attribution, but each span costs export bandwidth, storage

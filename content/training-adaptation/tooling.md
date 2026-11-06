@@ -413,7 +413,6 @@ the chat template with its tool schemas. If the rendered text does not show the 
 model's native format, the tuned model will not learn to emit it.
 
 ```python
-import json
 from transformers import AutoTokenizer
 
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
@@ -422,8 +421,7 @@ TOOLS = [{"type": "function", "function": {
     "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
                    "required": ["order_id"]}}}]
 
-row = {"tools": TOOLS, "messages": [
-    {"role": "system", "content": "You are a support agent. Use tools before answering."},
+row = {"tools": TOOLS, "messages": [                  # one JSONL line, from a run that passed your eval
     {"role": "user", "content": "Where is order 8812?"},
     {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {
         "name": "lookup_order", "arguments": {"order_id": "8812"}}}]},
@@ -433,20 +431,14 @@ row = {"tools": TOOLS, "messages": [
 
 text = tok.apply_chat_template(row["messages"], tools=row["tools"], tokenize=False)
 print(text)                                    # inspect: tool schema, tool call, tool result, answer
-# The tool name is already in the schema and 8812 in the user turn, so assert on the rendered
-# call arguments, which only appear if the template emitted the assistant's tool call.
+# 8812 is already in the user turn, so assert on the rendered call arguments instead.
 assert '"order_id": "8812"' in text, "tool call was not rendered"
-
-with open("agent_sft.jsonl", "w") as f:        # keep only runs that passed your agent eval
-    f.write(json.dumps(row) + "\n")
-# Loss should cover the assistant tool call and the final answer; the system, user and tool-result
-# turns are context. Confirm that with the pre-flight label check below.
 ```
 
 ### LoRA SFT with TRL
 A LoRA SFT on reviewed support conversations. The rows carry a `messages` list, so the trainer renders
 them with the model's chat template. The adapter is saved on its own and merged into the bf16 base later
-only if the serving stack needs a single checkpoint. The commented lines show the Unsloth swap-in.
+only if the serving stack needs a single checkpoint.
 
 Checked against trl 1.17.1, peft 0.21.2, transformers 5.22.1 and unsloth 2026.11.2, 2026-11.
 
@@ -459,34 +451,20 @@ from trl import SFTConfig, SFTTrainer
 name = "Qwen/Qwen2.5-1.5B-Instruct"
 tok = AutoTokenizer.from_pretrained(name)
 model = AutoModelForCausalLM.from_pretrained(name, dtype="bfloat16")
-
-# rows: {"messages": [{"role": "user", "content": ...}, {"role": "assistant", "content": ...}]}
-ds = load_dataset("json", data_files="support_chats.jsonl", split="train")
+ds = load_dataset("json", data_files="support_chats.jsonl", split="train")   # rows: {"messages": [...]}
 
 peft_cfg = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, task_type="CAUSAL_LM",
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                                       "gate_proj", "up_proj", "down_proj"])
-
-args = SFTConfig(
-    output_dir="out/support-lora",
-    per_device_train_batch_size=4, gradient_accumulation_steps=4,   # effective batch 16
-    learning_rate=2e-4, num_train_epochs=2, lr_scheduler_type="cosine",
-    warmup_steps=0.03,                   # below 1 is a ratio; transformers <5.15: warmup_ratio=0.03
-    bf16=True, gradient_checkpointing=True, packing=True,
-    max_length=2048,                     # older TRL releases call this max_seq_length
-    assistant_only_loss=True,            # needs a chat template that marks assistant turns;
-    logging_steps=10, save_strategy="epoch",   # otherwise use prompt/completion rows
-)
-trainer = SFTTrainer(model=model, args=args, train_dataset=ds,
-                     processing_class=tok,   # tokenizer= in older TRL releases
+args = SFTConfig(output_dir="out/support-lora",
+                 per_device_train_batch_size=4, gradient_accumulation_steps=4,   # effective batch 16
+                 learning_rate=2e-4, num_train_epochs=2, lr_scheduler_type="cosine",
+                 warmup_steps=0.03, save_strategy="epoch", bf16=True, gradient_checkpointing=True,
+                 packing=True, max_length=2048, assistant_only_loss=True)
+trainer = SFTTrainer(model=model, args=args, train_dataset=ds, processing_class=tok,
                      peft_config=peft_cfg)
 trainer.train()
 trainer.save_model()                     # writes the adapter only
-
-# Unsloth variant (import unsloth before trl and transformers): from unsloth import FastLanguageModel
-# model, tok = FastLanguageModel.from_pretrained(name, max_seq_length=2048, load_in_4bit=True)
-# model = FastLanguageModel.get_peft_model(model, r=16, lora_alpha=32, target_modules=[...])
-# then build SFTTrainer(model=model, ...) with peft_config=None.
 ```
 
 What the trainer does with one row is the part worth verifying by hand:
@@ -554,6 +532,13 @@ print("IGNORED:\n", tok.decode(ids[~trained])[:600])          # system and user 
 - **Evaluate the artifact you ship, inside the agent.** If serving needs one checkpoint, merge into the
   bf16 base (PEFT's `merge_and_unload()`), then re-run the held-out agent eval (task success, tool-call
   validity) on the merged model behind the real serving stack, not just the adapter in a notebook.
+- **Version-sensitive SFTConfig arguments.** `warmup_steps` below 1 is read as a ratio; on transformers
+  older than 5.15 use `warmup_ratio=0.03`. Older TRL releases take `max_seq_length` and `tokenizer=`
+  where current ones take `max_length` and `processing_class=`.
+- **Unsloth swap-in.** Import `unsloth` before `trl` and `transformers`, load with
+  `FastLanguageModel.from_pretrained(name, max_seq_length=2048, load_in_4bit=True)`, wrap with
+  `FastLanguageModel.get_peft_model(model, r=16, lora_alpha=32, target_modules=[...])`, then pass that
+  model to `SFTTrainer` with `peft_config=None`.
 
 ## Trade-offs
 - **TRL: control vs plumbing.** Full control and the newest algorithms first, but you own the plumbing

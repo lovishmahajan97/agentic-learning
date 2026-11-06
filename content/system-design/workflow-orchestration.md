@@ -249,102 +249,44 @@ sequenceDiagram
 ### Temporal: document extraction with a durable approval wait
 Activities carry the side effects and retry policies; the workflow carries only deterministic
 orchestration; the approval wait is a durable signal rather than a blocked thread. `blob_store`, `db` and
-`llm_extract` stand in for your own clients. Both Temporal examples here were run with stub clients in
-`WorkflowEnvironment.start_time_skipping()`, checked against temporalio 1.35.0, 2026-11.
+`llm_extract` stand in for your own clients.
+
+Run with stub clients in `WorkflowEnvironment.start_time_skipping()` against temporalio 1.35.0, 2026-11:
+a confident document returns `"written"`; a low-confidence one waits, then returns `"written"` or
+`"rejected"` depending on the signal.
 
 ```python
-import asyncio
 from datetime import timedelta
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 
 @activity.defn
 async def extract_fields(doc_id: str) -> dict:
-    text = await blob_store.read_text(doc_id)            # large payloads stay out of workflow history
-    return await llm_extract(text)                        # non-deterministic work belongs in an activity
+    return await llm_extract(await blob_store.read_text(doc_id))  # non-deterministic work: an activity
 
 @activity.defn
 async def write_record(doc_id: str, fields: dict) -> None:
-    await db.upsert(key=f"extract:{doc_id}", value=fields)   # idempotent by key: safe to retry
+    await db.upsert(key=f"extract:{doc_id}", value=fields)       # idempotent by key: safe to retry
 
 @workflow.defn
 class DocumentExtraction:
     def __init__(self) -> None:
         self.approved: bool | None = None
-
     @workflow.signal
-    def approve(self, decision: bool) -> None:            # delivered durably whenever it arrives
+    def approve(self, decision: bool) -> None:                   # delivered durably whenever it arrives
         self.approved = decision
-
     @workflow.run
     async def run(self, doc_id: str) -> str:
-        fields = await workflow.execute_activity(
-            extract_fields, doc_id, start_to_close_timeout=timedelta(minutes=5),
-            retry_policy=RetryPolicy(maximum_attempts=4, initial_interval=timedelta(seconds=5)))
-        if fields.get("confidence", 1.0) < 0.8:
-            try:   # durable wait: no worker is held; survives restarts and deploys
-                await workflow.wait_condition(lambda: self.approved is not None, timeout=timedelta(days=3))
-            except asyncio.TimeoutError:
-                return "approval_timed_out"
+        fields = await workflow.execute_activity(extract_fields, doc_id,
+            start_to_close_timeout=timedelta(minutes=5), retry_policy=RetryPolicy(maximum_attempts=4))
+        if fields["confidence"] < 0.8:                           # durable wait: no worker is held
+            await workflow.wait_condition(lambda: self.approved is not None, timeout=timedelta(days=3))
             if not self.approved:
                 return "rejected"
         await workflow.execute_activity(write_record, args=[doc_id, fields],
                                         start_to_close_timeout=timedelta(seconds=30))
         return "written"
-
-# Worker(client, task_queue="extraction", workflows=[DocumentExtraction], activities=[extract_fields, write_record])
 ```
-
-### Temporal: an agent loop as a durable workflow
-Model and tool calls are activities; the step budget and the approval gate are deterministic workflow
-code. `CONSEQUENTIAL`, `llm_step` and `tools.execute` stand in for your own tool registry and clients.
-The Temporal lab (see tool-labs/temporal-durable-agent-lab) builds this loop end to end, with
-time-skipping and replay tests.
-
-```python
-@activity.defn
-async def call_model(messages: list) -> dict:
-    return await llm_step(messages)             # returns {"final": ...} or {"tool", "args", "message"}
-
-@activity.defn
-async def run_tool(name: str, args: dict, idem_key: str) -> dict:
-    return await tools.execute(name, args, idempotency_key=idem_key)   # returns a short summary
-
-@workflow.defn
-class AgentRun:
-    def __init__(self) -> None:
-        self.approved: bool | None = None
-
-    @workflow.signal
-    def approve(self, decision: bool) -> None:
-        self.approved = decision
-
-    @workflow.run
-    async def run(self, task: str) -> str:
-        messages = [{"role": "user", "content": task}]
-        for step in range(12):                                         # step budget: deterministic
-            reply = await workflow.execute_activity(
-                call_model, messages, start_to_close_timeout=timedelta(minutes=2),
-                retry_policy=RetryPolicy(maximum_attempts=3))
-            if reply.get("final"):
-                return reply["final"]
-            if reply["tool"] in CONSEQUENTIAL:                         # approval gate as a durable wait
-                await workflow.wait_condition(lambda: self.approved is not None, timeout=timedelta(days=3))
-                if not self.approved:
-                    return "rejected"
-                self.approved = None
-            key = f"{workflow.info().workflow_id}:{step}"              # same key on every retry
-            result = await workflow.execute_activity(
-                run_tool, args=[reply["tool"], reply["args"], key],
-                start_to_close_timeout=timedelta(minutes=5))
-            messages += [reply["message"], {"role": "tool", "content": result["summary"]}]
-        return "budget_exhausted"
-```
-
-- **History grows with the transcript.** Each `call_model` input carries the whole message list, so keep
-  tool results as short summaries with references, and use continue-as-new for very long runs.
-- **The wait timeout raises `asyncio.TimeoutError`;** catch it as in the extraction example and return a
-  distinct status.
 
 ### Walking one low-confidence document through replay
 The server's history for the run, simplified:
@@ -369,6 +311,17 @@ A fresh worker replays `run` from the top:
 - **The bug the rule prevents.** Had someone put `datetime.now()` in the workflow to stamp the record,
   replay would compute a different value than the original run. The determinism rule and the SDK's
   `workflow.now()` exist to prevent exactly this class of bug.
+
+### Temporal: the agent-loop variant
+The same shape runs an agent; tool-labs/temporal-durable-agent-lab builds it end to end with replay tests.
+- **Activities:** `call_model(messages)` with `RetryPolicy(maximum_attempts=3)`, and
+  `run_tool(name, args, idem_key)` with its own timeout.
+- **Workflow code:** a loop of at most 12 steps; a `"final"` reply ends the run, otherwise it returns
+  `"budget_exhausted"`.
+- **Approval gate:** before a consequential tool, the same `approve` signal and `wait_condition`, then
+  `self.approved = None` for the next gate.
+- **Idempotency:** each tool call is keyed `f"{workflow.info().workflow_id}:{step}"`, identical on every
+  retry.
 
 ### Airflow: an interval-scoped nightly re-embed
 A TaskFlow-style DAG (Airflow 3.x Task SDK imports) where each run touches only its own day, so retries
@@ -423,6 +376,11 @@ reembed_daily()
   derived from their inputs (for example `cache_key_fn=task_input_hash`, or Prefect 3's
   `cache_policy=INPUTS`) and persisted results, so a re-run flow skips finished work. Monitor cache-hit
   rate on retried flow runs. Prefect 3.x; both names checked against prefect 3.9.1, 2026-11.
+- **Short tool summaries in agent-loop history.** Every model-call input carries the whole transcript
+  into history, so store tool results as short summaries with references.
+- **Catch the approval-wait timeout.** `workflow.wait_condition(..., timeout=...)` raises
+  `asyncio.TimeoutError` when the wait expires, which fails the run unless caught; catch it and return a
+  distinct status such as `"approval_timed_out"`.
 
 ## Trade-offs
 - **Airflow's static DAGs vs runtime-shaped graphs.** Predictable scheduling, backfills and a mature

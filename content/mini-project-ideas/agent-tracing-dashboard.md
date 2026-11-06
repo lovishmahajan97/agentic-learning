@@ -265,53 +265,33 @@ flowchart TD
 Runs with only `opentelemetry-sdk`; swap `JsonlExporter()` for `OTLPSpanExporter()` to send to a backend.
 
 ```python
-import json, time
-from opentelemetry import trace
-from opentelemetry.sdk.resources import Resource
+# pip install opentelemetry-sdk   (checked with 1.45.1)
+import json
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter, SpanExportResult
 
 class JsonlExporter(SpanExporter):
     """Writes one JSON line per finished span; the dashboard reads this file."""
-    def __init__(self, path="spans.jsonl"):
-        self.f = open(path, "a")
     def export(self, spans):
-        for s in spans:
-            self.f.write(json.dumps({
-                "trace_id": format(s.context.trace_id, "032x"), "span_id": format(s.context.span_id, "016x"),
-                "parent_id": format(s.parent.span_id, "016x") if s.parent else None,
-                "name": s.name, "start_ns": s.start_time, "end_ns": s.end_time,
-                "status": s.status.status_code.name, "attrs": dict(s.attributes or {})}) + "\n")
-        self.f.flush()
+        with open("spans.jsonl", "a") as f:
+            for s in spans:
+                f.write(json.dumps({"trace_id": format(s.context.trace_id, "032x"), "root": s.parent is None,
+                                    "name": s.name, "ms": (s.end_time - s.start_time) / 1e6,
+                                    "status": s.status.status_code.name, "attrs": dict(s.attributes)}) + "\n")
         return SpanExportResult.SUCCESS
-    def shutdown(self):
-        self.f.close()
 
-provider = TracerProvider(resource=Resource.create({"service.name": "cli-assistant"}))
+provider = TracerProvider()
 provider.add_span_processor(BatchSpanProcessor(JsonlExporter()))
-trace.set_tracer_provider(provider)
-tracer = trace.get_tracer("agent")
+tracer = provider.get_tracer("agent")
 
-def call_model(messages):
-    with tracer.start_as_current_span("chat") as span:
-        span.set_attribute("gen_ai.operation.name", "chat")
-        span.set_attribute("gen_ai.request.model", "your-model-id")
-        time.sleep(0.05)                                  # stand-in for the real API call
-        span.set_attribute("gen_ai.usage.input_tokens", 812)
-        span.set_attribute("gen_ai.usage.output_tokens", 64)
-        return {"tool": "read_file", "args": {"path": "README.md"}}
-
-def run_tool(name, args):
-    with tracer.start_as_current_span(f"execute_tool {name}") as span:
-        span.set_attribute("gen_ai.tool.name", name)
-        return "file contents"
-
-with tracer.start_as_current_span("invoke_agent") as root:
-    root.set_attribute("session.id", "demo-1")
-    step = call_model([])
-    run_tool(step["tool"], step["args"])
-    call_model([])
-provider.shutdown()
+with tracer.start_as_current_span("invoke_agent", attributes={"session.id": "demo-1"}):
+    with tracer.start_as_current_span("chat", attributes={"gen_ai.operation.name": "chat",
+                                                          "gen_ai.usage.input_tokens": 812}):
+        pass                                              # the model call goes here
+    with tracer.start_as_current_span("execute_tool read_file", attributes={"gen_ai.tool.name": "read_file"}):
+        pass                                              # the tool call goes here
+provider.shutdown()                                       # flush the batch before the process exits
+print(sum(1 for _ in open("spans.jsonl")))                # 3 on a fresh file
 ```
 
 ### Dashboard core: per-run and per-tool numbers
@@ -319,20 +299,13 @@ Wrap these tables in Streamlit (`st.dataframe`, `st.bar_chart`) for the visual v
 
 ```python
 import json, pandas as pd
-rows = [json.loads(line) for line in open("spans.jsonl")]
-df = pd.json_normalize(rows)                       # attrs become columns like "attrs.gen_ai.tool.name"
-df["ms"] = (df["end_ns"] - df["start_ns"]) / 1e6
-runs = df[df["parent_id"].isna()].set_index("trace_id")["ms"].rename("run_ms")
-chats = df[df["attrs.gen_ai.operation.name"] == "chat"]
-tokens = chats.groupby("trace_id")[["attrs.gen_ai.usage.input_tokens", "attrs.gen_ai.usage.output_tokens"]].sum()
-steps = chats.groupby("trace_id").size().rename("model_calls")
+df = pd.json_normalize([json.loads(line) for line in open("spans.jsonl")])   # attrs become "attrs.*" columns
+runs = df[df["root"]].set_index("trace_id")["ms"]
+tokens = df.groupby("trace_id")["attrs.gen_ai.usage.input_tokens"].sum()
+print(pd.concat([runs, tokens], axis=1).describe(percentiles=[0.5, 0.95]))  # p50 and p95 per run
 tools = df[df["name"].str.startswith("execute_tool")]
-tool_stats = tools.groupby("attrs.gen_ai.tool.name").agg(calls=("span_id", "count"),
-                                                          p50_ms=("ms", "median"),
-                                                          error_rate=("status", lambda s: (s == "ERROR").mean()))
-per_run = pd.concat([runs, steps, tokens], axis=1)
-print(per_run.describe(percentiles=[0.5, 0.95]).T[["mean", "50%", "95%"]])
-print(tool_stats)
+print(tools.groupby("attrs.gen_ai.tool.name").agg(calls=("ms", "count"), p50_ms=("ms", "median"),
+                                                  error_rate=("status", lambda s: (s == "ERROR").mean())))
 ```
 
 ### Milestone plan with time estimates
@@ -356,6 +329,8 @@ print(tool_stats)
   the dashboard, so price changes do not require re-instrumenting.
 - **Sample by outcome as volume grows.** Keep all error and slow traces and a percentage of the rest (tail-based
   sampling in an OpenTelemetry Collector), so rare failures survive sampling.
+- **Name the service on the provider.** Create the provider with `Resource.create({"service.name": "cli-assistant"})`
+  and record `gen_ai.request.model` and output tokens on each `chat` span, so backends group runs by service and model.
 
 ## Trade-offs
 - **OpenTelemetry vs a vendor SDK.** Raw OpenTelemetry is portable and works with any OTLP backend; Langfuse's or

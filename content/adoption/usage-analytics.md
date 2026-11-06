@@ -234,24 +234,19 @@ illustrative.
 ```python
 from math import sqrt
 
-# Weekly aggregates per agent version from run_finished events (no prompt or tool content).
+# Weekly run_finished aggregates per agent version (no prompt or tool content).
 # completed = finished unaided, edited = finished after user edits, taken_over = user did it by hand.
 weeks = {
     "v3": {"runs": 600, "completed": 390, "edited": 120, "taken_over": 90, "tool_calls": 4_200},
     "v4": {"runs": 600, "completed": 330, "edited": 132, "taken_over": 138, "tool_calls": 5_700},
 }
-
-def diff_se(p1, n1, p2, n2):
-    return sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
-
 for v, w in weeks.items():
-    done = w["completed"] + w["edited"]
-    print(v, f"takeover={w['taken_over'] / w['runs']:.2f}",
-          f"tool_calls_per_completed_task={w['tool_calls'] / done:.1f}")
+    rate = w["taken_over"] / w["runs"]
+    per_task = w["tool_calls"] / (w["completed"] + w["edited"])
+    print(v, f"takeover={rate:.2f} tool_calls_per_completed_task={per_task:.1f}")
 
-p3 = weeks["v3"]["taken_over"] / weeks["v3"]["runs"]
-p4 = weeks["v4"]["taken_over"] / weeks["v4"]["runs"]
-se = diff_se(p3, 600, p4, 600)
+p3, p4, n = 90 / 600, 138 / 600, 600
+se = sqrt(p3 * (1 - p3) / n + p4 * (1 - p4) / n)   # standard error of the difference
 print(f"diff={p4 - p3:.2f} se={se:.3f} z={(p4 - p3) / se:.1f}")
 # v3 takeover=0.15 tool_calls_per_completed_task=8.2
 # v4 takeover=0.23 tool_calls_per_completed_task=12.3
@@ -316,40 +311,22 @@ Reading the two queries together is the point. Illustrative numbers:
 - **Because every team fell,** it is a quality regression to chase in the traces by `request_id`, not an
   adoption problem.
 
-### Client-side edit size and a significance check in Python
-Edit size is computed where both texts exist and only the bucket is emitted; the same file checks
-whether a change in acceptance is bigger than noise.
+### Client-side edit size in Python
+Edit size is computed where both texts exist, and only the bucket is emitted.
 
 ```python
 from difflib import SequenceMatcher
-from math import sqrt
 
 def edit_size(draft, sent):
     return 1 - SequenceMatcher(None, draft, sent).ratio()   # 0 = unchanged, 1 = rewritten
 
 def bucket(x):
-    if x == 0:
-        return "0"
-    if x < 0.10:
-        return "under 10%"
-    if x <= 0.50:
-        return "10-50%"
-    return "over 50%"
-
-def diff_se(p1, n1, p2, n2):
-    return sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
+    return "0" if x == 0 else "under 10%" if x < 0.10 else "10-50%" if x <= 0.50 else "over 50%"
 
 draft = "Thanks for reaching out. Your refund was issued today."
 sent = "Thanks for reaching out! Your refund was issued today and should arrive in 3-5 days."
 x = edit_size(draft, sent)
 print(round(x, 2), bucket(x))             # 0.23 10-50%  (emit the bucket, never the text)
-
-for n in (500, 50):                       # drafts per prompt version
-    se = diff_se(0.42, n, 0.30, n)
-    z = (0.42 - 0.30) / se
-    print(n, round(se, 3), round(z, 1), "real" if abs(z) >= 2 else "unproven")
-# 500 0.03 4.0 real
-# 50 0.095 1.3 unproven
 ```
 
 ## Production patterns

@@ -208,29 +208,25 @@ lists low-confidence words containing digits, so the agent can hedge or verify i
 import pdfplumber, pytesseract
 from pytesseract import Output
 
-def read_document(path: str, pages: list[int] | None = None, min_conf: float = 80.0) -> dict:
+def read_document(path: str, pages: list[int] | None = None, min_conf: float = 80.0) -> list[dict]:
     """Tool: read pages of an uploaded PDF. Returns text per page plus parse-quality flags."""
     out = []
     with pdfplumber.open(path) as pdf:
-        total = len(pdf.pages)
-        wanted = pages or list(range(1, min(total, 10) + 1))            # never dump 300 pages at once
-        for n in (p for p in wanted if 1 <= p <= total):
+        for n in (pages or range(1, len(pdf.pages) + 1))[:10]:   # never dump 300 pages at once
             page = pdf.pages[n - 1]
             text, source, shaky = page.extract_text() or "", "text-layer", []
-            if len(text.strip()) < 50:                                   # scanned page: OCR it
+            if len(text.strip()) < 50:                           # scanned page: OCR it
                 img = page.to_image(resolution=300).original
                 d = pytesseract.image_to_data(img, output_type=Output.DICT)
                 words = [(w, float(c)) for w, c in zip(d["text"], d["conf"]) if w.strip()]
                 text, source = " ".join(w for w, _ in words), "ocr"
                 shaky = [w for w, c in words if c < min_conf and any(ch.isdigit() for ch in w)]
-            out.append({"page": n, "source": source, "text": text[:4000],
-                        "truncated": len(text) > 4000, "low_conf_numbers": shaky})
-    return {"total_pages": total, "pages": out}                         # agent asks for more by range
-
-# Tool description shown to the model (plain words):
-# "Reads pages of the uploaded PDF. If low_conf_numbers is non-empty, do not state those values as
-#  fact: say the scan is unclear or ask the user to confirm."
+            out.append({"page": n, "source": source, "text": text[:4000], "low_conf_numbers": shaky})
+    return out
 ```
+
+The tool description shown to the model says, in plain words: if `low_conf_numbers` is non-empty, do not
+state those values as fact; say the scan is unclear or ask the user to confirm.
 
 | Uploaded 12-page scanned lease (illustrative) | Without flags | With flags |
 |---|---|---|
@@ -247,44 +243,30 @@ placeholders through (see Misconceptions); in production replace it with a quali
 Checked with pdfplumber 0.11.10 and pytesseract 0.3.13 on a generated PDF; the OCR branch needs the
 Tesseract binary installed and was exercised with a stub.
 
-### Per-page parser with OCR fallback and row-wise tables
-Use the text layer when present, fall back to OCR, and serialise tables row by row with their headers.
+### Row-wise tables with their headers
+Serialise each table row with its column headers, so a row read on its own after chunking keeps its
+meaning.
 
 ```python
-import pdfplumber, pytesseract
+import pdfplumber
 
-def parse_pdf(path: str, min_chars: int = 50) -> list[dict]:
+def table_rows(path: str) -> list[dict]:
+    """Serialise each table row with its headers, so a lone row still means something."""
     out = []
     with pdfplumber.open(path) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            source = "text-layer"
-            if len(text.strip()) < min_chars:                 # scanned or empty layer
-                img = page.to_image(resolution=300).original  # PIL image
-                text = pytesseract.image_to_string(img)
-                source = "ocr"
-            out.append({"page": i, "type": "text", "source": source, "text": text})
-            for table in page.extract_tables():             # text layer only: [] on scans
-                if not table:
-                    continue
-                header, *rows = table                         # cells may be None
+            for header, *rows in (t for t in page.extract_tables() if t):  # text layer only
                 for row in rows:
-                    cells = [f"{h or '?'}: {v}" for h, v in zip(header, row) if v]
-                    out.append({"page": i, "type": "table_row", "source": "text-layer",
-                                "text": "; ".join(cells)})
+                    cells = [f"{h or '?'}: {v}" for h, v in zip(header, row) if v]  # cells may be None
+                    out.append({"page": i, "type": "table_row", "text": "; ".join(cells)})
     return out
 
 # A pricing table row becomes:
-# {"page": 4, "type": "table_row", "source": "text-layer",
-#  "text": "Plan: Enterprise; Refund window: 30 days; Seats: Unlimited"}
+# {"page": 4, "type": "table_row", "text": "Plan: Enterprise; Refund window: 30 days; Seats: Unlimited"}
 ```
 
-What this deliberately leaves out, to add once a sample of your real documents shows you need it:
-- **No reordering** of multi-column pages, **no header stripping**, **no merged header cells**.
-- **`extract_tables` only works on text-layer pages.**
-- **Each table is indexed twice:** `extract_text()` already includes the table's cells as a flattened
-  stream. A production version crops table regions out of the page (for example with `page.filter` or
-  `outside_bbox`) before extracting the prose.
+`extract_tables` only works on text-layer pages, and this leaves out merged header cells and tables
+that continue across pages.
 
 ### Measuring OCR damage and text-layer quality
 Runnable with the standard library. It shows why overall CER hides digit errors, and how to reject a
@@ -303,13 +285,10 @@ def cer(ref: str, hyp: str) -> float:
         prev = cur
     return prev[-1] / max(len(ref), 1)
 
-def digits(s: str) -> str:
-    return "".join(ch for ch in s if ch.isdigit())
-
+digits = lambda s: "".join(ch for ch in s if ch.isdigit())
 ref = "Refund window: 30 days for the Enterprise plan, billed annually."
 hyp = "Refund window: 3O days for the Enterprise plan, billed annually."   # OCR read 0 as O
-print(f"CER {cer(ref, hyp):.3f}  digit CER {cer(digits(ref), digits(hyp)):.2f}")
-# CER 0.016  digit CER 0.50  -> looks fine overall, but half the digits are wrong
+print(f"CER {cer(ref, hyp):.3f}  digit CER {cer(digits(ref), digits(hyp)):.2f}")  # CER 0.016  digit CER 0.50
 
 def layer_is_usable(text: str, vocab: set, min_word_share: float = 0.6) -> bool:
     text = unicodedata.normalize("NFKC", text)        # ligature glyphs become plain letters
@@ -319,8 +298,7 @@ def layer_is_usable(text: str, vocab: set, min_word_share: float = 0.6) -> bool:
     return bool(words) and sum(w in vocab for w in words) / len(words) >= min_word_share
 
 vocab = {"refund", "window", "days", "for", "the", "enterprise", "plan", "billed", "annually"}
-print(layer_is_usable(ref, vocab))                                    # True
-print(layer_is_usable("(cid:42)(cid:17)(cid:9)(cid:3) x", vocab))     # False
+print(layer_is_usable(ref, vocab), layer_is_usable("(cid:42)(cid:17)(cid:9)(cid:3) x", vocab))  # True False
 ```
 
 | Measurement on the sample sentence | Value | Reading |
@@ -351,6 +329,9 @@ have labelled by eye.
 - **Parse metadata into agent tool results.** Store `page`, `source` and an OCR-confidence flag on every
   chunk at ingestion and return them from the agent's search tool, so answers cite pages and the agent can
   hedge on scanned content. Monitor how often agents cite OCR-sourced chunks for numeric answers.
+- **Page the read tool.** Return `total_pages`, drop requested page numbers outside the document, and
+  flag text cut at the character cap as truncated, so the agent asks for more pages by range instead of
+  assuming it has read everything.
 
 ## Trade-offs
 - **Text layer vs OCR.** Text-layer extraction is exact, fast and cheap when the font encoding is sound,

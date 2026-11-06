@@ -293,10 +293,7 @@ REGISTRY = {"search_kb": "read", "create_ticket": "write", "route_to_queue": "wr
 class AgentTenantConfig(BaseModel):
     tenant_id: str
     categories: list[str]                              # prompt slot
-    tone: str = "concise and polite"                   # prompt slot
-    queue_map: dict[str, str]                          # category -> destination queue
     enabled_tools: list[str]
-    approval_required: list[str] = Field(default_factory=list)
     max_steps: int = Field(8, ge=1, le=15)             # core sets the hard maximum
     memory_namespace: str                              # tenant-scoped memory and retrieval
 
@@ -305,8 +302,6 @@ class AgentTenantConfig(BaseModel):
         unknown = set(self.enabled_tools) - REGISTRY.keys()
         if unknown:
             raise ValueError(f"unknown tools: {sorted(unknown)}")
-        if set(self.approval_required) - set(self.enabled_tools):
-            raise ValueError("approval rules name tools that are not enabled")
         # exact prefix plus separator, so tenant "acme" cannot claim "acme2:..."
         if not self.memory_namespace.startswith(f"{self.tenant_id}:"):
             raise ValueError("memory namespace must be scoped to the tenant")
@@ -343,6 +338,9 @@ class AgentTenantConfig(BaseModel):
   from tenant config at run start, and have the core refuse any tool call or retrieval outside them.
   Run a cross-tenant isolation test in every release. Monitor refused out-of-scope calls per tenant; any
   non-zero count deserves a look.
+- **Tenant config carries routing and approvals too** — real agent configs also hold a category-to-queue
+  map, a tone slot and a list of tools that need human approval; validate that every approval rule names
+  an enabled tool.
 
 ## Trade-offs
 - **Early productizing vs the wrong seam.** It avoids fork divergence, but with fewer than three examples

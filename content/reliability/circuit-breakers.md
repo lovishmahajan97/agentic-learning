@@ -230,111 +230,76 @@ stateDiagram-v2
 ```
 
 ## Examples
-### A compact asyncio breaker with fallback
-A count-based window, a minimum-calls guard, a capped number of half-open probes, and a fallback at the
-call site. It is single-process; a fleet shares breaker state through a library or a small Redis record,
-but the state machine is the same.
+### A compact asyncio breaker
+A count-based window, a minimum-calls guard, a timeout inside the call, and one trial call in half-open.
+It is single-process; a fleet shares breaker state through a library or a small Redis record, but the
+state machine is the same.
+
+At the call site, catch `CircuitOpen` and go to the fallback: another vendor, a smaller model, or a
+cached reply.
 
 ```python
 import asyncio, collections, time
 
 class CircuitOpen(Exception): pass
-class UpstreamError(Exception): pass          # 5xx / connection-level failures from the provider
-
 class CircuitBreaker:
-    def __init__(self, window=50, min_calls=20, fail_ratio=0.5, reset_after=30.0, probes=3):
-        self.window, self.min_calls, self.fail_ratio = window, min_calls, fail_ratio
-        self.reset_after, self.probes = reset_after, probes
-        self.results = collections.deque(maxlen=window)    # True = failed call
-        self.state, self.opened_at, self.probe_ok, self.probe_inflight = "closed", 0.0, 0, 0
-
-    def _allow(self):                                       # None = reject, True = probe, False = normal
-        if self.state == "open":
-            if time.monotonic() - self.opened_at < self.reset_after:
-                return None                                 # fail fast: no network call at all
-            self.state, self.probe_ok, self.probe_inflight = "half_open", 0, 0
-        if self.state == "half_open":
-            if self.probe_inflight >= self.probes:
-                return None                                 # only a few trial calls at a time
-            self.probe_inflight += 1
-            return True
-        return False
-
-    def _trip(self):
-        self.state, self.opened_at = "open", time.monotonic()
-
-    def _record(self, failed, probe):                       # failed=None: ignored outcome (e.g. a 4xx)
-        if probe:
-            if self.state != "half_open": return            # another probe already reopened it
-            self.probe_inflight -= 1                        # always release the probe slot
-            if failed is None: return
-            if failed: self._trip(); return                # still broken: reopen, timer restarts
-            self.probe_ok += 1
-            if self.probe_ok >= self.probes:                # enough evidence of recovery
-                self.state, self.results = "closed", collections.deque(maxlen=self.window)
-            return
-        if self.state != "closed" or failed is None: return # late result from before the trip: ignore
-        self.results.append(failed)
-        n = len(self.results)
-        if n >= self.min_calls and sum(self.results) / n >= self.fail_ratio:
-            self._trip()
-
-    async def call(self, fn, *args, timeout=10.0, **kw):
-        probe = self._allow()
-        if probe is None:
-            raise CircuitOpen("dependency marked unhealthy")
+    def __init__(self, window=50, min_calls=20, fail_ratio=0.5, reset_after=30.0):
+        self.results = collections.deque(maxlen=window)          # True = failed call
+        self.min_calls, self.fail_ratio, self.reset_after = min_calls, fail_ratio, reset_after
+        self.state, self.opened_at = "closed", 0.0
+    def _record(self, failed):
+        if self.state == "half_open":                            # the trial call decides
+            self.state, self.opened_at = ("open" if failed else "closed"), time.monotonic()
+        elif self.state == "closed":                             # late results after a trip: ignored
+            self.results.append(failed)
+            n = len(self.results)
+            if n >= self.min_calls and sum(self.results) / n >= self.fail_ratio:
+                self.state, self.opened_at = "open", time.monotonic(); self.results.clear()
+    async def call(self, fn, *args, timeout=10.0):
+        if self.state != "closed":                                 # half-open: one trial at a time
+            if self.state == "half_open" or time.monotonic() - self.opened_at < self.reset_after:
+                raise CircuitOpen("dependency marked unhealthy")   # fail fast: no network call at all
+            self.state = "half_open"                               # this caller is the trial
         try:
-            result = await asyncio.wait_for(fn(*args, **kw), timeout)
-        except (asyncio.TimeoutError, ConnectionError, UpstreamError):
-            self._record(True, probe); raise
-        except BaseException:                               # 4xx, cancellation: neither success nor failure
-            self._record(None, probe); raise
-        self._record(False, probe)
+            result = await asyncio.wait_for(fn(*args), timeout)    # slow responses become failures
+        except (asyncio.TimeoutError, ConnectionError):
+            self._record(True); raise
+        except BaseException:                                      # 4xx, cancellation: no verdict,
+            if self.state == "half_open": self.state = "open"      # but free the trial slot
+            raise
+        self._record(False)
         return result
-
-breaker = CircuitBreaker()
-
-async def answer(prompt):
-    try:
-        return await breaker.call(primary_llm, prompt, timeout=20)
-    except CircuitOpen:
-        return await secondary_llm(prompt)                   # other vendor, smaller model, or cached reply
 ```
 
 - **The timeout lives inside `call`,** so slow responses become failures the window can see.
-- **The catch-all branch matters more than it looks.** Without it, a 4xx or a cancelled request during
-  half-open would never release its probe slot, and after three such calls the breaker would reject
-  everything forever while the dependency was healthy.
 - **Late results are ignored.** Calls admitted before the trip keep finishing (timing out) for one timeout
-  after it; counting them would restart the open timer, and counting them during half-open would release
-  probe slots they never held. Only probe calls decide the half-open outcome.
+  after it; counting them would restart the open timer.
 - **Emit a metric on every state transition;** a breaker that opens silently is an outage nobody is
   looking at.
 
 ### Agent tool executor: one breaker per tool, open means a tool result
-The agent loop calls `run_tool` for each tool call the model emits. An open breaker becomes a structured
-result the model reads on its next step, so it can switch tools instead of retrying. It reuses the
-`CircuitBreaker` class above.
+An open breaker becomes a structured result the model reads on its next step, so it can switch tools
+instead of retrying. It reuses the `CircuitBreaker` class above; run them together.
 
 ```python
-breakers = {}                                              # one breaker per tool endpoint, created lazily
+breakers = collections.defaultdict(CircuitBreaker)           # one breaker per tool, created lazily
 
-def breaker_for(tool_name):
-    if tool_name not in breakers:
-        breakers[tool_name] = CircuitBreaker(window=50, min_calls=20, fail_ratio=0.5,
-                                             reset_after=30.0, probes=3)
-    return breakers[tool_name]
-
-async def run_tool(tool_name, args, tools, timeout=5.0):
-    fn = tools[tool_name]
+async def run_tool(name, fn, arg):
     try:
-        out = await breaker_for(tool_name).call(fn, **args, timeout=timeout)
-        return {"ok": True, "content": out}
-    except CircuitOpen:
-        return {"ok": False, "error": "tool_unavailable",     # the model sees this, not a stack trace
-                "message": f"{tool_name} is temporarily unavailable; use another tool or answer without it"}
-    except (asyncio.TimeoutError, ConnectionError, UpstreamError):
-        return {"ok": False, "error": "tool_failed", "message": f"{tool_name} failed; you may retry once"}
+        return {"ok": True, "content": await breakers[name].call(fn, arg, timeout=5.0)}
+    except CircuitOpen:                                       # the model sees this, not a stack trace
+        return {"ok": False, "error": "tool_unavailable",
+                "message": f"{name} is temporarily unavailable; use another tool or answer without it"}
+    except (asyncio.TimeoutError, ConnectionError):
+        return {"ok": False, "error": "tool_failed", "message": f"{name} failed; you may retry once"}
+
+async def search(q): raise ConnectionError("search down")
+
+async def main():
+    errors = [(await run_tool("search", search, "q"))["error"] for _ in range(22)]
+    print(errors[-3:])   # ['tool_failed', 'tool_unavailable', 'tool_unavailable']: open after 20 failures
+
+asyncio.run(main())
 ```
 
 - **The model gets a decision, not a hang:** a timeout of 5 seconds inside the breaker bounds each step, and
@@ -369,20 +334,17 @@ at 5 seconds per call.
 For JVM services the library expresses these settings directly (Spring Boot property names).
 
 ```yaml
-resilience4j:
-  circuitbreaker:
-    instances:
-      llmPrimary:
-        slidingWindowType: COUNT_BASED
-        slidingWindowSize: 100
-        minimumNumberOfCalls: 20
-        failureRateThreshold: 50
-        slowCallDurationThreshold: 5s       # slow success counts as a failure
-        slowCallRateThreshold: 50
-        waitDurationInOpenState: 30s
-        permittedNumberOfCallsInHalfOpenState: 3
-        ignoreExceptions:
-          - com.example.llm.BadRequestException   # your 4xx: not the provider's fault
+resilience4j.circuitbreaker.instances.llmPrimary:
+  slidingWindowType: COUNT_BASED
+  slidingWindowSize: 100
+  minimumNumberOfCalls: 20
+  failureRateThreshold: 50
+  slowCallDurationThreshold: 5s       # slow success counts as a failure
+  slowCallRateThreshold: 50
+  waitDurationInOpenState: 30s
+  permittedNumberOfCallsInHalfOpenState: 3
+  ignoreExceptions:
+    - com.example.llm.BadRequestException   # your 4xx: not the provider's fault
 ```
 
 ## Production patterns
@@ -405,6 +367,11 @@ resilience4j:
 - **Jitter the reset interval and alert on state.** Use `reset_after * random.uniform(0.8, 1.2)` so
   replicas do not probe on the same tick; export breaker state as a gauge per dependency and alert when a
   breaker has been open longer than its reset interval several times running.
+- **Cap and release half-open probes.** Allow only a few concurrent trial calls (for example 3) and
+  require several successes before closing; release the probe slot on every outcome, including 4xx and
+  cancellation, which count as neither success nor failure, or the breaker rejects everything forever.
+- **Ignore late results everywhere.** Results from calls admitted before a trip must not restart the open
+  timer, and during half-open only the probe calls decide the outcome.
 
 ## Trade-offs
 - **Fast protection vs false trips.** Aggressive thresholds protect the caller quickly but trip on transient

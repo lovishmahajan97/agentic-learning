@@ -239,33 +239,23 @@ flowchart TD
 
 ## Examples
 ### Contract as code with producer-side dead-lettering
-A Pydantic model carrying schema and semantic checks, a contract version embedded in every record, and a
+A Pydantic model carrying schema and one semantic check, a contract version in every record, and a
 producer-side gate that routes violations to a dead-letter list instead of publishing them.
 
 ```python
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Literal
-from pydantic import BaseModel, Field, ValidationError, model_validator
-
-CONTRACT_VERSION = "support_tickets.v2"
+from pydantic import BaseModel, ValidationError, model_validator
 
 class Ticket(BaseModel):
-    contract_version: Literal["support_tickets.v2"] = CONTRACT_VERSION
-    ticket_id: str = Field(pattern=r"^T-\d{6,}$")
-    tenant_id: str = Field(min_length=1)
+    contract_version: Literal["support_tickets.v2"] = "support_tickets.v2"
+    ticket_id: str
     category: Literal["billing", "login", "bug", "feature", "other"]   # closed value set
     opened_at: datetime
     closed_at: datetime | None = None
-    resolution: str | None = Field(default=None, max_length=8000)       # text that will be embedded
-    language: Literal["en", "de", "fr"] = "en"
-    contains_pii: bool                                                  # decides redaction before embedding
-
+    resolution: str | None = None                                       # text that will be embedded
     @model_validator(mode="after")
-    def semantics(self):                    # tz check first: naive-vs-aware compare raises TypeError
-        if any(t is not None and t.tzinfo is None for t in (self.opened_at, self.closed_at)):
-            raise ValueError("timestamps must be timezone-aware (UTC)")
-        if self.closed_at and self.closed_at < self.opened_at:
-            raise ValueError("closed_at before opened_at")
+    def semantics(self):                                                # meaning, not just types
         if self.closed_at and not self.resolution:
             raise ValueError("closed ticket must carry a resolution")
         return self
@@ -279,14 +269,10 @@ def publish(raw_records: list[dict]):
             dead.append({"record": r, "violations": e.errors(include_url=False)})
     return good, dead
 
-now = datetime.now(timezone.utc)
-good, dead = publish([
-    {"ticket_id": "T-000123", "tenant_id": "acme", "category": "billing",
-     "opened_at": now, "closed_at": now, "resolution": "Refunded.", "contains_pii": False},
-    {"ticket_id": "T-000124", "tenant_id": "acme", "category": 3,       # upstream changed to int ids
-     "opened_at": now, "contains_pii": False},
-])
+good, dead = publish([{"ticket_id": "T-1", "category": "billing", "opened_at": "2026-01-05T10:00:00Z"},
+                      {"ticket_id": "T-2", "category": 3, "opened_at": "2026-01-05T10:00:00Z"}])  # int ids now
 print(len(good), "published;", len(dead), "dead-lettered:", dead[0]["violations"][0]["msg"])
+# 1 published; 1 dead-lettered: Input should be 'billing', 'login', 'bug', 'feature' or 'other'
 ```
 
 The second record is the silent failure from the "Why it exists" section, now caught at the producer with
@@ -307,51 +293,25 @@ class OrderV1(BaseModel):
     status: Literal["placed", "shipped", "delivered", "refunded"]
     total_usd: float                                # contract: dollars, two decimals
 
-def get_order(raw_response: dict) -> dict:
-    """Tool result handed to the model."""
+def get_order(raw: dict) -> dict:
     try:
-        o = OrderV1(**raw_response)
+        o = OrderV1(**raw)
     except ValidationError as e:
-        return {"error": "order_service_contract_violation",
-                "fields": [".".join(map(str, err["loc"])) for err in e.errors()]}
+        return {"error": "order_service_contract_violation", "fields": [err["loc"][0] for err in e.errors()]}
     return {"order_id": o.order_id, "status": o.status, "total_usd": round(o.total_usd, 2)}
 
-print(get_order({"contract_version": "orders.v1", "order_id": "A1", "status": "shipped",
-                 "total_usd": 42.5, "carrier": "ups"}))      # extra field ignored
 print(get_order({"contract_version": "orders.v1", "order_id": "A2",
-                 "status": "in_transit", "total_usd": 42.5}))  # new enum value: error, not a guess
+                 "status": "in_transit", "total_usd": 42.5}))
+# {'error': 'order_service_contract_violation', 'fields': ['status']}  new enum value: error, not a guess
 ```
 
 A unit change that keeps the type (dollars to cents) still passes; that is why the producer must bump the
 contract version for semantic changes, and the wrapper pins the version it understands.
 
 ### Batch-level circuit breaker on a partition
-Runs after per-record validation. The 1% threshold and the 10-point distribution tolerance are illustrative
-values a contract would state explicitly.
-
-```python
-from collections import Counter
-
-MAX_VIOLATION_RATE = 0.01      # contract: above 1% the whole partition fails
-
-def gate_partition(good: list[dict], dead: list[dict], baseline: dict[str, float]):
-    total = len(good) + len(dead)
-    rate = len(dead) / total if total else 1.0
-    if rate > MAX_VIOLATION_RATE:
-        return "FAIL", f"violation rate {rate:.1%} > {MAX_VIOLATION_RATE:.0%}; nothing published"
-    share = Counter(r["category"] for r in good)
-    for cat, expected in baseline.items():              # distribution check on what survives
-        seen = share[cat] / len(good)
-        if abs(seen - expected) > 0.10:
-            return "FAIL", f"category {cat!r} share {seen:.0%} vs expected {expected:.0%}"
-    return "PUBLISH", f"{len(good)} rows published, {len(dead)} quarantined ({rate:.1%})"
-
-baseline = {"billing": 0.4, "login": 0.3, "bug": 0.3}
-good = [{"category": c} for c in ["billing"] * 400 + ["login"] * 300 + ["bug"] * 299]
-print(gate_partition(good, [{}], baseline))            # 1 of 1,000 bad: publish
-good = [{"category": c} for c in ["login"] * 300 + ["bug"] * 300]
-print(gate_partition(good, [{}] * 400, baseline))      # every billing row broke upstream: fail
-```
+Runs after per-record validation. The contract states a 1% violation-rate threshold for the whole
+partition and a 10-point tolerance on each category's share among the survivors (baseline: billing 40%,
+login 30%, bug 30%).
 
 | Partition | Dead-lettered | Outcome | Why it is right |
 |---|---|---|---|
@@ -383,6 +343,9 @@ print(gate_partition(good, [{}] * 400, baseline))      # every billing row broke
 - **Dual-production migration window.** Use for breaking changes. The producer emits old and new fields (or
   topics) with the version stamped on each record until consumers migrate; CI prevents dropping the old
   field early. Monitor reads of the old field to know when the window can close.
+- **Strict semantic checks in the contract model.** Constrain IDs with a pattern (`^T-\d{6,}$`), cap the
+  embedded text length (`max_length=8000`), and require timezone-aware timestamps, checking the timezone
+  before comparing `closed_at` with `opened_at`, since comparing naive and aware datetimes raises `TypeError`.
 
 ## Trade-offs
 - **Correct attribution vs organisational buy-in.** Producer-side enforcement attributes failures correctly

@@ -205,8 +205,7 @@ items = [  # (id, blocking, evidence_link_or_None, passed, waiver)
 def decide(items, today):
     blockers, waived, gaps = [], [], []
     for iid, blocking, evidence, passed, waiver in items:
-        ok = passed and evidence is not None          # no evidence means not done
-        if ok:
+        if passed and evidence is not None:           # no evidence means not done
             continue
         if blocking:
             blockers.append(iid)
@@ -255,14 +254,10 @@ candidate = {"lookup_policy": "read", "get_claim": "read",
              "update_claim_status": "write", "search_web": "read"}  # what the agent ships with
 
 def tool_drift(approved, candidate):
-    findings = []
     for name, scope in candidate.items():
-        if name not in approved:
-            findings.append((name, "new tool", "BLOCKING" if scope == "write" else "review"))
-        elif scope != approved[name]:                    # widened to write blocks; narrowed needs a look
-            findings.append((name, f"scope {approved[name]} -> {scope}",
-                             "BLOCKING" if scope == "write" else "review"))
-    return findings
+        if approved.get(name) != scope:                   # new tool, or scope changed
+            change = "new tool" if name not in approved else f"scope {approved[name]} -> {scope}"
+            yield name, change, "BLOCKING" if scope == "write" else "review"
 
 for f in tool_drift(approved, candidate):
     print(f)

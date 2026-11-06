@@ -200,20 +200,17 @@ flowchart TD
 
 ## Examples
 ### Starter skeleton: safe-outcome tests and an outcome estimate
-Standard library only, run on Python 3.9. Each scenario asserts the decision a failure must end in;
-the last lines turn pilot inputs into the number a sponsor reads.
+Standard library only, run on Python 3.9. Each scenario asserts the decision a failure must end in.
 
 ```python
 POS = {"PO-1": 1200.00, "PO-2": 560.00}               # purchase orders from the ERP (stubbed)
 PAID = set()                                          # invoice numbers already paid (duplicate guard)
 
 def extract(doc):                                     # stand-in for the LLM extraction step
-    if doc.get("corrupt"): raise ValueError("unreadable pdf")
     if doc.get("llm_down"): raise TimeoutError("model timeout")
     return {"invoice_no": doc["no"], "po": doc["po"], "amount": doc["amount"]}
 
-def process(doc, tolerance=0.02):
-    """Return (decision, reason). Every failure must end in a human queue, never in a payment."""
+def process(doc, tolerance=0.02):                     # every failure ends in a human queue, never a payment
     try:
         inv = extract(doc)
     except (ValueError, TimeoutError) as e:
@@ -221,35 +218,30 @@ def process(doc, tolerance=0.02):
     if inv["invoice_no"] in PAID:
         return "reject", "duplicate invoice"
     po_amount = POS.get(inv["po"])
-    if po_amount is None:
-        return "human_review", "unknown PO"
-    if abs(inv["amount"] - po_amount) > tolerance * po_amount:
-        return "human_review", "amount outside tolerance"
+    if po_amount is None or abs(inv["amount"] - po_amount) > tolerance * po_amount:
+        return "human_review", "no PO match within tolerance"
     PAID.add(inv["invoice_no"])
     return "auto_approve", "matched PO"
 
 SCENARIOS = [  # (name, document, decision that is acceptable)
-    ("happy path",        {"no": "I-1", "po": "PO-1", "amount": 1200.00}, "auto_approve"),
     ("within tolerance",  {"no": "I-2", "po": "PO-2", "amount": 565.00},  "auto_approve"),
-    ("duplicate",         {"no": "I-1", "po": "PO-1", "amount": 1200.00}, "reject"),
+    ("duplicate",         {"no": "I-2", "po": "PO-2", "amount": 565.00},  "reject"),
     ("over tolerance",    {"no": "I-3", "po": "PO-2", "amount": 700.00},  "human_review"),
     ("unknown PO",        {"no": "I-4", "po": "PO-9", "amount": 90.00},   "human_review"),
-    ("corrupt document",  {"corrupt": True},                              "human_review"),
     ("model outage",      {"llm_down": True},                             "human_review"),
 ]
-results = [(n, *process(d), want) for n, d, want in SCENARIOS]
-for n, got, why, want in results:
+for n, d, want in SCENARIOS:
+    got, why = process(d)
     print(f"{'PASS' if got == want else 'FAIL'}  {n:17} -> {got:12} ({why})")
-
-# Business outcome for a pilot week (illustrative inputs; replace with your measured baseline)
-invoices, manual_min, review_min, auto_rate = 2000, 6.0, 3.0, 0.55
-before = invoices * manual_min / 60
-after = invoices * (1 - auto_rate) * review_min / 60
-print(f"AP hours/week: {before:.0f} -> {after:.0f} ({1 - after / before:.0%} saved)")
 ```
 
-All seven scenarios pass and the estimate prints `AP hours/week: 200 -> 45 (78% saved)`. Treat both
-outputs with suspicion:
+All five scenarios pass. Then turn pilot inputs into the number a sponsor reads (illustrative inputs;
+replace them with your measured baseline):
+- **Before:** 2,000 invoices a week x 6 manual minutes = 200 AP hours.
+- **After:** 55% auto-approved, the other 45% reviewed at 3 minutes = 2,000 x 0.45 x 3 / 60 = 45 hours,
+  so 78% saved.
+
+Treat both outputs with suspicion:
 - **The tests cover only the failures you imagined.** Shadow mode on real invoices finds the rest, such
   as credit notes or split deliveries.
 - **The estimate assumes review takes 3 minutes,** half the manual time. Measure it in the pilot;

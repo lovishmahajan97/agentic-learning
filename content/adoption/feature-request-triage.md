@@ -222,9 +222,9 @@ illustrative.
   answer is a scoped plan, not a roadmap promise.
 
 ### Weekly triage pass: cluster, route and score
-Seven captured requests from five accounts. Requests are clustered by underlying problem and type, each
-cluster is routed, and only product gaps get a RICE score. ARR is shown next to the score but kept out of
-it. Impact, confidence and effort are the team's estimates.
+Seven captured requests from five accounts. Requests are clustered by underlying problem and type, and
+only product gaps get a RICE score; the other clusters are routed as in the table below. ARR is shown
+next to the score but kept out of it. Impact, confidence and effort are the team's estimates.
 
 ```python
 from collections import defaultdict
@@ -239,27 +239,20 @@ requests = [
     ("Umbrella", 90, "bulk-upload", "usage_gap"),
     ("MegaCorp", 2000, "approval-workflow", "product_gap"),
 ]
-ROUTE = {
-    "quality_failure": "failure triage + regression case",
-    "usage_gap": "enablement; fix discoverability",
-    "customer_specific": "field build on extension point",
-    "product_gap": "product backlog with evidence",
-}
 # Team estimates per product-gap cluster: impact (0.25-3), confidence (0-1), effort (weeks).
 ESTIMATES = {"cite-source-page": (2, 0.8, 3), "approval-workflow": (2, 0.8, 3)}
 
-clusters = defaultdict(list)
+clusters = defaultdict(dict)                    # (problem, kind) -> {account: arr}
 for acct, arr, problem, kind in requests:
-    clusters[(problem, kind)].append((acct, arr))
+    clusters[(problem, kind)][acct] = arr
 
-for (problem, kind), rows in clusters.items():
-    accounts = {a for a, _ in rows}
-    arr = sum(dict(rows).values())          # ARR per distinct account
-    line = f"{problem:17} {kind:17} accounts={len(accounts)} arr=${arr}k -> {ROUTE[kind]}"
-    if kind == "product_gap":
+for (problem, kind), accts in clusters.items():
+    if kind == "product_gap":                   # only product gaps get a RICE score
         impact, conf, effort = ESTIMATES[problem]
-        line += f" | RICE={len(accounts) * impact * conf / effort:.2f}"
-    print(line)
+        rice = len(accts) * impact * conf / effort
+        print(f"{problem:17} RICE={rice:.2f} arr=${sum(accts.values())}k")
+# cite-source-page  RICE=1.60 arr=$770k
+# approval-workflow RICE=0.53 arr=$2000k
 ```
 
 Seven tickets become five decisions:

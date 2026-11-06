@@ -152,40 +152,34 @@ Compares models on any OpenAI-compatible server (here Ollama) on tool name, argu
 
 ```python
 # pip install openai   (checked against openai 3.37.0 with a stub OpenAI-compatible endpoint)
-import json, statistics, time
+import json, time
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
-MODELS = ["qwen2.5:3b", "llama3.2:3b"]       # whatever candidates you pulled; check current tags
-TOOLS = [{"type": "function", "function": {"name": "get_weather", "description": "Weather for a city",
-          "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}},
-         {"type": "function", "function": {"name": "convert_currency", "description": "Convert money",
-          "parameters": {"type": "object", "properties": {"amount": {"type": "number"},
-          "to": {"type": "string"}}, "required": ["amount", "to"]}}}]
+TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object",
+          "properties": {"city": {"type": "string"}}, "required": ["city"]}}},
+         {"type": "function", "function": {"name": "convert_currency", "parameters": {"type": "object",
+          "properties": {"amount": {"type": "number"}, "to": {"type": "string"}},
+          "required": ["amount", "to"]}}}]
 CASES = [("Is it raining in Lisbon?", "get_weather", {"city": "Lisbon"}),
          ("Turn 40 dollars into euros", "convert_currency", {"amount": 40, "to": "EUR"}),
          ("Tell me a joke", None, None)]
 
 def run(model, text):
-    t = time.perf_counter()
     r = client.chat.completions.create(model=model, messages=[{"role": "user", "content": text}],
                                        tools=TOOLS, temperature=0)
-    calls = r.choices[0].message.tool_calls or []
-    if not calls:
-        return None, None, time.perf_counter() - t
-    try:
-        args = json.loads(calls[0].function.arguments)
-    except json.JSONDecodeError:
-        args = "INVALID"
-    return calls[0].function.name, args, time.perf_counter() - t
+    for call in r.choices[0].message.tool_calls or []:
+        try:
+            return call.function.name, json.loads(call.function.arguments)
+        except json.JSONDecodeError:
+            return call.function.name, "INVALID"       # unparseable arguments count as a miss
+    return None, None                                   # no tool call
 
-for m in MODELS:
-    ok, lat = 0, []
+for m in ["qwen2.5:3b", "llama3.2:3b"]:      # whatever candidates you pulled; check current tags
+    t, ok = time.perf_counter(), 0
     for text, want_tool, want_args in CASES:
-        tool, args, s = run(m, text)
-        lat.append(s)
-        ok += tool == want_tool and (want_args is None or args == want_args)
-    print(f"{m}: exact {ok}/{len(CASES)}, median latency {statistics.median(lat):.2f}s")
+        ok += run(m, text) == (want_tool, want_args)
+    print(f"{m}: exact {ok}/{len(CASES)}, mean latency {(time.perf_counter() - t) / len(CASES):.2f}s")
 ```
 
 Before trusting the ranking, grow `CASES` to hundreds, add a schema check and a multi-step sandbox

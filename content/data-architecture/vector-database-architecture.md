@@ -315,13 +315,6 @@ found fewer than k results so the agent widens the query instead of looping on t
 `client` and `models` from the setup above, with `user_id` as the tenant-marked field.
 
 ```python
-RECALL_TOOL = {
-    "name": "recall_memory",
-    "description": "Search this user's saved memories. Optionally narrow by topic.",
-    "input_schema": {"type": "object", "properties": {
-        "query": {"type": "string"}, "topic": {"type": "string"}}, "required": ["query"]},
-}
-
 def recall_memory(session, args, embed, k=5):
     must = [models.FieldCondition(key="user_id", match=models.MatchValue(value=session.user_id))]
     if args.get("topic"):                                     # model-chosen, so selectivity varies

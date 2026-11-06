@@ -299,90 +299,69 @@ flowchart TD
 
 ## Examples
 ### A domain hierarchy, a single mapping to Problem Details, and safe 500s
+Requires `fastapi` and `httpx` (for `TestClient`).
 
 ```python
 import logging, uuid
 from fastapi import FastAPI, Request
-from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
+from fastapi.testclient import TestClient
 
-log = logging.getLogger("api")
 app = FastAPI()
+class AppError(Exception): status, code, retry_after = 500, "internal", None   # message = detail
+class UpstreamBusy(AppError): status, code, retry_after = 503, "model_busy", 10
 
-class AppError(Exception):
-    status, code, retry_after = 500, "internal", None
-    def __init__(self, detail: str): self.detail = detail
-class UpstreamBusy(AppError):    status, code, retry_after = 503, "model_busy", 10
-class UpstreamTimeout(AppError): status, code = 504, "model_timeout"
-class ContextTooLong(AppError):  status, code = 422, "context_too_long"
-
-def problem(req: Request, status: int, code: str, detail, headers=None, rid=None):
-    rid = rid or req.headers.get("x-request-id") or str(uuid.uuid4())  # usually set by middleware
-    body = {"type": f"https://docs.acme.ai/errors/{code}", "title": code, "status": status,
-            "detail": detail, "request_id": rid}
+def problem(status: int, code: str, detail: str, headers=None, rid=None):
+    body = {"title": code, "status": status, "detail": detail, "request_id": rid or str(uuid.uuid4())}
     return JSONResponse(body, status, headers=headers, media_type="application/problem+json")
 
 @app.exception_handler(AppError)
 async def app_error(req: Request, e: AppError):
-    h = {"Retry-After": str(e.retry_after)} if e.retry_after else None
-    return problem(req, e.status, e.code, e.detail, h)
-
-@app.exception_handler(StarletteHTTPException)      # also catches routing 404/405
-async def http_error(req: Request, e: StarletteHTTPException):
-    return problem(req, e.status_code, "http_error", e.detail, getattr(e, "headers", None))
-
-@app.exception_handler(RequestValidationError)
-async def invalid(req: Request, e: RequestValidationError):
-    errs = [{k: v for k, v in err.items() if k != "input"} for err in e.errors()]  # no echoed prompt
-    return problem(req, 422, "invalid_request", jsonable_encoder(errs))
+    return problem(e.status, e.code, str(e), {"Retry-After": str(e.retry_after)} if e.retry_after else None)
 
 @app.exception_handler(Exception)                   # runs in ServerErrorMiddleware
 async def unhandled(req: Request, e: Exception):
-    rid = req.headers.get("x-request-id") or str(uuid.uuid4())
-    log.exception("unhandled error request_id=%s", rid)   # full detail goes to logs only
-    return problem(req, 500, "internal", "unexpected error; quote request_id to support", rid=rid)
+    rid = str(uuid.uuid4())
+    logging.exception("unhandled error request_id=%s", rid)   # full detail goes to logs only
+    return problem(500, "internal", "unexpected error; quote request_id to support", rid=rid)
+
+@app.post("/v1/generate")
+async def generate(busy: bool = True):
+    raise UpstreamBusy("model capacity exhausted") if busy else KeyError("internal state")
+
+c = TestClient(app, raise_server_exceptions=False)
+r = c.post("/v1/generate"); print(r.status_code, r.headers["retry-after"], r.json()["title"])  # 503 10 model_busy
+print(c.post("/v1/generate?busy=false").json()["detail"])  # unexpected error; quote request_id to support
 ```
 
-What happens on a provider 429:
-1. **A provider 429 inside `generate()`** is caught in the client wrapper and re-raised as
-   `UpstreamBusy("model capacity exhausted")`.
-2. **The caller receives a 503** Problem Details body with `Retry-After: 10` and a `request_id`.
-3. **The SDK backs off for ten seconds** instead of hammering, and support can find the trace from the ID.
-4. **Nothing from the provider's raw error reaches the client.**
-
+- **The SDK backs off for ten seconds** on the 503 instead of hammering, and support finds the trace from
+  the `request_id`. Nothing from the provider's raw error reaches the client.
 - **The 500 handler logs the same `request_id` it returns.** An ID minted fresh in the response but
   absent from the log line would send support looking for a trace that doesn't exist.
 - **In a real service a middleware assigns the ID once per request** and every log line carries it.
 
-### The client wrapper that maps provider errors (production snippet)
-Uses the hierarchy above plus a 502 class; this is where `generate()` turns httpx errors into domain
-errors, so no handler ever sees provider text.
+### The client wrapper that maps provider errors
+Uses the hierarchy above; this is where provider httpx errors become domain errors, so no handler ever
+sees provider text.
 
 ```python
 import httpx
 
-class UpstreamFailed(AppError):  status, code = 502, "model_upstream_error"
+class UpstreamFailed(AppError): status, code = 502, "model_upstream_error"
+class UpstreamTimeout(AppError): status, code = 504, "model_timeout"
 
-async def generate(client: httpx.AsyncClient, payload: dict) -> dict:
+async def call_model(client: httpx.AsyncClient, payload: dict) -> dict:
     try:
         r = await client.post("/v1/chat/completions", json=payload)
         r.raise_for_status()
         return r.json()
     except httpx.TimeoutException:
         raise UpstreamTimeout("model did not answer in time") from None
-    except httpx.ConnectError:
-        raise UpstreamFailed("model provider unreachable") from None
     except httpx.HTTPStatusError as e:
         s = e.response.status_code
-        log.warning("provider status=%s body=%.200s", s, e.response.text)  # logs only
+        logging.warning("provider status=%s body=%.200s", s, e.response.text)  # logs only
         if s == 429:
-            err = UpstreamBusy("model capacity exhausted")
-            hint = e.response.headers.get("retry-after", "")
-            if hint.isdigit():
-                err.retry_after = int(hint)          # provider's hint beats the default 10 s
-            raise err from None
+            raise UpstreamBusy("model capacity exhausted") from None
         if s >= 500:
             raise UpstreamFailed("model provider error") from None
         raise                                        # provider 4xx = our bug: a logged 500
@@ -390,85 +369,19 @@ async def generate(client: httpx.AsyncClient, payload: dict) -> dict:
 
 | Provider event | Raised as | Client sees |
 |---|---|---|
-| 429 with `retry-after: 7` | `UpstreamBusy` | 503, `Retry-After: 7` |
+| 429 | `UpstreamBusy` | 503, `Retry-After: 10` |
 | 503 from the provider | `UpstreamFailed` | 502 |
 | read or connect timeout | `UpstreamTimeout` | 504 |
 | 400 (we sent a bad request) | unmapped `HTTPStatusError` | generic 500 with `request_id`, full detail in logs |
 
-### Agent executor turning tool-server errors into observations
-The tool servers return the Problem Details envelope above, ideally with `code` and `retryable` added as
-extension members (RFC 9457 allows extra fields; the `problem()` helper above carries the code only in
-`title`, so the executor falls back to it). The executor decides what the model sees. `http` is your
-shared `httpx.AsyncClient`.
-
-```python
-import asyncio, httpx
-
-async def call_tool(http: httpx.AsyncClient, url: str, args: dict, budget_left: float) -> dict:
-    for attempt in range(2):
-        try:
-            r = await http.post(url, json=args, timeout=min(10.0, budget_left))
-        except httpx.TimeoutException:
-            return {"error": "tool timed out", "retryable": True}
-        if r.status_code < 400:
-            return r.json()
-        p = r.json() if r.headers.get("content-type", "").endswith("json") else {}
-        retry_after = r.headers.get("retry-after", "")
-        if r.status_code == 503 and attempt == 0 and retry_after.isdigit() \
-                and int(retry_after) < budget_left / 2:
-            await asyncio.sleep(int(retry_after))              # one retry inside the run budget
-            budget_left -= int(retry_after); continue
-        if 400 <= r.status_code < 500:                          # model can fix its arguments
-            return {"error": p.get("detail", "invalid request"),
-                    "code": p.get("code") or p.get("title", "invalid")}
-        return {"error": "tool unavailable", "retryable": True}  # 5xx: no internals to the model
-    return {"error": "tool busy", "retryable": True}
-```
+### Worked scenario: an agent executor turning tool-server errors into observations
+The tool servers return the envelope above; the executor decides what the model sees.
 
 | Tool server answers | Model sees | Run outcome |
 |---|---|---|
 | 422 `{"code": "invalid_date", "detail": "date must be YYYY-MM-DD"}` | that exact fix | model re-calls with `2026-10-22` |
 | 503 with `Retry-After: 2`, 20 s budget left | the result after one retry | continues |
 | 500 with a stack trace in the body | `tool unavailable` | model answers without that tool |
-
-### What the defaults and the middleware trap look like (runnable with TestClient)
-Requires `fastapi` and `httpx`. Shows routing errors sharing the envelope, middleware that raises versus
-returns, and the default 422 echoing input.
-
-```python
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from fastapi.testclient import TestClient
-from starlette.exceptions import HTTPException as StarletteHTTPException
-
-app = FastAPI()
-
-@app.exception_handler(StarletteHTTPException)       # covers handler-raised and routing errors
-async def http_error(req: Request, e: StarletteHTTPException):
-    return JSONResponse({"title": "http_error", "status": e.status_code, "detail": e.detail},
-                        e.status_code, media_type="application/problem+json")
-
-@app.middleware("http")
-async def check_key(req: Request, call_next):
-    key = req.headers.get("x-api-key")
-    if key == "banned":
-        raise HTTPException(401, "banned key")              # wrong: outside ExceptionMiddleware
-    if key == "revoked":
-        return JSONResponse({"detail": "revoked key"}, 401)  # right: middleware returns a response
-    return await call_next(req)
-
-@app.get("/v1/docs/{doc_id}")
-async def get_doc(doc_id: int):
-    raise HTTPException(404, f"document {doc_id} not found")
-
-c = TestClient(app, raise_server_exceptions=False)
-print(c.get("/v1/docs/7").json())        # {'title': 'http_error', 'status': 404, 'detail': 'document 7 not found'}
-print(c.get("/nope").json())             # {'title': 'http_error', 'status': 404, 'detail': 'Not Found'}
-print(c.delete("/v1/docs/7").status_code)                                  # 405, same envelope
-print(c.get("/v1/docs/7", headers={"x-api-key": "revoked"}).status_code)   # 401
-print(c.get("/v1/docs/7", headers={"x-api-key": "banned"}).status_code)    # 500
-print(c.get("/v1/docs/abc").json()["detail"][0]["input"])                  # abc: default 422 echoes input
-```
 
 ## Production patterns
 - **Request ID assigned once, everywhere** — on every service. A small middleware reads `X-Request-ID`
@@ -494,6 +407,15 @@ print(c.get("/v1/docs/abc").json()["detail"][0]["input"])                  # abc
   with FastAPI's `responses=` parameter (for example `responses={503: {"model": Problem}}` with a
   Pydantic `Problem` model) so SDKs and tool wrappers know the shape. Monitor tool errors by `code` and
   how often the run recovers after one.
+- **Cover routing errors and keep middleware out of it.** Register the handler on Starlette's
+  `HTTPException` so routing 404/405 share the envelope; in middleware, return a `JSONResponse` instead
+  of raising `HTTPException` (raised there it bypasses the handlers and becomes a 500); strip `input` from
+  `RequestValidationError` details, because the default 422 echoes the request (prompts included).
+- **Honour the provider's `retry-after`.** When a 429 carries a numeric `retry-after`, copy it onto
+  `UpstreamBusy` instead of the default 10 s; also map `httpx.ConnectError` to a 502.
+- **Tool executor retries once, inside the budget.** Retry a tool 503 only once and only when its
+  `Retry-After` is under half the remaining run budget; cap each tool call at
+  `min(10 s, budget left)`; pass 4xx `detail` and `code` to the model, never 5xx bodies.
 
 ## Trade-offs
 - **Central mapping vs indirection.** A central mapping keeps the contract consistent and the domain

@@ -233,9 +233,7 @@ Return JSON only: {"reasoning": "<one short paragraph>", "correct": "pass" or "f
 def judge(case: dict, run: dict, llm: Callable[[str], str]) -> dict:
     prompt = (f"{RUBRIC}\n\nQuestion: {case['question']}\nReference: {case['reference']}\n"
               f"Tool outputs: {json.dumps(run['tool_outputs'])[:4000]}\nAgent answer: {run['answer']}")
-    verdict = json.loads(llm(prompt))
-    assert verdict["correct"] in ("pass", "fail") and verdict["grounded"] in ("pass", "fail")
-    return verdict
+    return json.loads(llm(prompt))
 
 def deterministic_checks(case: dict, run: dict) -> dict:
     return {"used_expected_tool": case["expected_tool"] in run["tools_called"],
@@ -286,6 +284,8 @@ Illustrative numbers showing the shape of a length-bias incident; your own will 
   a score change can be traced to a cause.
 - **Gate on a margin with repeats.** Agents are non-deterministic; run each case 2-3 times or use enough cases, and fail
   CI only on drops beyond the observed run-to-run noise.
+- **Validate every verdict.** Reject any criterion value other than `pass` or `fail` before counting it, so a
+  malformed judge reply fails loudly instead of skewing the score.
 
 ## Trade-offs
 - **Judge vs human review.** A judge scales to thousands of runs for cents each, while humans catch subtle errors; use

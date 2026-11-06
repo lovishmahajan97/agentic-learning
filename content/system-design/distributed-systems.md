@@ -218,15 +218,12 @@ re-index a document, pauses longer than the lease, and a second worker takes ove
 rejects the first worker's late write because its token is stale.
 
 ```python
-import time, threading
-
 class LeaseLock:                       # stand-in for etcd/ZooKeeper/Redis-with-care
-    def __init__(self, ttl): self.ttl, self.token, self.holder, self.expires = ttl, 0, None, 0.0
-    def acquire(self, who):
-        if self.holder is None or time.monotonic() > self.expires:
-            self.token += 1; self.holder, self.expires = who, time.monotonic() + self.ttl
-            return self.token         # strictly increasing fencing token
-        return None
+    def __init__(self, ttl): self.ttl, self.token, self.expires = ttl, 0, 0.0
+    def acquire(self, now):
+        if now < self.expires: return None
+        self.token += 1; self.expires = now + self.ttl
+        return self.token              # strictly increasing fencing token
 
 class IndexStore:                      # the protected resource checks the token
     def __init__(self): self.max_token, self.data = 0, {}
@@ -236,22 +233,14 @@ class IndexStore:                      # the protected resource checks the token
         self.max_token = token; self.data[doc_id] = chunks
 
 lock, store = LeaseLock(ttl=0.5), IndexStore()
-
-def worker(name, pause):
-    tok = lock.acquire(name)
-    if tok is None: return
-    time.sleep(pause)                  # simulates a GC pause or a slow embedding call
-    try:
-        store.write(tok, "doc-42", f"chunks by {name} (token {tok})")
-        print(f"{name}: wrote with token {tok}")
-    except PermissionError as e:
-        print(f"{name}: rejected ({e})")
-
-a = threading.Thread(target=worker, args=("A", 1.0)); a.start()   # holds lease, then stalls
-time.sleep(0.7)                                                   # lease has expired by now
-b = threading.Thread(target=worker, args=("B", 0.0)); b.start()   # takes token 2, writes
-a.join(); b.join()
-print(store.data["doc-42"])            # B's chunks survive; A's late write was fenced off
+a = lock.acquire(now=0.0)              # A takes token 1, then stalls (GC pause, slow embedding call)
+b = lock.acquire(now=0.7)              # lease expired: B takes token 2
+store.write(b, "doc-42", "chunks by B")
+try:
+    store.write(a, "doc-42", "chunks by A")    # A wakes up and writes late
+except PermissionError as e:
+    print("A rejected:", e)            # A rejected: stale token 1 < 2
+print(store.data["doc-42"])            # chunks by B
 ```
 
 - **Without the token check,** worker A's write would land after B's and silently overwrite a newer index
@@ -273,47 +262,15 @@ def always_overlap(n, w, r):                      # does every read set meet eve
     return all(set(ws) & set(rs)
                for ws in combinations(nodes, w) for rs in combinations(nodes, r))
 
-print(attempts(3, 5), attempts(3, 1), attempts(1, 5))      # 1024 4 32
-for n, w, r in [(3, 2, 2), (5, 3, 3), (5, 2, 2), (5, 1, 4)]:
+print(attempts(3, 5), attempts(3, 1))             # 1024 4
+for n, w, r in [(3, 2, 2), (5, 3, 3), (5, 2, 2)]:
     print(f"N={n} W={w} R={r}  W+R>N={w + r > n}  overlap={always_overlap(n, w, r)}")
 # N=3 W=2 R=2  W+R>N=True  overlap=True
 # N=5 W=3 R=3  W+R>N=True  overlap=True
 # N=5 W=2 R=2  W+R>N=False  overlap=False
-# N=5 W=1 R=4  W+R>N=False  overlap=False
 ```
 
 - **Retrying at one layer only** (3 retries, 1 layer) caps the fan-out at 4 attempts instead of 1,024.
-
-### Agent scenario: one tool-call wrapper that owns deadline, retry and key
-The agent runtime is the single retry layer, so the model SDK's own retries are turned off. Each tool call
-gets the run's remaining budget, the same key on every attempt and a breaker per tool. `breaker` and
-`tool.call` stand in for your circuit breaker and tool client.
-
-```python
-import random, time
-
-def call_tool(tool, args, run, step, breaker, max_attempts=2, min_budget_s=0.5):
-    key = f"{run.id}:{step}"                          # same key on every attempt
-    for attempt in range(max_attempts):
-        remaining = run.deadline - time.monotonic()   # monotonic clock, not wall clock
-        if remaining < min_budget_s:
-            return {"error": "deadline exhausted", "retryable": False}
-        if breaker.is_open(tool.name):
-            return {"error": f"{tool.name} unavailable", "retryable": False}  # model can pick another path
-        try:
-            out = tool.call(args, timeout=min(tool.cap_s, remaining), idempotency_key=key)
-            breaker.record(tool.name, ok=True)
-            return out
-        except TimeoutError:
-            breaker.record(tool.name, ok=False)       # outcome unknown: the key makes a retry safe
-            time.sleep(random.uniform(0, 0.2 * 2 ** attempt))  # jittered backoff
-    return {"error": "timed out, outcome unknown", "retryable": False, "key": key}
-```
-
-- **Return errors to the model as data.** A structured "unavailable" or "outcome unknown" result lets the
-  agent choose a fallback or tell the user, instead of the loop crashing or retrying blindly.
-- **Caveat:** the key only prevents duplicates if the tool's API deduplicates on it; for tools that do not,
-  query by a correlation id before any retry.
 
 ### Worked scenario: propagating a deadline through an agent request
 A chat request arrives with a 10-second budget (illustrative numbers). Each hop passes on what is left
@@ -358,6 +315,11 @@ rather than its own default timeout.
 - **One trace per run.** Propagate one trace id through model calls, retrieval and tools (LangSmith, or
   OpenTelemetry with GenAI conventions in your tracing backend) so a failed run can be reconstructed hop
   by hop. Monitor the share of runs with complete traces.
+- **Tool errors go back to the model as data.** A tool-call wrapper that owns deadline and retry should
+  return a structured "unavailable", "deadline exhausted" or "outcome unknown" result (refusing to start a
+  call with under about 0.5 s of budget left) so the agent can choose a fallback instead of crashing. An
+  idempotency key only prevents duplicates if the tool's API deduplicates on it; for tools that do not,
+  query by a correlation id before any retry.
 
 ## Trade-offs
 - **Replicas vs write latency or staleness.** Replicating raises availability and read capacity, but every

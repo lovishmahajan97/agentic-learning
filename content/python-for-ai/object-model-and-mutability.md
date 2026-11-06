@@ -305,25 +305,18 @@ def compact(messages: list[dict[str, str]], limit: int = 20) -> None:
         if m["role"] == "tool" and len(m["content"]) > limit:
             m["content"] = m["content"][:limit] + "...[truncated]"
 
-def fresh_history() -> list[dict[str, str]]:
-    return [{"role": "user", "content": "Summarise ticket 4521"},
-            {"role": "tool", "content": "full ticket text " * 10}]   # 170 characters
-
-history = fresh_history()
-branch_a = list(history)                    # shallow: new list, SAME message dicts
-branch_b = list(history)
-compact(branch_a)                           # branch A compacts for a cheaper model
-print(len(branch_b[1]["content"]))          # 34: branch B lost the full tool output too
-print(history[1] is branch_b[1])            # True
-
 def compacted(messages: list[dict[str, str]], limit: int = 20) -> list[dict[str, str]]:
     return [{**m, "content": m["content"][:limit] + "...[truncated]"}
             if m["role"] == "tool" and len(m["content"]) > limit else m
-            for m in messages]               # new dicts only where something changes
+            for m in messages]                          # new dicts only where something changes
 
-history = fresh_history()
-branch_a = compacted(history)
-print(len(history[1]["content"]), len(branch_a[1]["content"]))   # 170 34
+history = [{"role": "user", "content": "Summarise ticket 4521"},
+           {"role": "tool", "content": "full ticket text " * 10}]   # 170 characters
+print(len(compacted(history)[1]["content"]), len(history[1]["content"]))   # 34 170: original intact
+
+branch_a, branch_b = list(history), list(history)    # shallow: new lists, SAME message dicts
+compact(branch_a)                                    # branch A compacts for a cheaper model
+print(len(branch_b[1]["content"]), history[1] is branch_b[1])   # 34 True: branch B lost it too
 ```
 
 | Branching approach | Cost per fork | Safe if a branch edits a message? |
@@ -333,86 +326,38 @@ print(len(history[1]["content"]), len(branch_a[1]["content"]))   # 170 34
 | `copy.deepcopy(history)` | O(size), every fork | yes, but slow for long transcripts |
 | Treat messages as immutable, return new ones | only what changes | yes, and cheap |
 
-### Four aliasing bugs from real LLM code, with fixes
-A shared default leaks history between callers, a shallow-copied template leaks tools between tenants,
-`+=` differs for lists and strings, and nested-list multiplication aliases rows.
+### Three leaks between callers: a default, a template, a class attribute
+A shared default leaks history between calls, a shallow-copied template extended with `+=` leaks tools
+between tenants, and a class-level list is shared by every agent.
 
 ```python
-import copy
-
 def ask(question: str, history: list[dict] = []) -> list[dict]:   # BUG: one list for every call
     history.append({"role": "user", "content": question})
     return history
 
 print(len(ask("a")), len(ask("b")))              # 1 2  -> the second caller sees the first turn
-
-def ask_ok(question: str, history: list[dict] | None = None) -> list[dict]:
-    history = [] if history is None else history  # fresh list per call unless one is passed
-    return [*history, {"role": "user", "content": question}]
+# fix: default to None and return [*(history or []), new_message]
 
 BASE = {"system": "You are a support bot.", "tools": ["search"]}
 
 def per_tenant(tenant: str) -> dict:
     cfg = BASE.copy()                            # shallow: cfg["tools"] IS BASE["tools"]
-    cfg["tools"].append(f"{tenant}_crm")         # leaks into every later tenant
+    cfg["tools"] += [f"{tenant}_crm"]            # list += mutates in place: leaks into BASE
     return cfg
 
 per_tenant("acme"); print(BASE["tools"])        # ['search', 'acme_crm']
-
-def per_tenant_ok(tenant: str) -> dict:
-    cfg = copy.deepcopy(BASE)                    # or rebuild; or store BASE as tuples
-    cfg["tools"] = [*cfg["tools"], f"{tenant}_crm"]
-    return cfg
-
-a = [1, 2]; b = a; c = a[:]
-b += [3]                                        # list.__iadd__ mutates the shared list in place
-print(a is b, a, c)                             # True [1, 2, 3] [1, 2]  (c is a shallow copy)
-s = "x"; t = s; s += "y"                        # str is immutable: += rebinds s only
-print(t)                                        # x
-grid = [[0] * 2] * 2; grid[0][0] = 9            # both rows are the same inner list
-print(grid, [[0] * 2 for _ in range(2)])        # [[9, 0], [9, 0]] [[0, 0], [0, 0]]
-```
-
-### Class-attribute leak, read-only template, and the tuple `+=` puzzle
-The class list is shared by every agent; a `MappingProxyType` template makes the tenant leak impossible
-rather than avoided; and `t[0] += [2]` both raises and mutates.
-
-```python
-from types import MappingProxyType
+# fix: cfg["tools"] = [*BASE["tools"], f"{tenant}_crm"], or copy.deepcopy(BASE)
 
 class Agent:
-    history: list[str] = []                     # BUG: one list on the class object
+    history: list[str] = []                     # BUG: one list on the class; fix: set it in __init__
 
     def remember(self, m: str) -> None:
         self.history.append(m)                  # reads the class list, mutates it for everyone
 
-class AgentOk:
-    def __init__(self) -> None:
-        self.history: list[str] = []            # one list per instance
-
 a, b = Agent(), Agent()
 a.remember("hi from a")
 print(b.history)                                # ['hi from a']
-print(AgentOk().history is AgentOk().history)   # False
-
-DEFAULTS = MappingProxyType({"model": "gpt-4o-mini", "headers": MappingProxyType({"X-App": "bot"})})
-try:
-    DEFAULTS["headers"]["X-Tenant"] = "acme"
-except TypeError as e:
-    print("blocked:", e)                        # blocked: 'mappingproxy' object does not support item assignment
-headers = {**DEFAULTS["headers"], "X-Tenant": "acme"}   # new small dict per request
-print(headers, dict(DEFAULTS["headers"]))       # {'X-App': 'bot', 'X-Tenant': 'acme'} {'X-App': 'bot'}
-
-t = ([1],)
-try:
-    t[0] += [2]                                 # list.__iadd__ runs, then tuple item store fails
-except TypeError:
-    pass
-print(t)                                        # ([1, 2],)
 ```
-
-- **Why the proxy is nested:** freezing is shallow, so the inner `headers` dict needs its own
-  `MappingProxyType`, or it stays writable.
 
 ## Production patterns
 - **Append-only transcripts, new messages for edits.** Treat each message in an agent's history as
@@ -435,6 +380,8 @@ print(t)                                        # ([1, 2],)
   fine-tuning, or finished agent runs kept alive by a cache or callback), clear notebook output history
   and stored exceptions, and inspect holders with `gc.get_referrers(obj)`. Monitor allocated memory per
   step (for example `torch.cuda.memory_allocated()`) across a long run.
+- **Freeze nested templates all the way down.** `MappingProxyType` is shallow: wrap each inner dict
+  (such as default headers) in its own proxy, or it stays writable through the outer one.
 
 ## Trade-offs
 - **Immutable sharing vs allocation.** Tuples, frozen dataclasses and `MappingProxyType` are safe to share

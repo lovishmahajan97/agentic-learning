@@ -336,15 +336,10 @@ the set of next nodes, and `assert_never` forces a branch for every finish reaso
 from enum import StrEnum
 from typing import Literal, NotRequired, TypedDict, assert_never
 
-class ToolCall(TypedDict):
-    id: str
-    name: Literal["search", "calculator"]       # the tool vocabulary, closed
-    arguments: str
-
 class AgentState(TypedDict):                     # graph state: stays a plain dict
     messages: list[dict[str, object]]
     steps: int
-    pending: NotRequired[list[ToolCall]]
+    pending: NotRequired[list[str]]              # tool-call ids waiting to run
 
 class Finish(StrEnum):
     STOP = "stop"
@@ -353,75 +348,23 @@ class Finish(StrEnum):
 
 Next = Literal["run_tools", "respond", "give_up"]
 
-def route(state: AgentState, finish: Finish, max_steps: int = 8) -> Next:
-    if state["steps"] >= max_steps:
+def route(state: AgentState, finish: Finish) -> Next:
+    if state["steps"] >= 8:
         return "give_up"
     match finish:
         case Finish.TOOL_CALLS: return "run_tools" if state.get("pending") else "respond"
-        case Finish.STOP: return "respond"
-        case Finish.LENGTH: return "respond"
+        case Finish.STOP | Finish.LENGTH: return "respond"
         case _: assert_never(finish)
 
-state: AgentState = {"messages": [], "steps": 2,
-                     "pending": [{"id": "c1", "name": "search", "arguments": '{"q": "refund policy"}'}]}
-print(route(state, Finish("tool_calls")))       # run_tools
-print(route({"messages": [], "steps": 8}, Finish.STOP))   # give_up
+state: AgentState = {"messages": [], "steps": 2, "pending": ["c1"]}
+print(type(state), route(state, Finish("tool_calls")))   # <class 'dict'> run_tools
+print(route({"messages": [], "steps": 8}, Finish.STOP))  # give_up
+print(isinstance(Finish.STOP, str), f"{Finish.STOP}")   # True stop: a StrEnum is a str
 ```
 
-- **Add a member and see:** a new `Finish.PAUSE` without a case makes the checker flag `assert_never`;
+- **Add a member and see:** a new `Finish.PAUSE` without a case makes mypy or pyright report that
+  `assert_never` received `Literal[Finish.PAUSE]` (the member left over after narrowing), not `Never`;
   a `return "run_tool"` typo is flagged because it is not a `Next`.
-
-### Wire message, behavioural StrEnum, exhaustive match
-An optional key, a `StrEnum` carrying behaviour, and an exhaustive `match` the checker polices. Requires
-Python 3.11+ for `NotRequired`, `StrEnum` and `assert_never`.
-
-```python
-import json
-from enum import StrEnum
-from typing import Literal, NotRequired, TypedDict, assert_never
-
-Role = Literal["system", "user", "assistant", "tool"]
-
-class ToolCall(TypedDict):
-    id: str
-    name: str
-    arguments: str                 # JSON text, exactly as the API sends it
-
-class ChatMessage(TypedDict):
-    role: Role
-    content: str | None
-    tool_calls: NotRequired[list[ToolCall]]
-
-class FinishReason(StrEnum):
-    STOP = "stop"
-    LENGTH = "length"
-    TOOL_CALLS = "tool_calls"
-    CONTENT_FILTER = "content_filter"
-
-    @property
-    def truncated(self) -> bool:
-        return self is FinishReason.LENGTH
-
-def next_action(reason: FinishReason) -> Literal["return", "continue", "call_tools", "refuse"]:
-    match reason:
-        case FinishReason.STOP: return "return"
-        case FinishReason.LENGTH: return "continue"
-        case FinishReason.TOOL_CALLS: return "call_tools"
-        case FinishReason.CONTENT_FILTER: return "refuse"
-        case _: assert_never(reason)   # add a member above without a case: checker error here
-
-msg: ChatMessage = {"role": "assistant", "content": None,
-                    "tool_calls": [{"id": "c1", "name": "search", "arguments": '{"q": "kv cache"}'}]}
-print(type(msg))                                   # <class 'dict'>: no wrapper object exists
-reason = FinishReason("tool_calls")                # lookup by wire value
-print(reason.truncated, next_action(reason))       # False call_tools
-print(json.dumps({"finish": reason}))              # {"finish": "tool_calls"}: StrEnum is a str
-# msg["role"] = "robot"   -> checker error: "robot" is not a Role
-```
-
-- **Exhaustiveness in action:** remove the `CONTENT_FILTER` case and mypy or pyright reports that
-  `assert_never` received `Literal[FinishReason.CONTENT_FILTER]` (the member left over after
-  narrowing), not `Never`.
 
 ### Validating a TypedDict at the boundary
 `json.loads` returns `Any`, so the checker would trust any shape. A `TypeAdapter` turns it into a
@@ -429,18 +372,12 @@ checked dict and still returns plain dicts.
 
 ```python
 import json
-from typing import Literal, NotRequired, TypedDict
+from typing import Literal, TypedDict
 from pydantic import TypeAdapter, ValidationError
-
-class ToolCall(TypedDict):
-    id: str
-    name: str
-    arguments: str
 
 class ChatMessage(TypedDict):
     role: Literal["system", "user", "assistant", "tool"]
     content: str | None
-    tool_calls: NotRequired[list[ToolCall]]
 
 messages = TypeAdapter(list[ChatMessage])        # build once at import time, reuse per request
 

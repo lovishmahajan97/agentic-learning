@@ -216,8 +216,6 @@ class MoELayer(nn.Module):
         for e in range(self.n):                            # one batched matmul per expert
             hit = (topi == e)                              # [tokens, k] bool
             rows = hit.any(-1).nonzero(as_tuple=True)[0]
-            if rows.numel() == 0:
-                continue
             w = (topv * hit)[rows].sum(-1, keepdim=True)   # router weight for expert e
             out[rows] += w * self.experts[e](x[rows])      # gradient reaches the router via w
         frac = F.one_hot(topi, self.n).float().sum(1).mean(0) / self.k   # f_i: share of routings per expert
@@ -227,8 +225,8 @@ class MoELayer(nn.Module):
 
 layer = MoELayer()
 y, aux = layer(torch.randn(4096, 512))
-print(y.shape, round(aux.item(), 3))
-print(sum(p.numel() for p in layer.experts.parameters()) / 1e6, "M expert params total")
+print(y.shape, round(aux.item(), 3))                    # torch.Size([4096, 512]) ~1.0 (near-uniform router)
+print(sum(p.numel() for p in layer.experts.parameters()) / 1e6, "M expert params total")   # ~16.8
 ```
 
 - **Not production code.** Production kernels do not loop over experts in Python; they sort tokens by

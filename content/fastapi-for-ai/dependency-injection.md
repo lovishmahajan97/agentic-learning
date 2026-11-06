@@ -312,78 +312,14 @@ flowchart TD
 ```
 
 ## Examples
-### Agent endpoint with per-user tools and a scripted fake model in tests
-The toolset is built per request from the caller's scopes, so a viewer's agent cannot even propose
-`refund_order`. In the test, `ScriptedLLM` returns a fixed tool call and then an answer, which makes the
-agent loop deterministic and free to run in CI.
-
-```python
-from typing import Annotated
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.testclient import TestClient
-
-app = FastAPI()
-USERS = {"key-viewer": {"id": "u1", "scopes": {"orders:read"}},
-         "key-admin": {"id": "u2", "scopes": {"orders:read", "orders:refund"}}}
-ALL_TOOLS = {"lookup_order": "orders:read", "refund_order": "orders:refund"}
-
-def get_principal(x_api_key: Annotated[str, Header()]) -> dict:
-    p = USERS.get(x_api_key)
-    if p is None:
-        raise HTTPException(401, "invalid api key")
-    return p
-
-def get_tools(p: Annotated[dict, Depends(get_principal)]) -> list[str]:
-    return [t for t, scope in ALL_TOOLS.items() if scope in p["scopes"]]   # per request
-
-def get_llm(request: Request):
-    return request.app.state.llm                      # built once in lifespan (not shown)
-
-@app.post("/agent/run")
-async def run(task: str, tools: Annotated[list[str], Depends(get_tools)], llm=Depends(get_llm)):
-    history, steps = [task], []
-    for _ in range(5):                                # max steps
-        reply = await llm.next(history, tools)
-        if reply["type"] == "answer":
-            return {"answer": reply["text"], "steps": steps}
-        if reply["tool"] not in tools:                # defence in depth: re-check every call
-            raise HTTPException(403, f"tool {reply['tool']} not allowed")
-        steps.append(reply["tool"]); history.append(f"{reply['tool']} -> ok")
-    return {"answer": None, "steps": steps}
-
-class ScriptedLLM:                                    # deterministic fake for agent tests
-    def __init__(self): self.calls = 0
-    async def next(self, history, tools):
-        self.calls += 1
-        return {"type": "tool", "tool": "lookup_order"} if self.calls == 1 else {"type": "answer", "text": "shipped"}
-
-app.dependency_overrides[get_llm] = ScriptedLLM       # class is callable: fresh fake per request
-with TestClient(app) as c:
-    r = c.post("/agent/run", params={"task": "where is order 7?"}, headers={"x-api-key": "key-viewer"})
-    assert r.json() == {"answer": "shipped", "steps": ["lookup_order"]}
-app.dependency_overrides.clear()
-```
-
-### Worked scenario: agent test suite with and without the override
-A suite of 200 agent tests, each averaging 4 steps (illustrative costs and latencies).
-
-| | Real model | `ScriptedLLM` override |
-|---|---|---|
-| LLM calls per CI run | 200 × 4 = 800 | 0 |
-| Wall time (about 3 s per call, run serially) | ~40 minutes | seconds |
-| Flaky failures | model output varies between runs | none: the script is fixed |
-| What it tests | prompt quality and wiring together | wiring: tool filtering, budget, loop limits, error paths |
-
-Keep a separate, smaller eval suite against the real model for prompt quality; do not mix the two.
-
 ### Auth, shared client, request-scoped budget and a test override
-- **Auth:** an API-key dependency.
-- **Shared client:** the LLM client fetched from `app.state`.
-- **Request scope:** a yield dependency holding a per-request spend cap (here $0.50) whose spend is
-  recorded even when the handler raises a 429.
-- **Test seam:** the override that keeps the suite from spending tokens.
+- **Auth:** `get_tenant`, an API-key dependency.
+- **Shared client:** `get_llm` fetches the LLM client from `app.state`; it never builds one.
+- **Request scope:** the `budget` yield dependency holds a per-request spend cap (here $0.50) and records
+  spend in `finally`, even when the handler raises a 429.
 - **Caching:** `get_tenant` appears twice in the tree (directly and under `budget`) but runs once per
   request.
+- **Test seam:** overriding `get_llm` with `FakeLLM` keeps the suite from spending tokens.
 
 ```python
 from typing import Annotated
@@ -394,85 +330,79 @@ app = FastAPI()
 TENANTS = {"key-acme": {"id": "acme", "max_request_usd": 0.50}}
 
 def get_tenant(x_api_key: Annotated[str, Header()]) -> dict:
-    tenant = TENANTS.get(x_api_key)
-    if tenant is None:
-        raise HTTPException(401, "invalid api key")
-    return tenant
+    if x_api_key not in TENANTS: raise HTTPException(401, "invalid api key")
+    return TENANTS[x_api_key]
 
 def get_llm(request: Request):
-    return request.app.state.llm       # created once in lifespan (not shown); fetched per request
-
-class Budget:
-    def __init__(self, limit): self.limit, self.spent = limit, 0.0
-    def charge(self, usd):
-        self.spent += usd
-        if self.spent > self.limit: raise HTTPException(429, "budget exceeded")
+    return request.app.state.llm                  # created once in lifespan (not shown)
 
 async def budget(tenant: Annotated[dict, Depends(get_tenant)]):
-    b = Budget(tenant["max_request_usd"])     # request-scoped: fresh per request
-    try:
-        yield b
-    finally:
-        print("record spend", tenant["id"], b.spent)   # persist to the ledger; runs even on 429
+    b = {"limit": tenant["max_request_usd"], "spent": 0.0}   # fresh per request
+    try: yield b
+    finally: print("record spend", tenant["id"], b["spent"])    # runs even on 429
 
 @app.post("/chat")
 async def chat(prompt: str, tenant: Annotated[dict, Depends(get_tenant)],
-               b: Annotated[Budget, Depends(budget)], llm=Depends(get_llm)):
-    text, cost = await llm.complete(prompt)
-    b.charge(cost)                  # post-hoc; a real cap also pre-checks an estimated cost
+               b: Annotated[dict, Depends(budget)], llm=Depends(get_llm)):
+    text, b["spent"] = await llm.complete(prompt)
+    if b["spent"] > b["limit"]: raise HTTPException(429, "budget exceeded")
     return {"tenant": tenant["id"], "text": text}
-
-class FakeLLM:                                       # test seam: no production code changes
+class FakeLLM:                                    # test seam: no production code changes
     async def complete(self, prompt): return f"echo: {prompt}", 0.001
 app.dependency_overrides[get_llm] = lambda: FakeLLM()
-with TestClient(app) as c:
-    r = c.post("/chat", params={"prompt": "hi"}, headers={"x-api-key": "key-acme"})
-    assert r.json()["text"] == "echo: hi"
+print(TestClient(app).post("/chat", params={"prompt": "hi"}, headers={"x-api-key": "key-acme"}).json())
+# record spend acme 0.001, then {'tenant': 'acme', 'text': 'echo: hi'}
 ```
 
 ### Runnable: sibling dependencies add up, a combined one overlaps
 Two independent 200 ms lookups declared as siblings cost ~400 ms before the handler starts; one
-dependency that runs both in a task group costs ~200 ms.
+dependency that runs both concurrently costs ~200 ms.
 
 ```python
 import asyncio, time
 from typing import Annotated
-import anyio
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 app = FastAPI()
 
-async def get_profile() -> dict:
+async def get_profile() -> str:
     await asyncio.sleep(0.2)                 # stand-in for a 200 ms lookup
-    return {"plan": "pro"}
+    return "pro"
 
 async def get_quota() -> int:
     await asyncio.sleep(0.2)                 # another independent 200 ms lookup
     return 1000
 
 @app.get("/slow")                            # siblings resolve one after another: ~400 ms
-async def slow(p: Annotated[dict, Depends(get_profile)], q: Annotated[int, Depends(get_quota)]):
-    return {"plan": p["plan"], "quota": q}
+async def slow(p: Annotated[str, Depends(get_profile)], q: Annotated[int, Depends(get_quota)]):
+    return {"plan": p, "quota": q}
 
-async def profile_and_quota() -> tuple[dict, int]:
-    out = {}
-    async def run(key, fn): out[key] = await fn()
-    async with anyio.create_task_group() as tg:   # both lookups overlap: ~200 ms
-        tg.start_soon(run, "p", get_profile)
-        tg.start_soon(run, "q", get_quota)
-    return out["p"], out["q"]
+async def profile_and_quota() -> tuple:
+    return await asyncio.gather(get_profile(), get_quota())   # both overlap: ~200 ms
 
 @app.get("/fast")
-async def fast(pq: Annotated[tuple[dict, int], Depends(profile_and_quota)]):
-    p, q = pq
-    return {"plan": p["plan"], "quota": q}
+async def fast(pq: Annotated[tuple, Depends(profile_and_quota)]):
+    return {"plan": pq[0], "quota": pq[1]}
 
 with TestClient(app) as c:
     for path in ("/slow", "/fast"):
         t0 = time.perf_counter(); c.get(path)
         print(path, f"{(time.perf_counter() - t0) * 1000:.0f} ms")   # ~405 ms, then ~205 ms
 ```
+
+### Worked scenario: agent test suite with and without the override
+A suite of 200 agent tests, each averaging 4 steps (illustrative costs and latencies), with `get_llm`
+overridden by a scripted fake such as the Lab's `ScriptedLLM` (one fixed tool call, then an answer).
+
+| | Real model | `ScriptedLLM` override |
+|---|---|---|
+| LLM calls per CI run | 200 × 4 = 800 | 0 |
+| Wall time (about 3 s per call, run serially) | ~40 minutes | seconds |
+| Flaky failures | model output varies between runs | none: the script is fixed |
+| What it tests | prompt quality and wiring together | wiring: tool filtering, budget, loop limits, error paths |
+
+Keep a separate, smaller eval suite against the real model for prompt quality; do not mix the two.
 
 ## Production patterns
 - **Build the toolset per request from the principal.** Use on every multi-user agent: a dependency
@@ -497,6 +427,11 @@ with TestClient(app) as c:
 - **Trace time spent before the handler.** Use when latency is unexplained: open a span or timer inside
   slow dependencies and compare total request time to handler time. Merge independent slow siblings into
   one task-group dependency, as in the runnable example.
+- **Re-check every tool call the model proposes.** Even with a per-request toolset, the agent loop should
+  reject (403) any tool name not in the caller's list, and cap the loop at a fixed step count (for example
+  5) so a scripted or real model cannot run forever.
+- **Pre-check estimated cost, not only post-hoc spend.** A budget that charges after the call can overshoot
+  by one call; a real cap also checks an estimated cost before calling the model.
 
 ## Trade-offs
 - **Explicit needs vs hidden cost.** Typed, per-request resolution makes every handler's needs explicit

@@ -310,31 +310,31 @@ tool-calling agent.
 import numpy as np
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 
-# X: (n_samples, dim) float32 embeddings of past requests; y: routed intent labels
 rng = np.random.default_rng(0)
-X = rng.standard_normal((4000, 384)).astype(np.float32)
-y = rng.choice(["billing", "faq", "order_status", "needs_agent"], size=4000)
+X = rng.standard_normal((4000, 384)).astype(np.float32)      # stand-in for request embeddings
+y = rng.choice(["billing", "faq", "order_status", "needs_agent"], size=4000)   # intent labels
 
 X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
 router = CalibratedClassifierCV(
     LogisticRegression(max_iter=1000, class_weight="balanced"), cv=5).fit(X_tr, y_tr)
-print(classification_report(y_te, router.predict(X_te)))
 
 THRESHOLD = 0.8          # choose from a precision-vs-coverage curve on validation data
 
 def route(embedding: np.ndarray) -> str:
     p = router.predict_proba(embedding.reshape(1, -1))[0]
-    label, conf = router.classes_[p.argmax()], p.max()
+    label, conf = str(router.classes_[p.argmax()]), p.max()
     if label == "needs_agent" or conf < THRESHOLD:
         return "agent"           # full tool-calling loop
     return label                 # cheap handler: FAQ answer, status lookup, billing form
+
+print(route(X_te[0]))            # agent
 ```
 
 - **Random data here, real embeddings in practice:** with random features the classifier learns nothing,
-  which is itself a useful sanity check that the baseline catches.
+  so every calibrated probability sits near 0.25 and every request falls back to `agent`, which is itself
+  a useful sanity check.
 
 ### Worked scenario: what the router saves
 10,000 requests a day; an agent run averages 4 model calls at an illustrative $0.01 per call.
@@ -380,8 +380,6 @@ print(f"model macro-F1 {f1.mean():.3f} ± {f1.std():.3f} | baseline {base.mean()
 
 pipe.fit(X_tr, y_tr)                                     # final fit on all training data
 print(classification_report(y_te, pipe.predict(X_te)))   # test set used once
-probs = pipe.predict_proba(["I was charged twice this month"])[0]
-print(dict(zip(pipe.classes_, probs.round(2))))
 ```
 
 Suppose 4,000 tickets across 6 intents, with `billing` at 40% of them:

@@ -177,11 +177,8 @@ def run_tests(code: str, tests: str) -> tuple[bool, int, str]:
     d = pathlib.Path(tempfile.mkdtemp())
     (d / "solution.py").write_text(code)
     (d / "test_solution.py").write_text(tests)
-    try:                                                # no -x: we want to count every pass
-        p = subprocess.run([sys.executable, "-m", "pytest", "-q", str(d)],
-                           capture_output=True, text=True, timeout=60)
-    except subprocess.TimeoutExpired:
-        return False, 0, "Tests timed out after 60 s (infinite loop?)"
+    p = subprocess.run([sys.executable, "-m", "pytest", "-q", str(d)],   # no -x: count every pass
+                       capture_output=True, text=True, timeout=60)
     m = re.search(r"(\d+) passed", p.stdout)
     return p.returncode == 0, int(m.group(1)) if m else 0, p.stdout[-2000:]
 
@@ -259,6 +256,8 @@ The fix was not more iterations; it was giving the critic the source document an
 - **Trace every attempt and critique.** Record each attempt, its score and the critic's issues as child
   spans (LangSmith or OpenTelemetry), and turn disputed critiques into a labelled dataset for the critic.
   Monitor score per iteration; a flat or falling curve says remove the loop.
+- **Time-limit every test run.** Pass a timeout (for example 60 s) to the test subprocess and score a
+  timeout as zero tests passed, because a revision can introduce an infinite loop.
 
 ## Trade-offs
 - **Higher success vs per-iteration cost.** Grounded reflection raises success on checkable tasks

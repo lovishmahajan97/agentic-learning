@@ -333,37 +333,27 @@ tracemalloc compares two snapshots around a burst of requests; cProfile then sho
 
 ```python
 import cProfile, pstats, tracemalloc
-from functools import lru_cache
 
 HISTORY: list[str] = []                          # the bug: grows forever
-
-@lru_cache(maxsize=None)                         # second bug: unbounded cache keyed by full text
-def normalize(text: str) -> str:
-    return " ".join(text.lower().split())
 
 def handle(i: int) -> int:
     doc = f"Retrieved chunk {i} " * 200
     HISTORY.append(doc)                          # kept "for debugging"
-    return len(normalize(doc).split())
+    return len(doc.split())
 
-tracemalloc.start(10)                            # keep 10 frames per allocation
+tracemalloc.start()
 before = tracemalloc.take_snapshot()
 for i in range(5_000):
     handle(i)
 after = tracemalloc.take_snapshot()
-for stat in after.compare_to(before, "lineno")[:3]:
-    print(stat)    # top lines by growth: the `doc = ...` line (strings kept alive by HISTORY),
-                   # normalize's join (cached results) and the call site (lru_cache entries)
+print(after.compare_to(before, "lineno")[0])     # the `doc = ...` line: size=20.0 MiB, count=5000
 tracemalloc.stop()
 
-prof = cProfile.Profile()
-prof.enable()
-for i in range(5_000, 10_000):
-    handle(i)
-prof.disable()
+with cProfile.Profile() as prof:                 # context manager: Python 3.8+
+    for i in range(5_000, 10_000):
+        handle(i)
 pstats.Stats(prof).sort_stats("cumulative").print_stats(5)
-# Fix: bound the history (collections.deque(maxlen=100)) and give lru_cache a maxsize,
-# then re-run the snapshot diff and confirm growth is flat across bursts.
+# Fix: HISTORY = collections.deque(maxlen=100), then re-run the diff and confirm growth is flat.
 ```
 
 ### Wall vs CPU time: the first discriminating measurement
@@ -384,53 +374,14 @@ def sequential_calls(n):            # stands in for n embedding calls made one a
         time.sleep(0.05)            # time.sleep releases the CPU, like waiting on a socket
 
 def tokenize_loop(n):               # pure-Python work: CPU time tracks wall time
-    text = "the quick brown fox " * 50
     for _ in range(n):
-        sum(len(w) for w in text.split())
+        sum(len(w) for w in ("the quick brown fox " * 50).split())
 
 measure(sequential_calls, 12)       # wall ≈ 0.6s, cpu ≈ 0.00s -> waiting
 measure(tokenize_loop, 20_000)      # wall ≈ cpu -> CPU-bound
 ```
 
 The 0.5 threshold is a rule of thumb for the demo, not a standard.
-
-### Agent scenario: session memory that never shrinks
-An agent server keeps each conversation's transcript in a dict keyed by session ID. tracemalloc shows the
-growth line; the fix bounds both the number of sessions and the transcript per session. Standard library
-only.
-
-```python
-import tracemalloc
-from collections import OrderedDict, deque
-
-SESSIONS: dict[str, list[str]] = {}                      # the bug: no eviction, no cap per session
-
-def agent_step(sid: str, i: int) -> None:
-    turn = f"tool result {i}: " + "x" * 2_000             # stands in for a large tool output
-    SESSIONS.setdefault(sid, []).append(turn)
-
-tracemalloc.start()
-before = tracemalloc.take_snapshot()
-for i in range(20_000):
-    agent_step(f"s{i % 2_000}", i)                        # 2,000 sessions, 10 steps each
-after = tracemalloc.take_snapshot()
-print(after.compare_to(before, "lineno")[0])              # points at the `turn = ...` line
-tracemalloc.stop()
-
-class BoundedSessions:                                    # the fix: LRU over sessions, cap per session
-    def __init__(self, max_sessions: int = 500, max_turns: int = 50) -> None:
-        self._d: OrderedDict[str, deque] = OrderedDict()
-        self._max_s, self._max_t = max_sessions, max_turns
-    def append(self, sid: str, turn: str) -> None:
-        q = self._d.pop(sid, None) or deque(maxlen=self._max_t)
-        q.append(turn)
-        self._d[sid] = q                                  # most recent at the end
-        if len(self._d) > self._max_s:
-            self._d.popitem(last=False)                   # evict least recently used session
-```
-
-In production, durable conversation state belongs in a store (Redis, Postgres or a LangGraph
-checkpointer); the in-process structure should only be a bounded cache.
 
 ### Worked scenario: an agent step that "needed a faster model"
 A support agent's step took about 8 s at p95. Wall versus CPU time and a trace told a different story
@@ -476,6 +427,11 @@ Same facts as Check yourself, walked as a diagnosis.
   process before and after each change; for a function, `timeit` with repeats and compare the minimum.
 - **Trace remote calls.** When wall time far exceeds CPU time, add spans per LLM, embedding and vector-store
   call; the fix is usually concurrency or batching, visible in the trace waterfall.
+- **Give every `lru_cache` a `maxsize`.** `@lru_cache(maxsize=None)` keyed by full request text keeps
+  every request's text alive for the life of the worker.
+- **Durable session state lives outside the process.** Keep conversations in Redis, Postgres or a
+  LangGraph checkpointer; an in-process session structure (LRU over sessions, a turn cap per session)
+  should only be a bounded cache.
 
 ## Trade-offs
 - **Exact counts vs honest timings.** Deterministic profilers give exact call counts but distort call-heavy

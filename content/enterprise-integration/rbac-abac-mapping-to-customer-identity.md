@@ -199,49 +199,35 @@ flowchart TD
 
 ## Examples
 ### In-process evaluator with the three layers
-Tenant config is data, not code; agent scope intersects with user rights.
+Tenant config is data, not code; the tenant boundary, the source ACL and an attribute rule all must pass.
 
 ```python
-TENANT_CFG = {
-    "acme": {
-        "role_bindings": {"3f2a9c1e": "workspace_admin", "8b7d0e44": "analyst"},  # Entra group IDs
-        "attribute_map": {"extension_region": "region", "department": "department"},
-    }
-}
+TENANT_CFG = {"acme": {
+    "role_bindings": {"3f2a9c1e": "workspace_admin", "8b7d0e44": "analyst"},  # Entra group IDs
+    "attribute_map": {"extension_region": "region"},
+}}
 ROLE_ACTIONS = {"workspace_admin": {"configure", "query", "export"}, "analyst": {"query"}}
 
 def principal(tenant: str, claims: dict) -> dict:
-    cfg = TENANT_CFG[tenant]
-    groups = set(claims.get("groups", []))
+    cfg, groups = TENANT_CFG[tenant], set(claims.get("groups", []))
     roles = {r for g, r in cfg["role_bindings"].items() if g in groups}
     attrs = {ours: claims.get(theirs) for theirs, ours in cfg["attribute_map"].items()}
-    return {"tenant": tenant, "groups": groups, "roles": roles, "attrs": attrs}
-
-def can_act(p: dict, action: str, agent_scope: set | None = None) -> bool:
-    allowed = set().union(*(ROLE_ACTIONS[r] for r in p["roles"])) if p["roles"] else set()
-    if agent_scope is not None:
-        allowed &= agent_scope                       # agent never exceeds the user, nor vice versa
-    return action in allowed
+    return {"tenant": tenant, "groups": groups, "attrs": attrs,
+            "actions": set().union(*(ROLE_ACTIONS[r] for r in roles))}
 
 def can_read(p: dict, doc: dict) -> bool:
-    if doc["tenant"] != p["tenant"]:
-        return False                                 # tenant boundary first, always
-    if not (p["groups"] & set(doc["acl_groups"])):   # source-system ACL (RBAC on data)
-        return False
-    if doc.get("region") and doc["region"] != p["attrs"].get("region"):
-        return False                                 # ABAC: regional restriction
-    return True
+    return (doc["tenant"] == p["tenant"]                              # tenant boundary first, always
+            and bool(p["groups"] & set(doc["acl_groups"]))            # source-system ACL (RBAC on data)
+            and doc.get("region") in (None, p["attrs"].get("region")))  # ABAC: regional restriction
 
 ana = principal("acme", {"groups": ["8b7d0e44", "g-sales-emea"], "extension_region": "EMEA"})
 deal = {"tenant": "acme", "acl_groups": ["g-sales-emea", "g-sales-amer"], "region": "AMER"}
-print(can_act(ana, "query"), can_act(ana, "export"), can_read(ana, deal))   # True False False
-print(can_act(ana, "query", agent_scope={"export"}))                       # False
+print("query" in ana["actions"], "export" in ana["actions"], can_read(ana, deal))   # True False False
 ```
 
 - **Ana is an analyst in the EMEA sales group.** She can query but not export.
 - **The ACL matches but ABAC denies.** She is in a group on the deal's ACL, yet the regional attribute rule
   denies the AMER deal.
-- **The agent cannot amplify her.** An agent scoped only to `export` cannot query on her behalf.
 
 ### Gating every agent tool call
 Runnable standard library, reusing the idea above: the runtime filters the tool list per principal and
@@ -251,8 +237,7 @@ re-checks each call, including the resource the model chose.
 AGENT_SCOPE = {"deal_assistant": {"query", "summarize"}}
 TOOL_ACTION = {"search_deals": "query", "summarize_deal": "summarize", "export_deals": "export"}
 USER_ACTIONS = {"ana": {"query", "export"}}            # from role bindings
-DEAL_REGION = {"D-1": "EMEA", "D-2": "AMER"}
-USER_REGION = {"ana": "EMEA"}
+DEAL_REGION, USER_REGION = {"D-1": "EMEA", "D-2": "AMER"}, {"ana": "EMEA"}
 
 def allowed_actions(user: str, agent: str) -> set:
     return USER_ACTIONS.get(user, set()) & AGENT_SCOPE.get(agent, set())   # intersection
@@ -261,8 +246,7 @@ def tools_for_model(user: str, agent: str) -> list[str]:
     return [t for t, a in TOOL_ACTION.items() if a in allowed_actions(user, agent)]
 
 def execute(user: str, agent: str, tool: str, args: dict) -> dict:
-    action = TOOL_ACTION.get(tool)
-    if action not in allowed_actions(user, agent):
+    if TOOL_ACTION.get(tool) not in allowed_actions(user, agent):
         return {"error": f"denied: {tool} not permitted", "rule": "user ∩ agent scope"}
     deal = args.get("deal_id")
     if deal and DEAL_REGION.get(deal) != USER_REGION.get(user):
@@ -274,6 +258,8 @@ print(execute("ana", "deal_assistant", "export_deals", {}))        # denied: not
 print(execute("ana", "deal_assistant", "search_deals", {"deal_id": "D-2"}))  # denied: ABAC
 ```
 
+- **The agent cannot amplify the user.** Ana's roles allow `export`, but the agent's scope does not, so
+  the intersection hides and denies `export_deals`.
 - **Denials go back to the model as tool results** with a reason, so the agent can explain instead of
   retrying, and the rule name lands in the decision log.
 
@@ -285,24 +271,20 @@ hold, built from the crosswalk and synced source-group membership.
 # Synced from each source: source group -> member source identities (nested groups pre-expanded)
 SOURCE_GROUP_MEMBERS = {
     "confluence:group:legal": {"atl:5b10"},                 # Atlassian account IDs
-    "sharepoint:sitegroup:hr-owners": {"entra:9a1f"},       # SharePoint uses Entra object IDs
     "slack:channel:C-deals": {"slack:U02ABC", "slack:U07XYZ"},
 }
 # Crosswalk: source identity -> IdP object ID, joined on IdP ID or verified email
-CROSSWALK = {"atl:5b10": "entra:9a1f", "slack:U02ABC": "entra:9a1f", "entra:9a1f": "entra:9a1f"}
+CROSSWALK = {"atl:5b10": "entra:9a1f", "slack:U02ABC": "entra:9a1f"}
 
 def principal_set(idp_user: str) -> set:
     """Every source principal this IdP user holds; computed per user, cached, invalidated on change."""
     mine = {src for src, idp in CROSSWALK.items() if idp == idp_user}
     return mine | {g for g, members in SOURCE_GROUP_MEMBERS.items() if members & mine}
 
-def visible(doc_acl: set, held: set) -> bool:
-    return bool(doc_acl & held)          # unresolved principals never match anyone: fail closed
-
-held = principal_set("entra:9a1f")
-print(visible({"confluence:group:legal"}, held))          # True: via crosswalked Atlassian ID
-print(visible({"slack:channel:C-board"}, held))           # False: not a member
-print(visible({"confluence:user:unknown-guest"}, held))   # False: unresolved grants nothing
+held = principal_set("entra:9a1f")                      # a doc is visible if its ACL & held is non-empty
+print(bool({"confluence:group:legal"} & held))          # True: via crosswalked Atlassian ID
+print(bool({"slack:channel:C-board"} & held))           # False: not a member
+print(bool({"confluence:user:unknown-guest"} & held))   # False: unresolved grants nothing (fail closed)
 ```
 
 ### Worked numbers: roles vs attributes, index vs query time
@@ -331,6 +313,8 @@ print(visible({"confluence:user:unknown-guest"}, held))   # False: unresolved gr
   set of decisions each quarter.
 - **Canary users per sensitive group.** Keep test users in HR, legal and each region, and run scheduled
   agent queries as them that must and must not return known documents. Alert on any wrong answer.
+- **Crosswalk SharePoint by Entra object ID.** SharePoint site groups list Entra object IDs, so the IdP ID
+  maps to itself; Atlassian and Slack IDs must be joined to the IdP ID or a verified email.
 
 ## Trade-offs
 - **RBAC reviewability vs role explosion.** Role bindings are easy for customer admins to review, but

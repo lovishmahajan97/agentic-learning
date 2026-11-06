@@ -202,24 +202,17 @@ import anthropic
 client = anthropic.Anthropic()
 MANUAL = open("policy_manual.md").read()          # ~20k tokens, identical on every request
 
-def ask(question: str) -> str:
-    resp = client.messages.create(
-        model="claude-opus-5-5",
-        max_tokens=1024,
-        system=[
-            {"type": "text", "text": "Answer questions using only the policy manual below."},
-            {"type": "text", "text": MANUAL,
-             "cache_control": {"type": "ephemeral"}},   # breakpoint: everything up to here is cacheable
-        ],
+def ask(question: str):
+    u = client.messages.create(
+        model="claude-opus-5-5", max_tokens=1024,
+        system=[{"type": "text", "text": MANUAL,
+                 "cache_control": {"type": "ephemeral"}}],   # breakpoint: everything up to here is cacheable
         messages=[{"role": "user", "content": question}],   # volatile content after the breakpoint
-    )
-    u = resp.usage
-    print(f"uncached={u.input_tokens} cache_write={u.cache_creation_input_tokens} "
-          f"cache_read={u.cache_read_input_tokens} output={u.output_tokens}")
-    return next(b.text for b in resp.content if b.type == "text")
+    ).usage
+    print(f"write={u.cache_creation_input_tokens} read={u.cache_read_input_tokens} uncached={u.input_tokens}")
 
-ask("What is the refund window?")      # first call: cache_write ≈ 20k, cache_read = 0
-ask("Who can approve an exception?")   # within the TTL: cache_read ≈ 20k, uncached ≈ the question
+ask("What is the refund window?")      # first call: write ≈ 20k, read = 0
+ask("Who can approve an exception?")   # within the TTL: read ≈ 20k, uncached ≈ the question
 ```
 
 ### Worked cost scenario
@@ -246,33 +239,25 @@ Pure Python, runs as is. A bag-of-words vector stands in for a real embedding mo
 pair shows how a threshold tuned for hit rate returns a wrong answer.
 
 ```python
-import math, re, time
+import math, re
 from collections import Counter
 
 def embed(text):                                   # stand-in for a real embedding model
     return Counter(re.findall(r"[a-z]+", text.lower()))
 
 def cosine(a, b):
-    dot = sum(a[t] * b[t] for t in a)
-    na, nb = math.sqrt(sum(v * v for v in a.values())), math.sqrt(sum(v * v for v in b.values()))
-    return dot / (na * nb) if na and nb else 0.0
+    n = lambda v: math.sqrt(sum(x * x for x in v.values()))
+    return sum(a[t] * b[t] for t in a) / (n(a) * n(b))
 
 class SemanticCache:
-    def __init__(self, threshold, ttl_s=3600):
-        self.threshold, self.ttl_s, self.entries = threshold, ttl_s, {}
-    def get(self, ns, query):
-        q, best, best_sim = embed(query), None, 0.0
-        for e in self.entries.get(ns, []):         # search only inside the namespace
-            sim = cosine(q, e["vec"])
-            if e["expires"] > time.monotonic() and sim > best_sim:
-                best, best_sim = e, sim
-        hit = best is not None and best_sim >= self.threshold
-        return (best["answer"] if hit else None), round(best_sim, 3)
+    def __init__(self, threshold):
+        self.threshold, self.entries = threshold, {}
     def put(self, ns, query, answer):
-        self.entries.setdefault(ns, []).append(
-            {"vec": embed(query), "answer": answer, "expires": time.monotonic() + self.ttl_s})
-    def invalidate(self, ns):                      # call when the knowledge base changes
-        self.entries.pop(ns, None)
+        self.entries.setdefault(ns, []).append((embed(query), answer))
+    def get(self, ns, query):                      # search only inside the namespace
+        sims = [(cosine(embed(query), v), a) for v, a in self.entries.get(ns, [])]
+        sim, answer = max(sims, default=(0.0, None))
+        return (answer if sim >= self.threshold else None), round(sim, 3)
 
 ns = ("acme", "kb-v7", "prompt-v3", "model-x")     # tenant, corpus version, prompt version, model
 for tau in (0.9, 0.8):
@@ -309,17 +294,18 @@ import hashlib, json, time
 READ_ONLY = {"search_docs", "get_order_status"}      # never cache tools with side effects
 _cache = {}
 
-def call_tool(ctx, name, args, tools, ttl_s=60):
+def call_tool(tenant, name, args, tools, ttl_s=60):
     if name not in READ_ONLY:
         return tools[name](**args)
-    key = hashlib.sha256(json.dumps([ctx.tenant, name, args], sort_keys=True).encode()).hexdigest()
-    hit = _cache.get(key)
-    if hit and hit["expires"] > time.monotonic():
-        ctx.metrics["tool_cache_hits"] += 1
-        return hit["value"]
-    value = tools[name](**args)
-    _cache[key] = {"value": value, "expires": time.monotonic() + ttl_s}
-    return value
+    key = hashlib.sha256(json.dumps([tenant, name, args], sort_keys=True).encode()).hexdigest()
+    if key in _cache and _cache[key][1] > time.monotonic():
+        return _cache[key][0]                         # hit: the tool does not run again
+    _cache[key] = (tools[name](**args), time.monotonic() + ttl_s)
+    return _cache[key][0]
+
+tools = {"search_docs": lambda q: print("ran search") or f"docs for {q}"}
+call_tool("acme", "search_docs", {"q": "refunds"}, tools)          # prints: ran search
+print(call_tool("acme", "search_docs", {"q": "refunds"}, tools))   # docs for refunds (no search)
 ```
 
 ## Production patterns
@@ -345,6 +331,8 @@ def call_tool(ctx, name, args, tools, ttl_s=60):
 - **Semantic cache with sampled precision review.** Namespace per tenant and knowledge-base version, start
   with a strict threshold, and have a human or judge grade a daily sample of hits. Monitor hit precision,
   not just hit rate, and invalidate on every knowledge-base publish.
+- **Expire semantic and tool-result entries.** Give semantic-cache entries a TTL (an hour is a sane
+  start) and read-only tool results a short one (about 60 s), and count tool-cache hits per run.
 
 ## Trade-offs
 - **Exact cache: never wrong for its key, rarely hit.** Hit rate on free-form conversation is close to

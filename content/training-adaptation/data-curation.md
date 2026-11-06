@@ -220,46 +220,40 @@ flowchart TD
 
 ## Examples
 ### Compact curation pass
-Gopher-style heuristics, exact deduplication, MinHash/LSH near-deduplication via `datasketch`, and
-13-gram decontamination against eval sets. Each stage returns early so you can count what it dropped.
+A length heuristic, exact deduplication, MinHash/LSH near-deduplication via `datasketch`, and 13-gram
+decontamination against eval sets. Each stage counts what it dropped.
 
 ```python
+# pip install datasketch
 import re, hashlib
+from collections import Counter
 from datasketch import MinHash, MinHashLSH
 
 def shingles(text, n=5):
     toks = re.findall(r"\w+", text.lower())
     return {" ".join(toks[i:i + n]) for i in range(max(1, len(toks) - n + 1))}
 
-def passes_heuristics(text):
-    w = re.findall(r"\w+", text)
-    if not 50 <= len(w) <= 100_000: return False                   # length bounds
-    if not 3 <= sum(map(len, w)) / len(w) <= 10: return False      # mean word length
-    lines = [l for l in text.splitlines() if l.strip()]
-    if sum(l.lstrip().startswith(("-", "*", "•")) for l in lines) > 0.9 * len(lines): return False
-    if sum(l.rstrip().endswith("...") for l in lines) > 0.3 * len(lines): return False
-    return True
-
-def curate(docs, eval_texts, num_perm=128, threshold=0.7):
+def curate(docs, eval_texts, min_words=50):
     eval_grams = set().union(*(shingles(t, 13) for t in eval_texts))   # decontamination index
-    seen, lsh, kept, dropped = set(), MinHashLSH(threshold=threshold, num_perm=num_perm), [], {}
+    seen, lsh, kept, dropped = set(), MinHashLSH(threshold=0.7, num_perm=128), [], Counter()
     for i, text in enumerate(docs):
-        if not passes_heuristics(text): dropped["heuristic"] = dropped.get("heuristic", 0) + 1; continue
         h = hashlib.sha1(" ".join(text.lower().split()).encode()).hexdigest()
-        if h in seen: dropped["exact"] = dropped.get("exact", 0) + 1; continue
-        seen.add(h)
-        if shingles(text, 13) & eval_grams: dropped["contaminated"] = dropped.get("contaminated", 0) + 1; continue
-        m = MinHash(num_perm=num_perm)
+        m = MinHash(num_perm=128)
         for g in shingles(text): m.update(g.encode())
-        if lsh.query(m): dropped["near_dup"] = dropped.get("near_dup", 0) + 1; continue
-        lsh.insert(str(i), m)
-        kept.append(text)
+        if len(text.split()) < min_words: dropped["heuristic"] += 1
+        elif h in seen: dropped["exact"] += 1
+        elif shingles(text, 13) & eval_grams: dropped["contaminated"] += 1
+        elif lsh.query(m): dropped["near_dup"] += 1
+        else: seen.add(h); lsh.insert(str(i), m); kept.append(text)
     return kept, dropped
 
-# kept, dropped = curate(raw_docs, eval_texts); print(len(kept), dropped)
-# Then: read 100 random rejects per stage and 100 random keeps, run a quality classifier on the keeps,
-# and only afterwards split train/validation, so near-duplicates cannot straddle the split.
+doc = " ".join(f"word{i}" for i in range(60))
+kept, dropped = curate([doc, doc, doc + " extra", "too short"], ["unrelated eval text"])
+print(len(kept), dict(dropped))   # 1 {'exact': 1, 'near_dup': 1, 'heuristic': 1}
 ```
+
+Then read 100 random rejects per stage and 100 random keeps, and only afterwards split train and
+validation, so near-duplicates cannot straddle the split.
 
 ### Choose LSH bands for your duplicate threshold
 Pure Python. Same 128 hash functions, three band layouts: the S-curve's threshold moves with *r* and *b*.
@@ -297,38 +291,9 @@ a benchmark):
 The lesson: macros dominate support logs, so near-dedup and outcome filtering remove far more than
 expected, and the eval set leaked because it was sampled from the same export.
 
-### Trajectory filter for agent logs
-Pure Python over exported traces. Each rule returns early with a reason, so the reject store explains
-every drop.
-
-```python
-import json
-
-def reject_reason(trace, tool_schemas, max_steps=25):
-    if not trace["task_passed"]:
-        return "failed_task"
-    calls = [t for t in trace["turns"] if t["role"] == "assistant" and t.get("tool_call")]
-    if len(trace["turns"]) > max_steps:
-        return "too_many_steps"
-    seen = set()
-    for c in calls:
-        name, args = c["tool_call"]["name"], c["tool_call"]["arguments"]
-        if name not in tool_schemas or not set(tool_schemas[name]) <= set(args):
-            return "stale_or_invalid_call"
-        key = name + json.dumps(args, sort_keys=True)
-        if key in seen:
-            return "repeated_call_loop"
-        seen.add(key)
-    if any(t["role"] == "tool" and t.get("error") for t in trace["turns"][-3:]):
-        return "unrecovered_tool_error"
-    return None
-
-# kept = [t for t in traces if reject_reason(t, schemas) is None]; store the rest with their reason,
-# then PII-scrub user and tool turns, dedup by user request, and split by tenant or task cluster.
-```
-
 ### Worked scenario: a coding-agent trace funnel
-Illustrative numbers for 50,000 logged coding-agent runs being turned into an SFT set and a held-out eval:
+Illustrative numbers for 50,000 logged coding-agent runs being turned into an SFT set and a held-out eval.
+Each rule records a reason, so the reject store explains every drop:
 
 | Stage | Dropped | Remaining | What a reject sample showed |
 |---|---|---|---|
@@ -361,6 +326,13 @@ imitate.
   pipeline commit and the stage counts in the model's registry entry, so every model points to the exact
   data that made it. For web-scale corpora use a pipeline library built for it, such as Hugging Face's
   `datatrove`, which was used for FineWeb, instead of hand-rolled loops.
+- **Gopher-style quality heuristics.** Beyond length bounds (about 50 to 100,000 words), drop documents
+  whose mean word length falls outside 3 to 10 characters, that are over 90% bullet lines, or where over
+  30% of lines end in an ellipsis.
+- **Trajectory rules for agent logs.** Reject a trace when the task failed, it exceeds a step cap (for
+  example 25), a call names a tool missing from the current schemas or lacks required arguments, the same
+  call repeats with identical arguments, or a tool error in the last few turns went unrecovered. Then
+  PII-scrub user and tool turns before training.
 
 ## Trade-offs
 - **Quality vs volume and diversity.** Aggressive filtering raises average quality but shrinks volume and

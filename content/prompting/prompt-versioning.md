@@ -175,43 +175,32 @@ flowchart TD
 ## Examples
 ### A minimal file-based registry
 Immutable version files, an alias file for promotion, a content hash over the whole bundle (template plus
-model, parameters and tool schemas), a variable-contract check at load time, and the trace line that
-records which version answered.
+model, parameters and tool schemas), and the trace line that records which version answered.
 - Swapping the directory for a registry client changes `load`, nothing else.
 - Promotion is a CI job that runs the golden set against `canary` and `production`, diffs results per
   case, and only then edits `aliases.yaml`.
 
 ```python
-import hashlib, json, pathlib, re
+import hashlib, json, pathlib
 import yaml                                  # pip install pyyaml
 
 ROOT = pathlib.Path("prompts")               # prompts/support_triage/{aliases.yaml, v13.md, v14.md}
 
 def load(name: str, alias: str = "production") -> dict:
-    aliases = yaml.safe_load((ROOT / name / "aliases.yaml").read_text())   # {"production": "v13", "canary": "v14"}
-    version = aliases[alias]
+    version = yaml.safe_load((ROOT / name / "aliases.yaml").read_text())[alias]  # {"production": "v13", ...}
     header, _, template = (ROOT / name / f"{version}.md").read_text().partition("\n---\n")
-    meta = yaml.safe_load(header)            # model (dated snapshot), max_tokens, tools, variables
-    found = set(re.findall(r"{{(\w+)}}", template))
-    assert found == set(meta["variables"]), f"variable contract drift: {found ^ set(meta['variables'])}"
+    meta = yaml.safe_load(header)            # model (dated snapshot), max_tokens, tools
     canon = json.dumps({"meta": meta, "template": template}, sort_keys=True).encode()  # tools are in meta
     return {"name": name, "version": version, "hash": hashlib.sha256(canon).hexdigest()[:12],
             "meta": meta, "template": template}
 
-def render(p: dict, **vars) -> str:
-    missing = set(p["meta"]["variables"]) - vars.keys()
-    if missing:
-        raise ValueError(f"{p['name']}@{p['version']} needs {missing}")
-    return re.sub(r"{{(\w+)}}", lambda m: str(vars[m.group(1)]), p["template"])
-
 def triage(client, ticket: str, tracer) -> str:
     p = load("support_triage")               # alias resolved per call: rollback = edit aliases.yaml
-    system = render(p, product="Acme Billing", tier="enterprise")
     r = client.messages.create(model=p["meta"]["model"], max_tokens=p["meta"]["max_tokens"],
-                               tools=p["meta"].get("tools", []), system=system,
+                               tools=p["meta"].get("tools", []), system=p["template"],
                                messages=[{"role": "user", "content": ticket}])
     tracer.log(prompt=p["name"], version=p["version"], hash=p["hash"],   # the line that makes replay possible
-               model=p["meta"]["model"], input_tokens=r.usage.input_tokens)
+               model=p["meta"]["model"])
     return "".join(b.text for b in r.content if b.type == "text")   # content[0] may be a tool_use block
 ```
 
@@ -282,6 +271,8 @@ A support agent has three tools: `lookup_order`, `issue_refund` and `escalate`. 
   of every request. Monitor registry errors and alias staleness.
 - **Read-only production in the console.** Let people edit drafts in the registry UI, but allow only CI
   (or a reviewed action) to move the `production` label. Monitor label moves as audit events.
+- **Variable contract checked at load.** If templates take `{{variables}}`, declare them in the version
+  header and fail at load when the template's placeholders differ, so code and prompt cannot drift apart.
 
 ## Trade-offs
 - **Files in git vs a registry.** Files give pull-request review and atomic code-plus-prompt changes, but

@@ -242,27 +242,23 @@ missing features fail closed to human review. The feature lookup and model are s
 ```python
 from datetime import datetime, timedelta, timezone
 
+now = datetime.now(timezone.utc)
 ONLINE = {"card:4242": {"txn_count_1h": 7, "avg_order_value_90d": 55.0,
-                        "event_timestamp": datetime.now(timezone.utc) - timedelta(minutes=3)}}
-MAX_STALENESS = timedelta(minutes=15)    # illustrative: the freshness the model was trained to expect
-THRESHOLD = 0.7                          # illustrative: set from the model's precision/recall curve
-
-def risk_model(f: dict) -> float:        # stand-in for the classical model
-    return min(1.0, 0.08 * f["txn_count_1h"] + 0.001 * f["avg_order_value_90d"])
+                        "event_timestamp": now - timedelta(minutes=3)}}
+MAX_STALENESS, THRESHOLD = timedelta(minutes=15), 0.7   # illustrative
 
 def refund_tool(card_id: str, amount_usd: float, trace: dict) -> dict:
-    f = ONLINE.get(f"card:{card_id}")
-    if f is None or datetime.now(timezone.utc) - f["event_timestamp"] > MAX_STALENESS:
-        trace["gate"] = "features_missing_or_stale"
-        return {"status": "needs_human_review", "reason": "risk features unavailable"}
-    score = risk_model(f)
-    trace.update(gate="risk_score", score=round(score, 3), feature_view="card_activity:v3")
+    f = ONLINE.get(f"card:{card_id}")                    # stand-in for get_online_features
+    if f is None or now - f["event_timestamp"] > MAX_STALENESS:
+        return {"status": "needs_human_review"}          # fail closed on missing or stale features
+    score = min(1.0, 0.08 * f["txn_count_1h"] + 0.001 * f["avg_order_value_90d"])  # stand-in model
+    trace.update(score=round(score, 3), feature_view="card_activity:v3")
     if score >= THRESHOLD:
-        return {"status": "needs_human_review", "reason": "risk score above threshold"}
+        return {"status": "needs_human_review"}
     return {"status": "refunded", "amount_usd": amount_usd}
 
 trace = {}
-print(refund_tool("4242", 30.0, trace), trace)   # score 0.615 -> refunded, score logged in the trace
+print(refund_tool("4242", 30.0, trace), trace)   # status 'refunded'; trace has score 0.615, card_activity:v3
 ```
 
 Logging the score and feature view version in the agent trace is what lets you later join served values
@@ -270,37 +266,29 @@ with batch values to check for skew.
 
 ### Point-in-time join versus the leaky latest-value join
 Pure Python, contrasted with the "join to the latest value" that hand-rolled pipelines usually do. Feature
-rows are `(entity, event_time, value)`; labels are `(entity, label_time)`.
+rows for one customer are `(event_time, value)`; labels are label times.
 
 ```python
-from bisect import bisect_right
-from collections import defaultdict
+from datetime import date
 
 # avg_order_value_90d for customer c1, appended as it changes (offline store rows)
-features = [("c1", "2024-03-01", 40.0), ("c1", "2024-04-15", 55.0), ("c1", "2024-05-20", 90.0)]
-labels   = [("c1", "2024-03-10"), ("c1", "2024-04-20"), ("c1", "2024-06-01")]
+features = [("2024-03-01", 40.0), ("2024-04-15", 55.0), ("2024-05-20", 90.0)]
+labels = ["2024-03-10", "2024-04-20", "2024-06-01"]
 TTL_DAYS = 120
 
-by_entity = defaultdict(list)
-for ent, ts, val in sorted(features, key=lambda r: r[1]):
-    by_entity[ent].append((ts, val))
+def point_in_time(label_ts):
+    known = [(ts, v) for ts, v in features if ts <= label_ts]   # event_time <= label_time
+    if not known:
+        return None
+    ts, v = known[-1]
+    age = (date.fromisoformat(label_ts) - date.fromisoformat(ts)).days
+    return v if age <= TTL_DAYS else None                       # null: unknown at that time
 
-def days_between(a, b):                     # ISO dates, good enough for the demo
-    from datetime import date
-    return (date.fromisoformat(b) - date.fromisoformat(a)).days
+def leaky_latest(_label_ts):
+    return features[-1][1]                                      # what a naive join does
 
-def point_in_time(ent, label_ts):
-    rows = by_entity[ent]
-    i = bisect_right([ts for ts, _ in rows], label_ts) - 1      # latest event_time <= label_ts
-    if i < 0 or days_between(rows[i][0], label_ts) > TTL_DAYS:
-        return None                                              # unknown at that time
-    return rows[i][1]
-
-def leaky_latest(ent, _label_ts):
-    return by_entity[ent][-1][1]                                 # what a naive join does
-
-for ent, lts in labels:
-    print(lts, "correct:", point_in_time(ent, lts), "| leaky:", leaky_latest(ent, lts))
+for lts in labels:
+    print(lts, "correct:", point_in_time(lts), "| leaky:", leaky_latest(lts))
 # 2024-03-10 correct: 40.0 | leaky: 90.0
 # 2024-04-20 correct: 55.0 | leaky: 90.0
 # 2024-06-01 correct: 90.0 | leaky: 90.0
@@ -322,21 +310,18 @@ from feast import Entity, FeatureStore, FeatureView, Field, FileSource
 from feast.types import Float32
 
 customer = Entity(name="customer", join_keys=["customer_id"])
-orders = FileSource(path="data/customer_orders.parquet", timestamp_field="event_timestamp")
 customer_orders = FeatureView(
     name="customer_orders", entities=[customer], ttl=timedelta(days=120),
-    schema=[Field(name="avg_order_value_90d", dtype=Float32)], source=orders,
+    schema=[Field(name="avg_order_value_90d", dtype=Float32)],
+    source=FileSource(path="data/customer_orders.parquet", timestamp_field="event_timestamp"),
 )
 
 store = FeatureStore(repo_path=".")
-labels = pd.DataFrame({"customer_id": [1001, 1001],
-                       "event_timestamp": pd.to_datetime(["2024-03-10", "2024-04-20"], utc=True)})
-train_df = store.get_historical_features(            # point-in-time correct, TTL applied
-    entity_df=labels, features=["customer_orders:avg_order_value_90d"]).to_df()
-
-store.materialize_incremental(end_date=datetime.now(timezone.utc))   # offline -> online
-online = store.get_online_features(features=["customer_orders:avg_order_value_90d"],
-                                   entity_rows=[{"customer_id": 1001}]).to_dict()
+feature = ["customer_orders:avg_order_value_90d"]
+labels = pd.DataFrame({"customer_id": [1001], "event_timestamp": pd.to_datetime(["2024-03-10"], utc=True)})
+train_df = store.get_historical_features(entity_df=labels, features=feature).to_df()   # point-in-time, TTL
+store.materialize_incremental(end_date=datetime.now(timezone.utc))                      # offline -> online
+online = store.get_online_features(features=feature, entity_rows=[{"customer_id": 1001}]).to_dict()
 ```
 
 ### Worked scenario: the 0.95-offline, 0.80-production fraud model behind an agent
@@ -375,6 +360,8 @@ with batch values for the same entities and timestamps (illustrative findings):
   time; a jump means a source stopped producing.
 - **Offline/online metric gap as the headline alert.** Use for every hybrid model. Track the difference
   between offline evaluation and production metrics per model version; skew or leakage shows up here first.
+- **Set the gate's limits from evidence.** The staleness limit is the freshness the model was trained to
+  expect, and the score threshold comes from the model's precision/recall curve, not a round number.
 
 ## Trade-offs
 - **Skew-proof by construction vs another platform.** A feature store removes skew and leakage by

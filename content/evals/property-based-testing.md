@@ -164,13 +164,13 @@ flowchart TD
   patching for the long input lets the same bug return with a different one.
 
 ## Examples
-### Three properties over an overlapping chunker
+### Properties over an overlapping chunker
 The kind of helper every RAG pipeline carries. A naive version without the empty-text guard fails the
 "no empty chunks" assertion and Hypothesis shrinks the counterexample to `text=''`, exactly the bug.
 
 ```python
 # pip install hypothesis  ->  pytest -q test_chunk.py
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, strategies as st
 
 def chunk(text: str, size: int, overlap: int) -> list[str]:
     if not text:                          # without this guard the loop emits one empty chunk for ""
@@ -182,26 +182,18 @@ def chunk(text: str, size: int, overlap: int) -> list[str]:
             return chunks
         i += step
 
-params = st.integers(min_value=1, max_value=200).flatmap(
-    lambda size: st.tuples(st.just(size), st.integers(min_value=0, max_value=size - 1)))
-
-@settings(max_examples=500)
-@given(text=st.text(max_size=2000), p=params)
-def test_chunk_properties(text, p):
-    size, overlap = p
-    step = size - overlap
-    chunks = chunk(text, size, overlap)
+@given(text=st.text(max_size=2000), size=st.integers(1, 200), data=st.data())
+def test_chunk_properties(text, size, data):
+    overlap = data.draw(st.integers(0, size - 1))                  # overlap must stay below size
+    chunks, step = chunk(text, size, overlap), size - overlap
     assert all(0 < len(c) <= size for c in chunks)                 # size bound and no empty chunks
     rebuilt = "".join(c[:step] for c in chunks[:-1]) + (chunks[-1] if chunks else "")
     assert rebuilt == text                                         # coverage: nothing lost or duplicated
-    for a, b in zip(chunks, chunks[1:]):
-        assert b.startswith(a[step:])                              # the overlap is real overlap
-    assert (len(chunks) == 0) == (text == "")
 ```
 
 ### Agent scenario: stateful test that catches a memory trimmer dropping the user's turn
-Runnable with `pip install hypothesis pytest`. The naive trimmer drops the oldest non-system turn until
-the history fits, which can delete the only user turn.
+Runnable with `pip install hypothesis pytest` (checked on Hypothesis 6.141 and 6.170). The naive
+trimmer drops the oldest non-system turn until the history fits, which can delete the only user turn.
 
 ```python
 from hypothesis import strategies as st
@@ -210,8 +202,8 @@ from hypothesis.stateful import RuleBasedStateMachine, rule, invariant
 BUDGET = 8_000                                   # token budget for the whole history
 
 class History:                                   # system under test: naive oldest-first trimmer
-    def __init__(self, system_tokens: int):
-        self.turns = [("system", system_tokens)]
+    def __init__(self):
+        self.turns = [("system", 500)]
     def add(self, role: str, tokens: int):
         self.turns.append((role, tokens))
         while sum(t for _, t in self.turns) > BUDGET and len(self.turns) > 2:
@@ -220,31 +212,19 @@ class History:                                   # system under test: naive olde
 class HistoryMachine(RuleBasedStateMachine):
     def __init__(self):
         super().__init__()
-        self.h, self.saw_user = History(system_tokens=500), False
-
+        self.h, self.saw_user = History(), False
     @rule(tokens=st.integers(1, 2_000))
     def user_turn(self, tokens):
         self.h.add("user", tokens); self.saw_user = True
-
     @rule(tokens=st.integers(1_000, 3_000))         # (1, 3_000) missed the bug in ~1 of 5 runs
     def tool_result(self, tokens):
         self.h.add("tool", tokens)
-
-    @invariant()
-    def system_prompt_first(self):
-        assert self.h.turns[0][0] == "system"
-
-    @invariant()
-    def within_budget(self):
-        assert sum(t for _, t in self.h.turns) <= BUDGET
-
     @invariant()
     def latest_user_turn_kept(self):
         assert not self.saw_user or any(role == "user" for role, _ in self.h.turns)
 
 TestHistory = HistoryMachine.TestCase
-# Fails latest_user_turn_kept on every run (Hypothesis 6.170), shrunk to about five steps, e.g.
-# user_turn(tokens=1), tool_result(1000), tool_result(1000), tool_result(2500), tool_result(3000):
+# Fails on every run, shrunk to e.g. user_turn(1), tool_result(1000) twice, (2500), (3000):
 # 500 + 1 + 1000 + 1000 + 2500 + 3000 = 8001 > 8000, so the trimmer drops the only user turn.
 ```
 
@@ -259,64 +239,7 @@ A four-step sequence breaks it the same way:
 | tool_result(3000) | over budget at 8001, oldest non-system turn (the user's) dropped | 8000 |
 
 The fix (never evict the latest user turn, summarise tool results instead) is now tested by the same
-invariant forever.
-
-### Agent scenario: round trip and typed errors for a tool-argument parser
-A typed error matters to the agent loop: it can be returned to the model as a tool error so the model
-retries with fixed arguments, while a stray `KeyError` crashes the run.
-
-Runnable with Hypothesis. Any JSON-shaped input either parses into the typed object or raises
-`ToolArgError`; any other exception fails the test.
-
-```python
-import json
-from dataclasses import dataclass, asdict
-from hypothesis import given, strategies as st
-
-class ToolArgError(ValueError): ...
-
-@dataclass(frozen=True)
-class Refund:
-    order_id: str
-    amount_cents: int
-
-def parse_refund(raw: str) -> Refund:
-    try:
-        d = json.loads(raw)
-        if not isinstance(d, dict):
-            raise ToolArgError("arguments must be a JSON object")
-        amount, order_id = d["amount_cents"], d["order_id"]
-        if isinstance(amount, str) and amount.isascii() and amount.isdigit():
-            amount = int(amount)                      # models often emit numbers as strings
-        if type(amount) is not int or amount < 0:     # type() check rejects True/False too
-            raise ToolArgError("amount_cents must be a non-negative integer")
-        if not isinstance(order_id, str):
-            raise ToolArgError("order_id must be a string")
-        return Refund(order_id, amount)
-    except (json.JSONDecodeError, KeyError) as e:
-        raise ToolArgError(f"bad arguments: {e}") from e
-
-refunds = st.builds(Refund, order_id=st.text(), amount_cents=st.integers(min_value=0))
-json_like = st.recursive(
-    st.none() | st.booleans() | st.integers() | st.text(),
-    lambda kids: st.lists(kids) | st.dictionaries(st.text(), kids), max_leaves=10)
-model_ish = st.fixed_dictionaries({}, optional={
-    "order_id": json_like, "amount_cents": json_like | st.integers(0, 10**6).map(str)})
-
-@given(refunds)
-def test_round_trip(r):                                    # typed object -> JSON -> same object
-    assert parse_refund(json.dumps(asdict(r))) == r
-
-@given(st.one_of(st.text(), json_like.map(json.dumps), model_ish.map(json.dumps)))
-def test_only_typed_errors(raw):                           # any other exception fails the test
-    try:
-        parse_refund(raw)
-    except ToolArgError:
-        pass
-```
-
-The `isascii()` guard matters: `"²".isdigit()` is true but `int("²")` raises `ValueError`, exactly the
-kind of input a Unicode-aware generator eventually produces.
+invariant forever. Add invariants for "system prompt still first" and "total within `BUDGET`" the same way.
 
 ## Production patterns
 - **CI and nightly settings profiles.** Register profiles with `settings.register_profile("ci",
@@ -339,6 +262,11 @@ kind of input a Unicode-aware generator eventually produces.
   retry limit per tool) as a stateful test whose rules are "model calls tool", "tool errors", "tool
   times out", with invariants that the loop always terminates within the step limit and spend never goes
   negative or past the cap. Monitor production runs that hit the step limit.
+- **Typed errors from tool-argument parsers.** A parser should return the typed object or raise one
+  typed error (a `ToolArgError` the loop returns to the model so it retries with fixed arguments), never a
+  stray `KeyError` that crashes the run. Property-test a round trip from generated typed objects plus
+  "only typed errors" over `st.recursive` JSON-like inputs and numbers emitted as strings, and guard
+  digit strings with `isascii()`: `"²".isdigit()` is true but `int("²")` raises `ValueError`.
 
 ## Trade-offs
 - **Coverage vs determinism.** Hundreds of inputs per property give coverage no example suite reaches,

@@ -300,11 +300,10 @@ flowchart TD
 
 ## Examples
 ### Settings for a tool-calling RAG agent
-One class holds the model, the loop budget, retrieval knobs and per-tool config. Every agent component
-reads from it.
+One class holds the model, the loop budget and retrieval knobs. Every agent component reads from it.
 
 ```python
-from functools import lru_cache
+import os
 from typing import Literal
 from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -312,10 +311,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Retrieval(BaseModel):
     top_k: int = Field(8, ge=1, le=100)
     rerank: bool = True
-
-class SearchTool(BaseModel):
-    enabled: bool = True
-    timeout_s: float = Field(10.0, gt=0)
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -325,24 +320,14 @@ class Settings(BaseSettings):
     model: str = "gpt-4o-mini"
     max_steps: int = Field(8, ge=1, le=50)        # agent loop budget
     request_timeout_s: float = Field(30.0, gt=0)
-    allowed_models: list[str] = ["gpt-4o-mini"]
     retrieval: Retrieval = Retrieval()
-    search: SearchTool = SearchTool()
 
-@lru_cache
-def get_settings() -> Settings:
-    return Settings()
-
-# Environment:
-#   APP_OPENAI_API_KEY=sk-live-...      APP_ENV=prod
-#   APP_RETRIEVAL__TOP_K=20             APP_ALLOWED_MODELS='["gpt-4o-mini","gpt-4o"]'
-#   APP_SEARCH__ENABLED=false
-s = get_settings()
-print(s.retrieval)          # top_k=20 rerank=True   (nested override, default kept)
-print(s.search.enabled)     # False                  (parsed bool, not the truthy string)
-print(s.openai_api_key)     # **********             (masked)
+os.environ.update({"APP_OPENAI_API_KEY": "sk-test", "APP_ENV": "prod",
+                   "APP_RETRIEVAL__RERANK": "false"})
+s = Settings()
+print(s.retrieval)          # top_k=8 rerank=False  (nested override; "false" parsed, not truthy)
+print(s.openai_api_key)     # **********            (masked)
 client_key = s.openai_api_key.get_secret_value()
-tools = [t for t, on in {"search": s.search.enabled, "retrieve": True}.items() if on]
 
 # In a test, ignore the developer's .env (real env vars still apply, so
 # kwargs or monkeypatch.delenv must cover anything the shell might set):
@@ -407,6 +392,8 @@ class Settings(BaseSettings):
 - **Tolerate shared dotenv files.** Use `extra="ignore"` when the same `.env` feeds other tools (a tracing
   SDK, an MCP server), so their keys do not fail validation. Keep a documented `.env.example` that
   mirrors the `Settings` fields.
+- **List and dict fields arrive as JSON.** A field such as `allowed_models: list[str]` is set with
+  `APP_ALLOWED_MODELS='["gpt-4o-mini","gpt-4o"]'`; a comma-separated value fails validation.
 
 ## Trade-offs
 - **Fail fast vs convenience.** Startup validation turns silent misconfiguration into a crash, right for

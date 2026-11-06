@@ -262,50 +262,63 @@ flowchart TD
 ## Examples
 ### Agent run: return the final state, publish only the answer
 The agent loop returns its full state as a dict (as graph frameworks typically do). The route returns it
-unchanged; `response_model` keeps only `answer`, `citations` and `steps`. The streaming route cannot rely
-on that, so each event is built from an explicit model in a discriminated union.
+unchanged; `response_model` keeps only `answer`, `citations` and `steps`. The last line is the exact-key
+contract test: any new public field needs a deliberate test change.
 
 ```python
-from typing import Annotated, Literal, Union
+# pip install fastapi httpx
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
 
 class RunOut(BaseModel):                       # the public contract
     answer: str
     citations: list[str] = []
     steps: int
 
-async def run_agent(task: str) -> dict:        # stand-in for an agent framework's final state
+def run_agent(task: str) -> dict:              # stand-in for an agent framework's final state
     return {"answer": "Use GQA.", "citations": ["doc-12"], "steps": 4,
             "messages": [{"role": "system", "content": "internal system prompt"}],
-            "scratchpad": "user seems junior...", "tool_outputs": [{"crm_row": {"email": "x@y.z"}}],
-            "cost_usd": 0.042}
-
-class ToolEvent(BaseModel):
-    type: Literal["tool"]
-    name: str                                  # tool name only, never raw tool output
-class TokenEvent(BaseModel):
-    type: Literal["token"]
-    text: str
-class DoneEvent(BaseModel):
-    type: Literal["done"]
-    steps: int
-Event = Annotated[Union[ToolEvent, TokenEvent, DoneEvent], Field(discriminator="type")]
+            "scratchpad": "user seems junior...", "cost_usd": 0.042}
 
 app = FastAPI()
 
 @app.post("/agent/run", response_model=RunOut)
-async def run(body: dict) -> RunOut:
-    return await run_agent(body["task"])       # messages, scratchpad, tool_outputs, cost_usd dropped
+def run(body: dict):
+    return run_agent(body["task"])             # messages, scratchpad, cost_usd dropped
 
-@app.post("/agent/stream", response_model=None)  # Response: no filtering, so build every event
-async def stream(body: dict):
-    async def events():
-        for ev in (ToolEvent(type="tool", name="search_docs"), TokenEvent(type="token", text="Use GQA."),
-                   DoneEvent(type="done", steps=4)):
+body = TestClient(app).post("/agent/run", json={"task": "x"}).json()
+print(body)   # {'answer': 'Use GQA.', 'citations': ['doc-12'], 'steps': 4}
+assert set(body) == {"answer", "citations", "steps"}   # exact allow-list, not a deny-list
+```
+
+### Streamed events: build each one from a model
+A `StreamingResponse` is sent as-is, so `response_model` filters nothing there. Each event is built from
+an explicit model that carries only public fields. Add this to the app above.
+
+```python
+from typing import Literal
+from fastapi.responses import StreamingResponse
+
+class ToolEvent(BaseModel):
+    type: Literal["tool"] = "tool"
+    name: str                                  # tool name only, never raw tool output
+
+class TokenEvent(BaseModel):
+    type: Literal["token"] = "token"
+    text: str
+
+@app.post("/agent/stream", response_model=None)  # a Response: no filtering, so build every event
+def stream(body: dict):
+    def events():
+        for ev in (ToolEvent(name="search_docs"), TokenEvent(text="Use GQA.")):
             yield f"data: {ev.model_dump_json()}\n\n"
     return StreamingResponse(events(), media_type="text/event-stream")
+
+print(TestClient(app).post("/agent/stream", json={}).text)
+# data: {"type":"tool","name":"search_docs"}
+#
+# data: {"type":"token","text":"Use GQA."}
 ```
 
 ### Worked scenario: what one leaked agent state exposes
@@ -320,65 +333,6 @@ A team returned the framework's final state directly for two weeks (illustrative
 | `answer`, `citations`, `steps` | under 1 KB | the only fields the UI used |
 
 With `response_model=RunOut`, responses shrink to the last row and nothing else ships.
-
-### Internal superset in, public shape out
-A public model, an internal subclass with fields that must never leave the process, and a handler that
-returns the internal object unchanged.
-
-- **Subclassing keeps the type checker happy** (a `CompletionInternal` *is* a `CompletionOut`).
-- **FastAPI still filters.** It does not trust `isinstance`: it dumps the returned object and re-validates
-  the data through the declared model, so only `CompletionOut`'s four fields survive.
-- **`finish_reason` is omitted when `None`** because of `response_model_exclude_none`.
-- **A dict without `text`** would raise `ResponseValidationError` and produce a 500 rather than a
-  malformed success.
-
-```python
-from typing import Annotated, Optional
-from fastapi import Body, FastAPI
-from pydantic import BaseModel
-
-app = FastAPI()
-
-class CompletionOut(BaseModel):               # what clients receive
-    id: str
-    text: str
-    model: str
-    finish_reason: Optional[str] = None
-
-class CompletionInternal(CompletionOut):      # what the service works with
-    cost_usd: float                           # never public
-    provider_raw: dict                        # never public
-
-def run_model(prompt: str) -> CompletionInternal:
-    return CompletionInternal(id="cmpl_1", text=prompt[::-1], model="demo-1", cost_usd=0.0003,
-                              provider_raw={"headers": {"x-ratelimit-remaining": "99"}})
-
-@app.post("/complete", response_model=CompletionOut, response_model_exclude_none=True)
-async def complete(prompt: Annotated[str, Body(embed=True)]) -> CompletionOut:
-    internal = run_model(prompt)
-    return internal        # superset is fine: cost_usd and provider_raw are dropped on the way out
-
-# POST /complete {"prompt": "abc"} -> {"id": "cmpl_1", "text": "cba", "model": "demo-1"}
-# GET /openapi.json shows CompletionOut as the 200 schema; cost_usd and provider_raw do not appear.
-```
-
-### Contract tests that pin the allow-list
-Run against the app above. Assert the exact key set, not just "no `cost_usd`", so any new field needs a
-deliberate test change.
-
-```python
-from fastapi.testclient import TestClient
-
-client = TestClient(app)
-
-def test_complete_returns_only_public_fields():
-    body = client.post("/complete", json={"prompt": "abc"}).json()
-    assert set(body) == {"id", "text", "model"}          # exact allow-list, not a deny-list
-
-def test_openapi_documents_no_internal_fields():
-    schema = client.get("/openapi.json").json()["components"]["schemas"]["CompletionOut"]
-    assert not {"cost_usd", "provider_raw"} & set(schema["properties"])
-```
 
 ### Worked comparison: the exclude options on one object
 Model `Out(id, text, finish_reason: Optional[str] = None)`; the handler returns an internal subclass
@@ -414,6 +368,10 @@ to clients.
 - **Measured opt-out for bulk payloads.** Use only when profiling shows serialisation dominating, such as
   large embedding batches: return a pre-built response on that one route, keep the model for OpenAPI via
   `responses=`, and monitor payload size and p99 latency to confirm the gain.
+- **Internal subclass, public parent.** An internal model may subclass the public one (a
+  `CompletionInternal(CompletionOut)` adding `cost_usd` and `provider_raw`); FastAPI does not trust
+  `isinstance`, it re-validates through the declared model, so the subclass-only fields are still dropped.
+  Pair it with an OpenAPI check that no internal field appears in the published schema.
 
 ## Trade-offs
 - **Hard allow-list vs silent drops.** Filtering also drops fields you forgot to declare; the protection

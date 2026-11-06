@@ -235,13 +235,13 @@ flowchart TD
 
 ## Examples
 ### Admission control for a chat endpoint
-Shed at the door by priority, bound the queue wait by the SLO, release the slot if the client left while
-waiting. The limits would be derived from measured service rate and the latency budget, then adjusted by
-an adaptive controller.
+Shed at the door by priority and bound the queue wait by the SLO. The limits would be derived from
+measured service rate and the latency budget, then adjusted by an adaptive controller.
 
 ```python
+# pip install fastapi uvicorn   (run: uvicorn app:app)
 import asyncio
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request
 
 app = FastAPI()
 MAX_INFLIGHT, MAX_QUEUE, MAX_WAIT_S = 32, 64, 2.0   # capacity, service_rate x wait budget, SLO slice
@@ -251,23 +251,20 @@ waiting = 0                                          # single event loop: no loc
 @app.post("/v1/chat")
 async def chat(req: Request):
     global waiting
-    priority = req.headers.get("x-priority", "interactive")
     batch_cap = MAX_QUEUE // 4                       # batch work gets a quarter of the queue
-    # 1) shed at the door: a 1 ms rejection instead of a 10 s timeout
-    if waiting >= MAX_QUEUE or (priority == "batch" and waiting >= batch_cap):
+    cap = batch_cap if req.headers.get("x-priority") == "batch" else MAX_QUEUE
+    if waiting >= cap:                               # shed at the door: 1 ms rejection, not a 10 s timeout
         raise HTTPException(503, "overloaded", headers={"Retry-After": "5"})
     waiting += 1
-    try:
-        # 2) bounded queue wait: beyond the budget the answer would arrive too late to matter
+    try:                                             # bounded wait: later answers arrive too late to matter
         await asyncio.wait_for(slots.acquire(), timeout=MAX_WAIT_S)
     except asyncio.TimeoutError:
         raise HTTPException(503, "queue wait exceeded", headers={"Retry-After": "5"})
     finally:
         waiting -= 1
     try:
-        if await req.is_disconnected():              # 3) client gave up while queued: do not spend the GPU
-            return Response(status_code=204)
-        return await run_inference(await req.json()) # your model client; token-cost admission goes here
+        await asyncio.sleep(0.64)                    # stand-in for your model call
+        return {"ok": True}
     finally:
         slots.release()
 ```
@@ -282,26 +279,11 @@ async def chat(req: Request):
   line instead of a cliff.
 
 ### Worked scenario: queue growth and sizing from Little's law
-Pure Python, no dependencies: how fast an unprotected queue grows, when requests start dying, and how
-deep the queue may be for a given wait budget.
-
-```python
-def mm1_time_in_system(service_s, utilisation):
-    return service_s / (1 - utilisation)              # W = S / (1 - rho)
-
-def unprotected_wait_s(arrival, service_rate, seconds_in):
-    backlog = max(0, (arrival - service_rate) * seconds_in)
-    return backlog / service_rate                     # time a new arrival waits before service
-
-def max_queue(service_rate, wait_budget_s):
-    return int(service_rate * wait_budget_s)          # deeper only manufactures timeouts
-
-for rho in (0.5, 0.7, 0.9, 0.95):
-    print(f"rho={rho:.2f}: {mm1_time_in_system(1.0, rho):.1f}x service time")
-print(unprotected_wait_s(60, 50, 60))                 # 12.0 s after one minute at 60 vs 50 req/s
-print(max_queue(50, 2.0))                             # 100
-# rho=0.50: 2.0x   rho=0.70: 3.3x   rho=0.90: 10.0x   rho=0.95: 20.0x
-```
+- **Utilisation:** in an M/M/1 queue time in system is `W = S / (1 - rho)`, so at rho 0.5, 0.7, 0.9 and
+  0.95 a request takes 2.0x, 3.3x, 10x and 20x its service time.
+- **Unprotected growth:** at 60 arrivals against 50 req/s served, the backlog grows by 10 per second, so
+  after one minute a new arrival waits 600 / 50 = 12 s.
+- **Sizing:** `max_queue = service_rate × wait_budget = 50 × 2.0 = 100`; deeper only manufactures timeouts.
 
 | Second into a 60 vs 50 req/s overload | Backlog | Wait for a new arrival | With 10 s client timeout |
 |---|---|---|---|
@@ -325,23 +307,16 @@ ignore retries, which makes the step-level case optimistic.
   client can retry later.
 
 ```python
-import asyncio
-
 class RunAdmission:
     """Admit an agent run only if its estimated calls fit the per-minute model-call budget."""
     def __init__(self, calls_per_min: int):
-        self.budget, self.used = calls_per_min, 0
+        self.budget, self.used = calls_per_min, 0    # a timer resets used to 0 every minute
 
     def try_admit(self, est_calls: int) -> bool:
         if self.used + est_calls > self.budget:
             return False                  # reject the whole run now: 503 with Retry-After
         self.used += est_calls
         return True
-
-    async def refill_every_minute(self):
-        while True:
-            await asyncio.sleep(60)
-            self.used = 0
 
 gate = RunAdmission(calls_per_min=600)
 print(sum(gate.try_admit(12) for _ in range(80)))   # 50 runs admitted, 30 rejected up front
@@ -373,6 +348,9 @@ print(sum(gate.try_admit(12) for _ in range(80)))   # 50 runs admitted, 30 rejec
 - **Per-run fan-out limit.** Bound parallel tool calls and sub-agents per run with a small semaphore,
   and per-tool concurrency for slow internal APIs. Monitor peak concurrent calls per run and tool queue
   wait.
+- **Re-check the client after the queue wait.** Once a slot is acquired, test for disconnect (in FastAPI,
+  `await request.is_disconnected()`) and release the slot without calling the model if the client left
+  while queued.
 
 ## Trade-offs
 - **Shedding vs queueing.** Shedding sacrifices some requests to keep latency bounded for the rest, which

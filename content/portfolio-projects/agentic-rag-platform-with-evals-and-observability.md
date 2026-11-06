@@ -168,39 +168,30 @@ chunk ids. Tracing uses the OpenTelemetry API, which Langfuse, LangSmith and Pho
 each tool's current docs for exporter setup.
 
 ```python
+# pip install opentelemetry-api
 from opentelemetry import trace
 
 tracer = trace.get_tracer("rag-platform")
 
-def search(query: str, k: int = 5) -> list[dict]:
-    """Your hybrid search + rerank. Returns [{'id': ..., 'text': ..., 'score': ...}]."""
-    raise NotImplementedError
+def search(query: str, k: int = 5) -> list[str]:
+    """Your hybrid search + rerank; returns chunk ids. Stubbed here so the harness runs."""
+    return ["billing-04#2", "faq-02#1"][:k]
 
-def traced_search(query: str, k: int = 5) -> list[dict]:
+def traced_search(query: str, k: int = 5) -> list[str]:
     with tracer.start_as_current_span("search") as span:
-        span.set_attribute("rag.query", query)
         hits = search(query, k)
-        span.set_attribute("rag.hit_ids", [h["id"] for h in hits])
+        span.set_attribute("rag.hit_ids", hits)   # lets you tell a retrieval miss from a bad answer
         return hits
 
-GOLDEN = [  # question -> chunk ids that contain the answer; [] means unanswerable
+GOLDEN = [  # question -> chunk ids that contain the answer
     {"q": "What is the refund window for annual plans?", "gold": ["billing-04#2"]},
     {"q": "Does the API support SAML?", "gold": ["sso-01#1", "sso-01#3"]},
-    {"q": "What is the CEO's home address?", "gold": []},
 ]
 
-def recall_at_k(k: int = 5) -> float:
-    scored = [c for c in GOLDEN if c["gold"]]
-    hits = sum(any(h["id"] in c["gold"] for h in traced_search(c["q"], k)) for c in scored)
-    return hits / len(scored)
-
-def citation_ok(answer_ids: list[str], retrieved_ids: list[str]) -> bool:
-    return bool(answer_ids) and set(answer_ids) <= set(retrieved_ids)  # no citing unseen chunks
-
-if __name__ == "__main__":
-    r = recall_at_k()
-    print(f"recall@5 = {r:.2f}")
-    assert r >= 0.80, "retrieval regression: block the release"
+recall = sum(any(h in c["gold"] for h in traced_search(c["q"])) for c in GOLDEN) / len(GOLDEN)
+print(f"recall@5 = {recall:.2f}")   # recall@5 = 0.50
+if recall < 0.80:
+    print("retrieval regression: block the release")
 ```
 
 ### Evals and SLOs to hit
@@ -232,6 +223,8 @@ Targets are illustrative; set them from your MVP baseline and raise them as the 
   and alert on questions that hit the cap.
 - **Access filters at query time.** Apply the user's access groups as metadata filters inside the search
   tool, because a model cannot be trusted to ignore chunks it was shown.
+- **Golden set includes unanswerable questions.** Give them an empty gold list, score them on "not
+  found" rather than recall, and fail any answer that cites a chunk id the search did not return.
 
 ## Trade-offs
 - **Agentic vs single-shot retrieval.** Iterative search answers harder questions but adds latency and

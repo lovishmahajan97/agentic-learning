@@ -177,19 +177,10 @@ Checked against `anthropic` 2.1.0 (Python 3.12) with scripted responses; a live 
 import json, anthropic
 
 client = anthropic.Anthropic()
-TOOLS = [{
-    "name": "get_order",
-    "description": "Look up one order by id. Call this before answering any question "
-                   "about an order's status, items or delivery date.",
-    "input_schema": {"type": "object", "properties": {"order_id": {"type": "string"}},
-                     "required": ["order_id"], "additionalProperties": False},
-}]
-DB = {"A100": {"status": "shipped", "eta": "2026-10-23"}}
-
-def get_order(order_id: str) -> dict:
-    if order_id not in DB:
-        raise KeyError(f"no order with id {order_id}")
-    return DB[order_id]
+TOOLS = [{"name": "get_order", "description": "Look up one order by id.",
+          "input_schema": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                           "required": ["order_id"]}}]
+DB = {"A100": {"status": "shipped", "eta": "2026-10-23"}}      # get_order(id) is DB[id]
 
 def run(user_text: str, max_steps: int = 8) -> str:
     messages = [{"role": "user", "content": user_text}]
@@ -202,14 +193,12 @@ def run(user_text: str, max_steps: int = 8) -> str:
         if resp.stop_reason != "tool_use":          # end_turn, stop_sequence, refusal
             return "".join(b.text for b in resp.content if b.type == "text")
         results = []
-        for block in resp.content:
-            if block.type != "tool_use":
-                continue
+        for b in (b for b in resp.content if b.type == "tool_use"):
             try:
-                content, is_error = json.dumps(get_order(**block.input)), False
+                content, is_error = json.dumps(DB[b.input["order_id"]]), False
             except Exception as e:                  # the model sees the failure; the loop survives
-                content, is_error = f"error: {e}", True
-            results.append({"type": "tool_result", "tool_use_id": block.id,
+                content, is_error = f"error: no order {e}", True
+            results.append({"type": "tool_result", "tool_use_id": b.id,
                             "content": content, "is_error": is_error})
         messages.append({"role": "user", "content": results})  # all results, one message
     raise RuntimeError(f"no final answer after {max_steps} steps")
@@ -267,6 +256,9 @@ Same assumptions as above: 3,000 stable tokens, 1,500 new tokens per step (illus
 - **Approval gate for side effects.** When tools write or spend; tag tools read-only or mutating in the
   harness and route mutating calls to a human or policy check before execution. Monitor approval and
   rejection rates.
+- **Tool definitions that steer.** Say in each tool description when to call it ("call this before
+  answering any question about an order"), and close input schemas with `"additionalProperties": false` so
+  invented arguments are rejected.
 
 ## Trade-offs
 - **Adaptivity vs predictability.** The loop handles cases nobody scripted, but its path, cost and latency

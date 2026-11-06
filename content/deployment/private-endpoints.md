@@ -223,31 +223,24 @@ sequenceDiagram
 ```python
 import ipaddress, socket, sys
 
-# Hostnames the application's SDKs actually call (region-specific in real deployments).
-REQUIRED_PRIVATE = [
+REQUIRED_PRIVATE = [    # hostnames the app's SDKs actually call (region-specific in real use)
     "bedrock-runtime.eu-west-1.amazonaws.com",
     "s3.eu-west-1.amazonaws.com",
     "vectors.internal.example.com",   # our own SaaS exposed through a private endpoint
 ]
 
-def resolved_ips(host):
-    infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-    return sorted({ipaddress.ip_address(info[4][0]) for info in infos}, key=str)  # v4 and v6 mix
-
-failures = []
+failures = 0
 for host in REQUIRED_PRIVATE:
     try:
-        ips = resolved_ips(host)
-    except socket.gaierror as e:
-        failures.append(f"{host}: does not resolve ({e})"); continue
-    public = [str(ip) for ip in ips if not ip.is_private]
-    if public:
-        failures.append(f"{host}: resolves to public {public}; private DNS not active here")
-    else:
-        print(f"ok   {host} -> {[str(ip) for ip in ips]}")
-
-if failures:
-    print("\n".join("FAIL " + f for f in failures)); sys.exit(1)
+        ips = {ipaddress.ip_address(i[4][0]) for i in socket.getaddrinfo(host, 443)}
+    except socket.gaierror:
+        ips = set()                                    # does not resolve at all
+    public = sorted(str(ip) for ip in ips if not ip.is_private)
+    status = "ok  " if ips and not public else "FAIL"
+    failures += status == "FAIL"
+    print(status, host, public or sorted(map(str, ips)))
+sys.exit(1 if failures else 0)
+# Outside the VPC: FAIL bedrock-runtime.eu-west-1.amazonaws.com [<public IPs>]   (private DNS off)
 ```
 
 - **Run it inside the workload,** because resolution depends on the caller's resolver.
@@ -262,8 +255,7 @@ rather than a generic timeout it will retry until the step budget runs out.
 ```python
 import ipaddress, socket
 
-def diagnose(host, port=443, timeout=3.0):
-    """Return a short error string an agent loop can log and surface, or None if reachable."""
+def diagnose(host, port=443, timeout=3.0):    # error string the agent can surface, or None
     try:
         ips = {ipaddress.ip_address(i[4][0]) for i in socket.getaddrinfo(host, port)}
     except socket.gaierror:

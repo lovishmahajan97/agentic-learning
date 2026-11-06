@@ -184,40 +184,33 @@ window minus the output reserve.
 
 ```python
 WINDOW, OUTPUT_RESERVE = 200_000, 16_000
-BUDGET = {"system": 6_000, "tools": 8_000, "retrieved": 40_000, "history": 100_000}   # illustrative split
+BUDGET = {"retrieved": 40_000, "history": 100_000}   # illustrative split
 
 def stub(m):        # same tool_use_ids, one-line content: the call/result pairing stays valid
     return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": b["tool_use_id"],
             "content": "[consumed; see state note]"} for b in m["content"]]}
 
-def fresh_user_turn(m):    # a turn of plain user text, never a tool_result (its tool_use would be cut off)
-    return m["role"] == "user" and isinstance(m["content"], str)
-
-def assemble(system, tools, retrieved, history, consumed, question, count, summarize):
-    assert count(system) <= BUDGET["system"] and count(tools) <= BUDGET["tools"]
-    # 1. retrieval: keep the best chunks that fit, then put the strongest at the edges, weakest in the middle
+def assemble(system, retrieved, history, consumed, question, count, summarize):
     kept, used = [], 0
-    for chunk in retrieved:                                    # sorted by relevance, best first
-        if used + count(chunk.text) > BUDGET["retrieved"]:
+    for chunk in retrieved:                          # sorted best first: keep what fits
+        if used + count(chunk) > BUDGET["retrieved"]:
             break
-        kept.append(chunk); used += count(chunk.text)
-    ordered = kept[0::2] + kept[1::2][::-1]                     # best, 3rd, 5th ... 4th, 2nd
-    docs = "\n".join(f"<doc id='{c.id}' source='{c.source}'>\n{c.text}\n</doc>" for c in ordered)
-    # 2. history: stub consumed tool results (indexes in `consumed`), then compact if still over budget
+        kept.append(chunk); used += count(chunk)
+    ordered = kept[0::2] + kept[1::2][::-1]          # best, 3rd ... 4th, 2nd: weakest in the middle
+    docs = "\n".join(f"<doc>{c}</doc>" for c in ordered)
     hist = [stub(m) if i in consumed else m for i, m in enumerate(history)]
-    if count(hist) > BUDGET["history"]:
-        cut = max(len(hist) - 10, 1)
-        while cut < len(hist) and not fresh_user_turn(hist[cut]):
-            cut += 1
-        if cut == len(hist):
-            raise RuntimeError("no safe compaction point in the recent turns")
-        head, tail = hist[:cut], hist[cut:]
-        hist = [{"role": "user", "content": f"<summary>{summarize(head)}</summary>"},
-                {"role": "assistant", "content": "Understood. Continuing from the summary."}] + tail
+    if count(hist) > BUDGET["history"]:              # compact at a plain user-text turn, never a tool_result
+        cut = next(i for i in range(max(len(hist) - 10, 1), len(hist))
+                   if hist[i]["role"] == "user" and isinstance(hist[i]["content"], str))
+        hist = [{"role": "user", "content": f"<summary>{summarize(hist[:cut])}</summary>"},
+                {"role": "assistant", "content": "Understood. Continuing from the summary."}] + hist[cut:]
     messages = hist + [{"role": "user", "content": f"<documents>\n{docs}\n</documents>\n\n{question}"}]
-    total = count(system) + count(tools) + count(messages)
-    assert total <= WINDOW - OUTPUT_RESERVE, f"{total} tokens over budget"
-    return {"system": system, "tools": tools, "messages": messages}
+    assert count(system) + count(messages) <= WINDOW - OUTPUT_RESERVE, "over budget"
+    return {"system": system, "messages": messages}
+
+count = lambda x: len(str(x)) // 4                   # stand-in for a real tokenizer
+out = assemble("Be brief.", ["best", "2nd", "3rd", "4th"], [], set(), "Refund policy?", count, str)
+print(out["messages"][-1]["content"].splitlines()[1:5])   # ['<doc>best</doc>', '<doc>3rd</doc>', '<doc>4th</doc>', '<doc>2nd</doc>']
 ```
 
 In a cached agent loop, call `assemble` with a `consumed` set that changes only when the history budget
@@ -270,6 +263,9 @@ Either way, the lesson holds: batch edits, and prefer edits near the tail.
 - **Sub-agents for broad exploration.** Give a sub-agent the search and read tools and a cap on its
   returned summary, and pass only that summary to the parent. Monitor parent tokens per step and total
   task tokens.
+- **Budget every layer, and fail loudly on no safe cut.** Give system rules and tool definitions their own
+  budgets too (for example 6k and 8k), and raise an error if no plain user-text turn exists in the recent
+  turns to compact at, rather than cutting between a `tool_use` and its `tool_result`.
 
 ## Trade-offs
 - **Whole documents vs retrieval.** Loading whole documents is simpler with no retrieval misses, but costs

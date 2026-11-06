@@ -163,19 +163,18 @@ Authorization wiring differs across SDK versions, so check the docs; the tools s
 auth plumbing.
 
 ```python
+# pip install "mcp<2"
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 mcp = FastMCP("team-hub")
 READ_ONLY = ToolAnnotations(readOnlyHint=True)   # a hint for hosts; permissions are enforced server-side
-
 TICKETS = {"OPS-1": {"title": "Disk full on db-2", "status": "open"}}
 
 @mcp.tool(annotations=READ_ONLY)
 def search_docs(query: str, limit: int = 5) -> list[dict]:
-    """Search team runbooks and design docs. Returns title, url and a short snippet per hit.
-    Use this before answering any question about internal systems."""
-    return [{"title": "DB disk runbook", "url": "https://wiki.internal/db-disk", "snippet": "..."}][:limit]
+    """Search team runbooks. Use this before answering any question about internal systems."""
+    return [{"title": "DB disk runbook", "url": "https://wiki.internal/db-disk"}][:limit]
 
 @mcp.tool(annotations=READ_ONLY)
 def get_ticket(ticket_id: str) -> dict:
@@ -186,15 +185,10 @@ def get_ticket(ticket_id: str) -> dict:
 def create_ticket(title: str, severity: int) -> dict:
     """Create an ops ticket. severity is 1 (critical) to 4 (low). Confirm with the user first."""
     if not 1 <= severity <= 4:
-        return {"error": "severity must be 1-4"}
+        return {"error": "severity must be 1-4"}   # tell the model how to fix the call
     tid = f"OPS-{len(TICKETS) + 1}"
-    TICKETS[tid] = {"title": title, "status": "open", "severity": severity}
+    TICKETS[tid] = {"title": title, "status": "open"}
     return {"ticket_id": tid}
-
-@mcp.resource("runbook://oncall")
-def oncall_runbook() -> str:
-    """The current on-call runbook."""
-    return "1. Acknowledge the page. 2. Check the dashboard. 3. Open a ticket."
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")   # use "stdio" for local testing with a desktop host
@@ -217,7 +211,7 @@ async def main():
             tools = {t.name for t in (await session.list_tools()).tools}
             assert {"search_docs", "get_ticket", "create_ticket"} <= tools
             result = await session.call_tool("get_ticket", {"ticket_id": "OPS-1"})
-            print(result.content)
+            print(result.content)   # [TextContent(type='text', text='{\n  "title": "Disk full on db-2", ...')]
 
 asyncio.run(main())
 ```
@@ -250,6 +244,8 @@ Targets are illustrative; tool-selection accuracy is measured by running a real 
   structured log with redacted arguments; alert on error spikes and on unusual callers of write tools.
 - **Rate-limit and isolate.** Per-user and per-tool rate limits protect downstream systems; run risky
   integrations as separate servers behind the gateway so one failure does not take down every tool.
+- **Runbooks as resources, not tools.** Expose read-only reference text such as the on-call runbook
+  with `@mcp.resource("runbook://oncall")`, so hosts can attach it as context without a tool call.
 
 ## Trade-offs
 - **One hub vs many servers.** A single hub is easy to discover and operate but becomes a shared blast

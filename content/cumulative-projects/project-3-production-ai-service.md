@@ -195,79 +195,61 @@ flowchart TD
 
 ## Examples
 ### Starter skeleton: auth, storage, request ids, cost and tests
-Needs `pip install fastapi httpx pytest`. Tested with FastAPI 0.128.8, Starlette 0.49.3 and Python 3.9;
-run with `python app.py` or `pytest app.py`. The in-memory SQLite and `fake_llm` are stand-ins.
+Save the service as `app.py`. The in-memory SQLite and `fake_llm` are stand-ins.
 
 ```python
-import json, logging, sqlite3, time, uuid
+# pip install fastapi httpx pytest   (tested with FastAPI 0.128.8, Starlette 0.49.3, Python 3.9)
+import sqlite3, uuid
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-log = logging.getLogger("svc")
 KEYS = {"test-key-1": "tenant-a"}                 # load hashed keys from a secrets store in real code
 PRICE_PER_1K = {"in": 0.003, "out": 0.015}        # illustrative USD prices; read yours from the provider
 db = sqlite3.connect(":memory:", check_same_thread=False)
-db.execute("CREATE TABLE calls (id TEXT, tenant TEXT, tokens_in INT, tokens_out INT, cost REAL)")
+db.execute("CREATE TABLE calls (rid TEXT, tenant TEXT, cost REAL)")
 app = FastAPI()
-
 class Ask(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
-
 def tenant(x_api_key: str = Header(default="")):
     if x_api_key not in KEYS: raise HTTPException(401, "invalid api key")
     return KEYS[x_api_key]
-
 def fake_llm(q):                                   # swap for the real client; keep the usage fields
     if "boom" in q: raise TimeoutError("provider timeout")
     return {"text": f"echo: {q}", "usage": {"in": len(q.split()) * 2, "out": 12}}
 
-@app.middleware("http")
-async def trace(request: Request, call_next):
-    rid, t0 = request.headers.get("x-request-id", uuid.uuid4().hex), time.perf_counter()
-    request.state.rid = rid
-    resp = await call_next(request)
-    log.info(json.dumps({"rid": rid, "path": request.url.path, "status": resp.status_code,
-                         "ms": round((time.perf_counter() - t0) * 1000, 1)}))
-    resp.headers["x-request-id"] = rid
-    return resp
-
-@app.exception_handler(TimeoutError)
+@app.exception_handler(TimeoutError)               # provider failure -> 503, never a bare 500
 async def upstream_timeout(request: Request, exc: TimeoutError):
-    return JSONResponse(status_code=503, content={"error": "upstream_timeout", "rid": request.state.rid})
+    return JSONResponse(status_code=503, content={"error": "upstream_timeout"})
 
 @app.post("/ask")
-def ask(body: Ask, request: Request, t: str = Depends(tenant)):
-    r = fake_llm(body.question)
-    u = r["usage"]
-    cost = u["in"] / 1000 * PRICE_PER_1K["in"] + u["out"] / 1000 * PRICE_PER_1K["out"]
-    db.execute("INSERT INTO calls VALUES (?,?,?,?,?)", (request.state.rid, t, u["in"], u["out"], cost))
-    db.commit()
-    return {"answer": r["text"], "cost_usd": round(cost, 6), "rid": request.state.rid}
-
-@app.get("/healthz")
-def health(): return {"ok": True}
-
-# ---- tests (pytest picks these up; run directly here for the demo)
-from fastapi.testclient import TestClient
-c = TestClient(app)
-def test_auth():      assert c.post("/ask", json={"question": "hi"}).status_code == 401
-def test_validation(): assert c.post("/ask", json={"question": ""}, headers={"x-api-key": "test-key-1"}).status_code == 422
-def test_cost_row():
-    r = c.post("/ask", json={"question": "what is rag"}, headers={"x-api-key": "test-key-1"})
-    assert r.status_code == 200 and db.execute("SELECT count(*) FROM calls").fetchone()[0] >= 1
-def test_upstream_error():
-    r = c.post("/ask", json={"question": "boom"}, headers={"x-api-key": "test-key-1"})
-    assert r.status_code == 503 and r.json()["error"] == "upstream_timeout"
-if __name__ == "__main__":
-    for f in (test_auth, test_validation, test_cost_row, test_upstream_error): f(); print("PASS", f.__name__)
-    print(db.execute("SELECT tenant, sum(cost) FROM calls GROUP BY tenant").fetchall())
+def ask(body: Ask, t: str = Depends(tenant), x_request_id: str = Header(default="")):
+    rid, r = x_request_id or uuid.uuid4().hex, fake_llm(body.question)
+    cost = r["usage"]["in"] / 1000 * PRICE_PER_1K["in"] + r["usage"]["out"] / 1000 * PRICE_PER_1K["out"]
+    db.execute("INSERT INTO calls VALUES (?,?,?)", (rid, t, cost))   # one usage row per model call
+    return {"answer": r["text"], "cost_usd": round(cost, 6), "rid": rid}
 ```
 
-All four tests pass, each request logs one JSON line with `rid`, status and milliseconds (httpx, used by
-the test client, adds its own INFO line), and the last line prints cost per tenant. Gaps left for the milestones:
-- **Errors are not one envelope yet.** 401 and 422 still use FastAPI's default `detail` shape (M1).
+Save the tests as `test_app.py` and run `pytest -s test_app.py`.
+
+```python
+from fastapi.testclient import TestClient
+from app import app, db
+c, key = TestClient(app), {"x-api-key": "test-key-1"}
+
+def test_auth():       assert c.post("/ask", json={"question": "hi"}).status_code == 401
+def test_validation(): assert c.post("/ask", json={"question": ""}, headers=key).status_code == 422
+def test_upstream():   assert c.post("/ask", json={"question": "boom"}, headers=key).status_code == 503
+def test_cost_row():
+    r = c.post("/ask", json={"question": "what is rag"}, headers=key)
+    assert r.status_code == 200 and r.json()["rid"]
+    print(db.execute("SELECT tenant, sum(cost) FROM calls GROUP BY tenant").fetchall())
+    # [('tenant-a', 0.000198)]
+```
+
+All four tests pass and the last line prints cost per tenant. Gaps left for the milestones:
+- **Errors are not one envelope yet.** 401 and 422 still use FastAPI's default `detail` shape, and the 503
+  has no `rid` (M1).
 - **Keys are plaintext and storage is in memory** (M2); there is no retry or fallback (M3).
 - **Usage is only written on success,** so failed calls that still cost tokens are invisible (M4).
 
@@ -298,6 +280,8 @@ ones with whoever will depend on the service.
   use a real database container, because tenancy bugs hide in SQL. Monitor CI duration and flake rate.
 - **Release prompt and model with code.** Version prompts and model ids in the repo so a rollback restores
   all three together. Monitor eval scores per release.
+- **Log one JSON line per request.** A middleware records `rid`, path, status and milliseconds and echoes
+  `x-request-id` in the response header; the starter leaves this to M4.
 
 ## Trade-offs
 - **Managed platform vs Kubernetes.** A single container on a managed service ships in a day and covers

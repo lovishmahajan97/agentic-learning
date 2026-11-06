@@ -183,9 +183,8 @@ TOOLS = {   # the live registry: name -> JSON Schema for the arguments
 }
 SIDE_EFFECTS = {"refund"}   # state-changing tools: IDs must come from a tool result, not the model
 
-def check_call(call, seen_ids):
-    """Return an error to reflect back to the model, or None if the call may run."""
-    name, args = call.get("name"), call.get("arguments", {})
+def check_call(call, seen_ids):      # an error to reflect back to the model, or None if it may run
+    name, args = call["name"], call["arguments"]
     if name not in TOOLS:                                    # invented tool name
         return f"unknown tool {name!r}; available: {sorted(TOOLS)}"
     try:
@@ -197,15 +196,11 @@ def check_call(call, seen_ids):
     return None
 
 seen = {"A1043"}                     # IDs that actually came back from tools in this run
-for call in [{"name": "issue_refund", "arguments": {"order_id": "A1043", "amount": 20}},
-             {"name": "refund", "arguments": {"order_id": "A1043", "amount": "20"}},
-             {"name": "refund", "arguments": {"order_id": "A9999", "amount": 20}},
-             {"name": "refund", "arguments": {"order_id": "A1043", "amount": 20}}]:
-    print(check_call(call, seen))
-# unknown tool 'issue_refund'; available: ['get_order', 'refund']
-# invalid arguments for refund: '20' is not of type 'number'
-# order_id A9999 never appeared in a tool result; call get_order first
-# None
+for name, order_id, amount in [("issue_refund", "A1043", 20), ("refund", "A1043", "20"),
+                               ("refund", "A9999", 20), ("refund", "A1043", 20)]:
+    print(check_call({"name": name, "arguments": {"order_id": order_id, "amount": amount}}, seen))
+# unknown tool 'issue_refund'; available: ['get_order', 'refund']  |  invalid arguments for refund:
+# '20' is not of type 'number'  |  order_id A9999 never appeared in a tool result; ...  |  None
 ```
 
 - **Why only side-effecting tools.** A lookup such as `get_order` must accept IDs the user typed, or the
@@ -236,37 +231,21 @@ real errors are correlated, and some are recoverable).
 ```python
 import json
 
-def llm(prompt, temperature=0.0):
-    """Call your model provider here and return the text."""
+def llm(prompt):   # call your model provider here at temperature 0 and return the text
     raise NotImplementedError
 
-def extract_claims(answer):
-    out = llm("Split this answer into atomic factual claims. "
-              f"Return a JSON list of strings.\n\nANSWER:\n{answer}")
-    return json.loads(out)
-
-def verify(claim, passages):
-    ctx = "\n\n".join(f"[{i}] {p}" for i, p in enumerate(passages))
-    out = llm("Decide whether the CLAIM is supported by the PASSAGES. Reply with JSON "
-              '{"verdict": "supported" | "contradicted" | "not_found", "source": <index or null>}.\n\n'
-              f"PASSAGES:\n{ctx}\n\nCLAIM: {claim}")
-    return json.loads(out)
-
 def faithfulness_report(answer, passages):
-    claims = extract_claims(answer)
-    verdicts = [verify(c, passages) for c in claims]
-    unsupported = [(c, v["verdict"]) for c, v in zip(claims, verdicts) if v["verdict"] != "supported"]
+    claims = json.loads(llm(f"Split into atomic factual claims, as a JSON list of strings:\n{answer}"))
+    ctx = "\n".join(f"[{i}] {p}" for i, p in enumerate(passages))
+    verdicts = [json.loads(llm('Reply {"verdict": "supported" | "contradicted" | "not_found"} for the '
+                               f"CLAIM against the PASSAGES.\nPASSAGES:\n{ctx}\nCLAIM: {c}"))["verdict"]
+                for c in claims]
+    unsupported = [(c, v) for c, v in zip(claims, verdicts) if v != "supported"]
     return {"claims": len(claims), "unsupported": unsupported,
             "unsupported_rate": len(unsupported) / max(1, len(claims))}
 
-retrieved_passages = ["Refunds are issued within 14 days of a returned item being received."]
-answer_text = "Refunds take 14 days and are paid to the original card."   # second claim is unsupported
-report = faithfulness_report(answer_text, retrieved_passages)
-# Expected: 2 claims; "paid to the original card" comes back not_found, so unsupported_rate = 0.5.
-if report["unsupported_rate"] > 0:
-    # Options: regenerate with the unsupported claims listed as "do not state",
-    # return only the supported claims with their [source] indices, or route to review.
-    ...
+# faithfulness_report("Refunds take 14 days and are paid to the original card.", ["Refunds are issued
+# within 14 days of a returned item being received."])  # -> unsupported_rate 0.5: card claim not_found
 ```
 
 - **Free error analysis.** Unsupported claims that are "not_found" with weak retrieval scores point at the
@@ -282,18 +261,12 @@ import math, re
 def semantic_entropy(samples, same_meaning):
     clusters = []
     for s in samples:
-        for c in clusters:
-            if same_meaning(c[0], s):
-                c.append(s)
-                break
-        else:
-            clusters.append([s])
-    n = len(samples)
-    return sum(-(len(c) / n) * math.log(len(c) / n) for c in clusters)
+        match = next((c for c in clusters if same_meaning(c[0], s)), None)
+        if match: match.append(s)
+        else: clusters.append([s])
+    return sum(len(c) / len(samples) * math.log(len(samples) / len(c)) for c in clusters)
 
-years = lambda s: set(re.findall(r"\b\d{4}\b", s))
-same_year = lambda a, b: years(a) == years(b)
-
+same_year = lambda a, b: set(re.findall(r"\b\d{4}\b", a)) == set(re.findall(r"\b\d{4}\b", b))
 known = ["Founded in 1998.", "1998", "It was founded in 1998", "In 1998.", "1998, in Ohio"]
 guess = ["Founded in 1998.", "2003", "It was founded in 1987", "In 2003.", "2011"]
 print(round(semantic_entropy(known, same_year), 2))   # 0.0: one meaning, likely known
@@ -337,6 +310,9 @@ breakdown like this (illustrative counts, the shape is typical):
   model or prompt changes.
 - **Tier verification by stakes.** Run claim-level verification online only for high-stakes categories and
   offline on sampled traffic for everything else. Track the latency and cost it adds per tier.
+- **Act on unsupported claims.** Regenerate with the unsupported claims listed as "do not state",
+  return only the supported claims with their source indices (ask the judge for a `source` index per
+  claim), or route the answer to review.
 
 ## Trade-offs
 - **Verification per step vs agent latency.** Checking every fact before acting makes long agents

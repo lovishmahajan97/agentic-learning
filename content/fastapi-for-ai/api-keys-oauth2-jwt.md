@@ -256,51 +256,35 @@ principal type.
 
 ```python
 import asyncio, hashlib, jwt
-from dataclasses import dataclass
-from fastapi import Depends, FastAPI, HTTPException, Security
-from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
-
+from typing import NamedTuple
+from fastapi import Depends, HTTPException, Security
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 ISSUER, AUDIENCE = "https://login.acme-idp.com/", "api://ai-platform"
 jwks = jwt.PyJWKClient(ISSUER + ".well-known/jwks.json")   # caches keys; its fetch is blocking I/O
-api_key_hdr = APIKeyHeader(name="X-API-Key", auto_error=False)
-bearer = HTTPBearer(auto_error=False)
-KEYS = {}   # sha256(key) -> {"tenant": ..., "scopes": [...]}, really a DB table
+api_key_hdr, bearer = APIKeyHeader(name="X-API-Key", auto_error=False), HTTPBearer(auto_error=False)
+KEYS = {}   # sha256(key) -> (tenant, scopes), really a DB table
 
-@dataclass
-class Principal:
-    tenant: str; subject: str; scopes: set[str]
+class Principal(NamedTuple): tenant: str; subject: str; scopes: set[str]
 
 async def principal(key: str | None = Security(api_key_hdr),
                     cred: HTTPAuthorizationCredentials | None = Security(bearer)) -> Principal:
-    if key:
-        rec = KEYS.get(hashlib.sha256(key.encode()).hexdigest())
-        if rec:
-            return Principal(rec["tenant"], "key:" + key[:12], set(rec["scopes"]))
-    elif cred:
-        try:
-            jwk = await asyncio.to_thread(jwks.get_signing_key_from_jwt, cred.credentials)
-            signing_key = jwk.key                    # thread: a cache miss must not stall the loop
-            c = jwt.decode(cred.credentials, signing_key, algorithms=["RS256"],
-                           audience=AUDIENCE, issuer=ISSUER, leeway=30,
-                           options={"require": ["exp", "sub"]})   # PyJWT accepts a token with no exp otherwise
-            return Principal(c["tenant_id"], c["sub"], set(c.get("scope", "").split()))
-        except (jwt.PyJWTError, KeyError):
-            pass
-    raise HTTPException(401, "invalid or missing credentials",
-                        headers={"WWW-Authenticate": "Bearer"})
+    if key and (rec := KEYS.get(hashlib.sha256(key.encode()).hexdigest())):
+        return Principal(rec[0], "key:" + key[:12], set(rec[1]))
+    try:
+        tok = cred.credentials if cred else ""   # no credential: "" fails to decode -> 401
+        jwk = await asyncio.to_thread(jwks.get_signing_key_from_jwt, tok)   # off the event loop
+        c = jwt.decode(tok, jwk.key, algorithms=["RS256"], audience=AUDIENCE,
+                       issuer=ISSUER, leeway=30, options={"require": ["exp", "sub"]})
+        return Principal(c["tenant_id"], c["sub"], set(c.get("scope", "").split()))
+    except (jwt.PyJWTError, KeyError):
+        raise HTTPException(401, "invalid or missing credentials", headers={"WWW-Authenticate": "Bearer"})
 
-def require(scope: str):
+def require(scope: str):            # use: p: Principal = Depends(require("chat:write"))
     def check(p: Principal = Depends(principal)) -> Principal:
         if scope not in p.scopes:
             raise HTTPException(403, f"missing scope {scope}")
         return p
     return check
-
-app = FastAPI()
-
-@app.post("/v1/chat")
-async def chat(body: dict, p: Principal = Depends(require("chat:write"))):
-    return {"tenant": p.tenant, "reply": "..."}    # every query below filters by p.tenant
 ```
 
 - **401** means "I don't know who you are" (with `WWW-Authenticate`).
@@ -315,26 +299,10 @@ async def chat(body: dict, p: Principal = Depends(require("chat:write"))):
 
 In both paths the tenant comes from the verified credential, never from the request body.
 
-### Tool executor that injects per-tool credentials
-The model chooses the tool and arguments; the executor decides identity. `exchange_token` stands in for
-your IdP's token exchange (RFC 8693) or equivalent; `Principal` is the dataclass above.
-
-```python
-TOOL_AUDIENCE = {"search_docs": ("api://doc-search", "docs:read"),
-                 "create_ticket": ("api://tickets", "tickets:write")}
-
-async def call_tool(run_principal: Principal, user_token: str, name: str, args: dict, http):
-    args = {k: v for k, v in args.items() if k not in {"tenant_id", "user_id"}}  # model can't pick identity
-    if name not in TOOL_AUDIENCE:
-        return {"error": f"unknown tool {name}"}
-    aud, scope = TOOL_AUDIENCE[name]
-    if scope not in run_principal.scopes:                          # user must hold the scope itself
-        return {"error": f"user lacks permission for {name}"}      # an observation, not a crash
-    tok = await exchange_token(user_token, audience=aud, scope=scope)   # short-lived, one audience
-    r = await http.post(f"https://{aud.removeprefix('api://')}.internal/invoke", json=args,
-                        headers={"Authorization": f"Bearer {tok}"})
-    return r.json() if r.status_code < 400 else {"error": f"{name} returned {r.status_code}"}
-```
+### Tool executor rule: identity comes from the token, not the model
+The model chooses the tool and arguments; the executor decides identity. It drops `tenant_id` and
+`user_id` from model-produced arguments, checks the user holds the tool's scope, and exchanges the user's
+token for a short-lived one scoped to that tool's audience.
 
 | Attack or mistake | Without the executor rule | With it |
 |---|---|---|
@@ -343,39 +311,35 @@ async def call_tool(run_principal: Principal, user_token: str, name: str, args: 
 | Token for `api://doc-search` replayed at the ticket tool | accepted if `aud` is unchecked | ticket tool rejects it with 401 |
 
 ### What PyJWT rejects when verification is pinned (runnable)
-Requires `pyjwt` and `cryptography`. Each line shows the exception a misuse produces.
+Each line shows the exception a misuse produces.
 
 ```python
+# pip install pyjwt cryptography
 import time, jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)   # the IdP's key pair
-pub = priv.public_key()                                                  # what verifiers get
 ISS, AUD = "https://login.acme-idp.com/", "api://ai-platform"
 
-def mint(drop=(), key=priv, alg="RS256", **over):
-    c = {"iss": ISS, "aud": AUD, "sub": "u_9", "tenant_id": "t_42",
-         "scope": "chat:read", "exp": int(time.time()) + 300, **over}
-    for k in drop:
-        c.pop(k)
-    return jwt.encode(c, key, algorithm=alg)
+def mint(**over):
+    c = {"iss": ISS, "aud": AUD, "sub": "u_9", "exp": int(time.time()) + 300, **over}
+    return jwt.encode({k: v for k, v in c.items() if v is not None}, priv, algorithm="RS256")
 
 def verify(tok):
     try:
-        c = jwt.decode(tok, pub, algorithms=["RS256"], audience=AUD, issuer=ISS,
-                       leeway=30, options={"require": ["exp", "sub"]})
-        return f"ok tenant={c['tenant_id']} scope={c['scope']}"
+        jwt.decode(tok, priv.public_key(), algorithms=["RS256"], audience=AUD, issuer=ISS,
+                   leeway=30, options={"require": ["exp", "sub"]})
+        return "ok"
     except jwt.PyJWTError as e:
         return type(e).__name__
 
-print(verify(mint()))                                   # ok tenant=t_42 scope=chat:read
-print(verify(mint(aud="api://billing")))                # InvalidAudienceError
-print(verify(mint(exp=int(time.time()) - 60)))          # ExpiredSignatureError (past 30 s leeway)
-print(verify(mint(drop=["exp"])))                       # MissingRequiredClaimError
-print(verify(mint(key=None, alg="none")))               # InvalidAlgorithmError: alg pinned
-h, p, s = mint().split(".")
-forged = mint(tenant_id="t_99").split(".")[1]           # swap in another tenant's payload
-print(verify(".".join([h, forged, s])))                 # InvalidSignatureError
+print(verify(mint()))                               # ok
+print(verify(mint(aud="api://billing")))            # InvalidAudienceError
+print(verify(mint(exp=int(time.time()) - 60)))      # ExpiredSignatureError (past 30 s leeway)
+print(verify(mint(exp=None)))                       # MissingRequiredClaimError
+print(verify(jwt.encode({"sub": "u_9"}, None, algorithm="none")))   # InvalidAlgorithmError
+h, _, s = mint().split(".")
+print(verify(f"{h}.{mint(sub='admin').split('.')[1]}.{s}"))         # InvalidSignatureError: payload swapped
 ```
 
 ## Production patterns
@@ -401,6 +365,9 @@ print(verify(".".join([h, forged, s])))                 # InvalidSignatureError
   principal and tokens in executor context, strip identity fields from model-produced tool arguments,
   and store third-party OAuth refresh tokens encrypted per user. Monitor 401/403 rates per tool and per
   client (key prefix or client ID); spikes mean a broken integration or an attack.
+- **Tool-call failures as observations.** In the tool executor, return an unknown tool, a missing scope or
+  a 4xx/5xx from the tool service to the model as an error result instead of raising, so the run can
+  recover or explain.
 
 ## Trade-offs
 - **API keys vs client credentials.** Keys are trivial for customers to use and revoke instantly, but

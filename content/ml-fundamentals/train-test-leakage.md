@@ -177,7 +177,7 @@ flowchart TD
   give each run a fresh memory namespace.
 
 ## Examples
-### Feature-selection and row leakage on pure noise
+### Feature-selection leakage on pure noise
 The classic demonstration: 100 rows, 10,000 pure-noise features, labels unrelated to anything.
 - **Leaky:** feature selection on the full dataset before cross-validating gives impressive accuracy on data
   with no signal, because the selector peeked at every fold's test labels.
@@ -186,47 +186,48 @@ The classic demonstration: 100 rows, 10,000 pure-noise features, labels unrelate
 - **The arithmetic:** with 10,000 noise columns and 100 rows, a few dozen correlate with the labels by luck,
   and the leaky selector picks exactly those, *using the labels of the rows it will later be scored on*.
 
-The second half shows row leakage. Each of 40 patients contributes ten visits sharing a feature
-fingerprint, and the label is a coin flip per patient, so nothing generalizes to a new patient.
-
-A random row split almost always puts a sibling visit in training, and a 1-nearest-neighbour model scores
-near-perfectly by looking it up. Splitting by patient exposes the truth.
-
 ```python
 import numpy as np
 from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.linear_model import LogisticRegression
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.model_selection import StratifiedKFold, KFold, GroupKFold, cross_val_score
+from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.pipeline import make_pipeline
 
 rng = np.random.default_rng(0)
 X = rng.normal(size=(100, 10_000))                     # pure noise
 y = rng.integers(0, 2, size=100)                       # labels independent of X
 cv = StratifiedKFold(5, shuffle=True, random_state=0)
-clf = LogisticRegression(max_iter=1000)
 
 # WRONG: choose the 20 "best" features using all 100 rows, then cross-validate
 X_sel = SelectKBest(f_classif, k=20).fit_transform(X, y)
-leaky = cross_val_score(clf, X_sel, y, cv=cv).mean()
-
+leaky = cross_val_score(LogisticRegression(max_iter=1000), X_sel, y, cv=cv).mean()
 # RIGHT: selection is a pipeline step, refitted on each fold's training rows only
 pipe = make_pipeline(SelectKBest(f_classif, k=20), LogisticRegression(max_iter=1000))
 clean = cross_val_score(pipe, X, y, cv=cv).mean()
 print(f"leaky CV accuracy: {leaky:.2f}   clean CV accuracy: {clean:.2f}")   # ~0.87 vs ~0.47
+```
 
-# Row leakage: 40 patients x 10 visits; each patient has a feature "fingerprint" and one
-# random label, so the features carry no information about the label of an unseen patient.
-groups = np.repeat(np.arange(40), 10)
-fingerprint = rng.normal(size=(40, 8))
-Xp = fingerprint[groups] + 0.3 * rng.normal(size=(400, 8))
-yp = rng.integers(0, 2, size=40)[groups]
+### Row leakage: split by row versus by patient
+Each of 40 patients contributes ten visits sharing a feature fingerprint, and the label is a coin flip per
+patient, so nothing generalizes to a new patient.
+
+A random row split almost always puts a sibling visit in training, and a 1-nearest-neighbour model scores
+near-perfectly by looking it up. Splitting by patient exposes the truth.
+
+```python
+import numpy as np
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.model_selection import KFold, GroupKFold, cross_val_score
+
+rng = np.random.default_rng(2)
+groups = np.repeat(np.arange(40), 10)                  # 40 patients x 10 visits
+Xp = rng.normal(size=(40, 8))[groups] + 0.3 * rng.normal(size=(400, 8))   # per-patient fingerprint
+yp = rng.integers(0, 2, size=40)[groups]               # one random label per patient
 knn = KNeighborsClassifier(n_neighbors=1)              # a pure memorizer makes the leak obvious
 by_row = cross_val_score(knn, Xp, yp, cv=KFold(5, shuffle=True, random_state=0)).mean()
 by_patient = cross_val_score(knn, Xp, yp, cv=GroupKFold(5), groups=groups).mean()
 print(f"random-row CV: {by_row:.2f}   patient-grouped CV: {by_patient:.2f}")
-# Expect ~0.98 by row (a sibling visit is always in training) and near 0.5 by patient,
-# noisy because there are only 40 independent units, not 400.
+# 0.99 by row, 0.46 by patient; the grouped score is noisy (other seeds 0.4-0.7): only 40 independent units
 ```
 
 ### Cross-split duplicate check for an agent eval set
@@ -235,17 +236,14 @@ and the retrieval corpus.
 Standard library only; swap the shingle scan for a MinHash index at corpus scale.
 
 ```python
-import hashlib, re
+import re
 
-def norm(t):                                   # cheap normalization before hashing
+def norm(t):                                   # cheap normalization before comparing
     return re.sub(r"\s+", " ", t.lower()).strip()
 
 def shingles(t, n=5):
     w = norm(t).split()
     return {" ".join(w[i:i + n]) for i in range(max(1, len(w) - n + 1))}
-
-def jaccard(a, b):
-    return len(a & b) / len(a | b)
 
 train = ["My order 1234 never arrived, please refund me.",
          "How do I reset my password on the mobile app?"]
@@ -253,12 +251,10 @@ test = ["my order 1234 never arrived,   please refund me.",   # exact after norm
         "How do I reset my password on the mobile app today?",  # near-duplicate
         "Can I change the delivery address after checkout?"]   # genuinely new
 
-train_hash = {hashlib.sha256(norm(t).encode()).hexdigest() for t in train}
-train_sh = [shingles(t) for t in train]
+train_norm, train_sh = {norm(t) for t in train}, [shingles(t) for t in train]
 for t in test:
-    exact = hashlib.sha256(norm(t).encode()).hexdigest() in train_hash
-    near = max(jaccard(shingles(t), s) for s in train_sh)
-    print(f"exact={exact!s:5}  max_jaccard={near:.2f}  {t[:40]}")
+    near = max(len(shingles(t) & s) / len(shingles(t) | s) for s in train_sh)   # Jaccard
+    print(f"exact={norm(t) in train_norm!s:5}  max_jaccard={near:.2f}  {t[:40]}")
 # exact=True   max_jaccard=1.00  my order 1234 never arrived, ...
 # exact=False  max_jaccard=0.62  How do I reset my password ...
 # exact=False  max_jaccard=0.00  Can I change the delivery ...

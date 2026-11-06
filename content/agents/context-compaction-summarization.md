@@ -188,41 +188,30 @@ before it replaces the old span.
 import json
 
 LIMIT, TRIGGER, KEEP_RECENT = 100_000, 0.7, 6   # window budget, compaction threshold, verbatim tail
-
-SUMMARY_PROMPT = """Summarize the conversation so far for an agent that will continue it.
-Return JSON with keys: goal, constraints, decisions (each with its reason),
-state (files changed, ids created, commands run and their results), open_issues, next_step.
-Be exact with paths, ids and error strings. Never invent."""
-
-def prune_old_outputs(messages, keep_recent):
-    for m in messages[:len(messages) - keep_recent]:
-        if m["role"] == "tool" and len(m["content"]) > 500:
-            m["content"] = f"[tool output of {len(m['content'])} chars pruned; re-run the tool if needed]"
-    return messages
+SUMMARY_PROMPT = ("Summarize for an agent that will continue. Return JSON with keys: goal, constraints, decisions "
+                  "(with reasons), state, open_issues, next_step. Be exact with paths, ids, errors. Never invent.")
 
 def compact(messages, llm, count_tokens):
     if count_tokens(messages) < TRIGGER * LIMIT:
         return messages
-    messages = prune_old_outputs(messages, KEEP_RECENT)
+    for m in messages[:len(messages) - KEEP_RECENT]:    # layer 1: stub old tool outputs, no model call
+        if m["role"] == "tool" and len(m["content"]) > 500:
+            m["content"] = f"[tool output of {len(m['content'])} chars pruned; re-run the tool if needed]"
     if count_tokens(messages) < TRIGGER * LIMIT:
         return messages                      # pruning was enough; no summary call needed
     pinned, old, recent = messages[:2], messages[2:-KEEP_RECENT], messages[-KEEP_RECENT:]
     while recent and recent[0]["role"] == "tool":       # never split a tool call from its result
         old.append(recent.pop(0))
-    raw = llm(pinned + old + [{"role": "user", "content": SUMMARY_PROMPT}])
-    data = json.loads(raw)                               # a broken schema must fail loudly, not silently
-    missing = [k for k in ("goal", "state", "next_step") if not data.get(k)]
-    assert not missing, f"summary missing {missing}"
-    note = {"role": "user", "content": "Earlier context was compacted. Summary:\n" + json.dumps(data, indent=1)}
+    data = json.loads(llm(pinned + old + [{"role": "user", "content": SUMMARY_PROMPT}]))  # fail loudly
+    assert all(data.get(k) for k in ("goal", "state", "next_step")), "summary missing required keys"
+    note = {"role": "user", "content": "Earlier context was compacted. Summary:\n" + json.dumps(data)}
     return pinned + [note] + recent          # system prompt + task statement stay pinned
 
-if __name__ == "__main__":   # demo: fake model, chars/4 as the token counter
-    fake = lambda msgs: json.dumps({"goal": "fix test", "state": "PR #1 open", "next_step": "run CI"})
-    tokens = lambda msgs: sum(len(m["content"]) for m in msgs) // 4
-    run = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
-    run += [m for i in range(40) for m in ({"role": "assistant", "content": f"call {i}"},
-                                           {"role": "tool", "content": "x" * 30_000})]
-    print(tokens(run), "->", tokens(compact(run, fake, tokens)))   # 300k -> ~23k, pruning alone
+tokens = lambda msgs: sum(len(m["content"]) for m in msgs) // 4   # demo: chars/4 as the token counter
+run = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+for i in range(40):
+    run += [{"role": "assistant", "content": f"call {i}"}, {"role": "tool", "content": "x" * 30_000}]
+print(tokens(run), "->", tokens(compact(run, llm=None, count_tokens=tokens)))   # 300k -> ~23k, pruning alone
 ```
 
 ### Anchored merge for the second and later compactions
@@ -281,6 +270,9 @@ print(m["goal"], m["ids_created"], m["next_step"])
   compact them, and ask probe questions answered in the dropped span (which PR did you open? which
   constraint applies?); a wrong answer is a schema gap. Track task success and probe accuracy, not just
   tokens saved.
+- **Ask the summary for state in detail.** The `state` key should list files changed, ids created, and
+  commands run with their results; these are what a continuing agent most often needs and a loose summary
+  most often drops.
 
 ## Trade-offs
 - **Bounded context vs full recall.** Compaction is lossy by construction: a cheaper, bounded context in

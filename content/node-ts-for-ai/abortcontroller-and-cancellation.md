@@ -350,90 +350,56 @@ flowchart TD
 
 ## Examples
 ### Request-scoped signal through a streaming model call
-A request-scoped signal combining client disconnect and a hard timeout, passed through a streaming model
-call, with the abort reason used to decide whether the error is retryable. An agent-step signal joins the
-same way, as a third entry in the `AbortSignal.any` list.
-
-The listener cleanup in `withResource` shows the
-pattern for resources that have no signal-aware API.
+One signal per request combines client disconnect and a hard timeout, goes into the streaming `fetch`, and
+its abort reason decides how the handler responds.
 
 ```ts
-import { setTimeout as sleep } from "node:timers/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-function requestSignal(req: IncomingMessage, res: ServerResponse, timeoutMs: number) {
+function requestSignal(res: ServerResponse, timeoutMs: number) {
   const client = new AbortController();
   // fetch rejects with this exact reason, so keep its name "AbortError" (not a plain Error)
   res.once("close", () => client.abort(new DOMException("client disconnected", "AbortError")));
   return AbortSignal.any([client.signal, AbortSignal.timeout(timeoutMs)]);
 }
 
-async function streamModel(prompt: string, signal: AbortSignal, onToken: (t: string) => void) {
-  const res = await fetch("https://provider.example/v1/stream", {
-    method: "POST", body: JSON.stringify({ prompt, stream: true }), signal,
-  });
-  const dec = new TextDecoder();                  // stream: true keeps split UTF-8 characters intact
-  for await (const chunk of res.body!) {          // rejects with signal.reason when the signal fires
-    signal.throwIfAborted();                       // also stop between chunks if parsing is slow
-    onToken(dec.decode(chunk, { stream: true }));
-  }
-}
-
-async function withResource<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
-  const conn = { release() { console.log("released"); } };
-  let released = false;                          // abort and finally both fire on cancellation
-  const release = () => { if (!released) { released = true; conn.release(); } };
-  signal.addEventListener("abort", release, { once: true });
-  try { return await fn(); }
-  finally { signal.removeEventListener("abort", release); release(); }
-}
-
 export async function handler(req: IncomingMessage, res: ServerResponse) {
-  const signal = requestSignal(req, res, 30_000);
+  const signal = requestSignal(res, 30_000);
   try {
-    await withResource(signal, () => streamModel("Explain backpressure", signal, (t) => res.write(t)));
+    const r = await fetch("https://provider.example/v1/stream", { method: "POST", body: "{}", signal });
+    for await (const chunk of r.body!) res.write(chunk);   // rejects with signal.reason on abort
     res.end();
-  } catch (e: unknown) {
-    const name = (e as { name?: string }).name;
-    if (name === "AbortError") return;                       // user left: no retry, no error log
-    if (name === "TimeoutError") {                          // headers may be sent once tokens flowed
-      if (!res.headersSent) res.statusCode = 504;
-      return res.end("\n[provider timeout]");
-    }
-    throw e;                                                 // genuine failure: let the error layer classify it
+  } catch (e) {
+    const name = (e as Error).name;
+    if (name === "AbortError") return;                      // user left: no retry, no error log
+    if (name === "TimeoutError") return res.end("\n[provider timeout]");
+    throw e;                                                // genuine failure: let the error layer classify it
   }
 }
-void sleep;                                                  // sleep(ms, undefined, { signal }) for cancellable waits
 ```
 
 ### Agent scenario: a stoppable tool-calling loop
-One run controller (the stop button), a per-step timeout, and a step cap. Every model and tool call gets
+One run signal (the stop button), a fresh per-step timeout, and a step cap. Every model and tool call gets
 the combined signal, so stop or a slow step ends the work, not just the wait.
 
 ```ts
-type Step = { done: boolean; toolCalls: Array<{ name: string; args: unknown }> };
+type Step = { done: boolean; toolCalls: string[] };
 
 export async function runAgent(
   callModel: (signal: AbortSignal) => Promise<Step>,
-  runTool: (c: { name: string; args: unknown }, signal: AbortSignal) => Promise<string>,
-  run: AbortSignal,                       // aborted by the stop button or client disconnect
-  maxSteps = 10,
+  runTool: (name: string, signal: AbortSignal) => Promise<string>,
+  run: AbortSignal, maxSteps = 10,
 ) {
   for (let i = 0; i < maxSteps; i++) {
-    run.throwIfAborted();                 // safe point between steps
-    const step = AbortSignal.any([run, AbortSignal.timeout(20_000)]);   // fresh per step
+    run.throwIfAborted();                                              // safe point between steps
+    const step = AbortSignal.any([run, AbortSignal.timeout(20_000)]);  // fresh 20 s per step
     const out = await callModel(step);
     if (out.done) return "done";
-    // side-effecting tools should be idempotent: an abort may land mid-call
-    await Promise.allSettled(out.toolCalls.map((c) => runTool(c, step)));   // results feed the next
-    // model call through the transcript (omitted here)
+    await Promise.allSettled(out.toolCalls.map((c) => runTool(c, step)));
   }
   return "step limit reached";
 }
 ```
-
-- **Why the timeout is per step:** `AbortSignal.timeout` counts from creation, so building it at the top of
-  each step gives every step its own 20 s, while `run` still caps the whole run.
 
 ### `Promise.race` keeps billing; a signal stops it
 Save as `race.mjs` and run `node race.mjs` (about 7 seconds). A fake provider bills one token every 100 ms.
@@ -456,15 +422,10 @@ await sleep(4500);
 console.log("4.5 s later, still billing:", raced.tokens);        // 50
 
 const stopped = { tokens: 0 };
-await fakeProvider(AbortSignal.timeout(1000), stopped)
-  .catch((e) => console.log("rejected:", e.name, "cause:", e.cause?.name)); // AbortError, cause TimeoutError
+await fakeProvider(AbortSignal.timeout(1000), stopped).catch((e) => console.log("rejected:", e.name)); // AbortError
 await sleep(1000);
 console.log("signal version, 1 s later:", stopped.tokens);       // 9, no growth
 ```
-
-- **Note the rejection shape.** `timers/promises` rejects with an `AbortError` whose `cause` is the
-  `TimeoutError`, while `fetch` rejects with the `TimeoutError` itself. Classify from `signal.reason` when you
-  have the signal, rather than trusting one error name.
 
 ### Worked scenario: one deadline across three hops
 Gateway deadline 30 s; each hop subtracts elapsed time and a 500 ms margin (illustrative).
@@ -493,6 +454,15 @@ Gateway deadline 30 s; each hop subtracts elapsed time and a 500 ms margin (illu
   numbers, and review them when the model or prompt size changes. Watch the timeout rate per provider.
 - **Abort-aware retry and logging.** The retry layer skips `AbortError`, may fall back on `TimeoutError`, and
   logs aborts at info level, not as errors. Monitor token spend on aborted requests.
+- **Timeout status after streaming starts.** Send 504 only if `!res.headersSent`; once tokens have flowed,
+  end the stream with a marker instead.
+- **Decode streamed chunks safely.** Use one `TextDecoder` with `decode(chunk, { stream: true })` so split
+  UTF-8 characters survive, and call `signal.throwIfAborted()` between chunks when parsing is slow.
+- **Release-once cleanup.** For resources with no signal API, guard release with a flag (abort and `finally`
+  both fire on cancellation) and remove the abort listener in `finally`.
+- **Classify from `signal.reason`.** `timers/promises` rejects with an `AbortError` whose `cause` is the
+  `TimeoutError`, while `fetch` rejects with the `TimeoutError` itself.
+- **Idempotent side-effecting tools.** An abort can land mid tool call, so tools must tolerate a retry.
 
 ## Trade-offs
 - **Safe cleanup vs weakest link.** Cooperative cancellation is safe (cleanup runs where resources live) but

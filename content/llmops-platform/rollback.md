@@ -207,53 +207,36 @@ flowchart TD
 
 ## Examples
 ### Registry with immutable manifests and a guarded rollback
-A registry with immutable manifests, an environment alias, and a guard loop that rolls back when a metric
-breaches its threshold with enough samples. Promotion records history so rollback has a validated target.
+Deployment is an alias pointing at an immutable manifest; promotion records history, so rollback has a
+validated target. The guard rolls back only with enough samples and only inside the bake window.
 
 ```python
 import time
-from dataclasses import dataclass, field
 
-@dataclass(frozen=True)
-class Manifest:
-    id: str; model: str; prompt: str; params: dict; tools: str; index: str; guardrails: str
+manifests = {"m41": {"model": "m-2026-05", "prompt": "v12"}, "m42": {"model": "m-2026-09", "prompt": "v13"}}
+alias, history, promoted_at = {}, [], 0.0
 
-@dataclass
-class Registry:
-    manifests: dict = field(default_factory=dict)
-    alias: dict = field(default_factory=dict)      # env -> manifest id
-    history: dict = field(default_factory=dict)    # env -> [manifest ids that served]
-    promoted_at: dict = field(default_factory=dict)
+def promote(mid):
+    global promoted_at
+    assert mid in manifests, "unknown manifest"
+    history.append(mid)
+    alias["prod"] = mid                  # a pointer move, nothing rebuilt
+    promoted_at = time.time()
 
-    def promote(self, env: str, mid: str):
-        assert mid in self.manifests, "unknown manifest"
-        self.history.setdefault(env, []).append(mid)
-        self.alias[env] = mid                      # O(1): a pointer move, nothing rebuilt
-        self.promoted_at[env] = time.time()
-        cache.invalidate(namespace=env)            # cached answers belonged to the old version
+def check_guard(refusal_rate, n, limit=0.10, min_n=200, bake_s=48 * 3600):
+    global promoted_at
+    if n < min_n or refusal_rate <= limit:
+        return "ok"
+    if time.time() - promoted_at > bake_s:
+        return "page a human"            # late breach: likely external, not the release
+    history.pop()
+    alias["prod"] = history[-1]
+    promoted_at = 0.0                    # restored version is not fresh: no cascading rollbacks
+    return f"rolled back to {alias['prod']}"
 
-    def rollback(self, env: str) -> str:
-        served = self.history[env]
-        assert len(served) >= 2, "nothing validated to roll back to"
-        served.pop()                               # drop the bad one
-        self.alias[env] = served[-1]
-        self.promoted_at[env] = 0.0                # restored version is not "fresh": a further
-        cache.invalidate(namespace=env)            # breach pages a human, no cascading rollbacks
-        return served[-1]
-
-GUARDS = {"schema_fail_rate": (0.02, 200), "p95_ms": (6000, 200), "refusal_rate": (0.10, 200)}
-BAKE_S = 48 * 3600                                 # auto-rollback only while the release is fresh
-
-def check_guards(reg: Registry, env: str, window: dict) -> str | None:
-    for metric, (limit, min_n) in GUARDS.items():
-        if window["n"] >= min_n and window[metric] > limit:
-            if time.time() - reg.promoted_at[env] > BAKE_S:
-                alerts.page(f"{env}: {metric} breach outside bake window; human decision")
-                return None
-            target = reg.rollback(env)
-            alerts.page(f"{env}: {metric}={window[metric]:.3f} > {limit}; rolled back to {target}")
-            return target
-    return None
+promote("m41"); promote("m42")
+print(check_guard(0.15, n=50))           # ok (too few samples)
+print(check_guard(0.15, n=400))          # rolled back to m41
 ```
 
 ### Pre-release rollback-readiness check
@@ -328,6 +311,8 @@ A ticketing agent's new manifest a18 started duplicating tickets. Figures are il
 - **Manifest id on every agent action.** Tag each tool call, memory write and outbound message with the
   manifest id and run id, so a rollback is followed by one query listing what the bad version did.
   Monitor the share of tool calls missing the tag.
+- **Guard thresholds need a sample floor.** Illustrative guards: schema-failure rate above 2%, p95 above
+  6,000 ms or refusal rate above 10%, each evaluated only once a window holds at least 200 requests.
 
 ## Trade-offs
 - **Warm previous model vs cost.** Instant rollback costs GPU memory or a second serving pool; for

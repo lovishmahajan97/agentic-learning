@@ -185,13 +185,9 @@ The judge is a lookup table here; in production it is an NLI model or calibrated
 one claim and the given passages only.
 
 ```python
-SUPPORT = {  # judge(claim, passages) -> "full" | "partial" | "none"
-    ("C1", frozenset({"S2"})): "full",
-    ("C2", frozenset({"S2", "S4"})): "full", ("C2", frozenset({"S4"})): "full",
-    ("C5", frozenset({"S1"})): "full",
-}
-def judge(claim, passages):
-    return SUPPORT.get((claim, frozenset(passages)), "none")
+FULL = {("C1", ("S2",)), ("C2", ("S2", "S4")), ("C2", ("S4",)), ("C5", ("S1",))}
+def judge(claim, passages):                     # -> "full" | "partial" | "none"; a lookup stand-in here
+    return "full" if (claim, tuple(sorted(passages))) in FULL else "none"
 
 answer = {"C1": ["S2"], "C2": ["S2", "S4"], "C3": ["S3"], "C4": [], "C5": ["S1"]}
 
@@ -199,11 +195,10 @@ def score(answer):
     supported = sum(judge(c, p) == "full" for c, p in answer.items())
     relevant = total = 0
     for c, cited in answer.items():
-        full = judge(c, cited)
         for s in cited:
             total += 1
             alone = judge(c, [s]) == "full"
-            needed = judge(c, [x for x in cited if x != s]) != full   # removal changes support
+            needed = judge(c, [x for x in cited if x != s]) != judge(c, cited)   # removal changes support
             relevant += alone or needed
     return {"recall": supported / len(answer), "precision": relevant / total,
             "rate": sum(bool(p) for p in answer.values()) / len(answer)}
@@ -218,9 +213,8 @@ adapt it to your tracing tool's export.
 
 ```python
 def score_trace(trace, judge):
-    """trace: {"tool_results": {"S1": text, ...}, "claims": [{"text": ..., "source_ids": [...]}]}"""
     pool = trace["tool_results"]                       # everything the agent retrieved in this run
-    out = {"full": 0, "misattributed": 0, "invented": 0, "n": len(trace["claims"])}
+    out = {"full": 0, "misattributed": 0, "invented": 0}
     for cl in trace["claims"]:
         cited = [pool[s] for s in cl["source_ids"] if s in pool]
         if cited and judge(cl["text"], cited) == "full":
@@ -229,7 +223,6 @@ def score_trace(trace, judge):
             out["misattributed"] += 1                  # grounded somewhere in the run: re-cite
         else:
             out["invented"] += 1                       # nothing in the run supports it
-    out["citation_recall"] = out["full"] / max(out["n"], 1)
     return out
 
 def keyword_judge(claim, passages):                    # stand-in for an NLI model or LLM judge
@@ -239,7 +232,7 @@ trace = {"tool_results": {"S1": "Annual plans: refunds within 30 days.", "S2": "
          "claims": [{"text": "refunds within 30 days", "source_ids": ["S1"]},
                     {"text": "billing runs monthly", "source_ids": ["S1"]},     # right fact, wrong ID
                     {"text": "refunds are prorated", "source_ids": ["S2"]}]}
-print(score_trace(trace, keyword_judge))   # 1 full, 1 misattributed, 1 invented
+print(score_trace(trace, keyword_judge))   # {'full': 1, 'misattributed': 1, 'invented': 1}
 ```
 
 | Run slice (illustrative) | Claims | Full | Misattributed | Invented |
@@ -259,11 +252,8 @@ import random
 def bootstrap_ci(per_question, iters=2000, seed=0):
     """per_question: (supported, needing_citation) claim counts per question. Resample questions."""
     rng = random.Random(seed)
-    stats = []
-    for _ in range(iters):
-        sample = [rng.choice(per_question) for _ in per_question]
-        stats.append(sum(s for s, _ in sample) / sum(n for _, n in sample))
-    stats.sort()
+    samples = ([rng.choice(per_question) for _ in per_question] for _ in range(iters))
+    stats = sorted(sum(s for s, _ in smp) / sum(n for _, n in smp) for smp in samples)
     return stats[int(0.025 * iters)], stats[int(0.975 * iters)]
 
 rng = random.Random(1)

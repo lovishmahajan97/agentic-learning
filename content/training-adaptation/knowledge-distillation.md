@@ -218,34 +218,28 @@ Both models must use the same tokenizer so vocabulary positions line up; the tea
 scaling and mixed hard/soft objective follow Hinton; padded positions are masked out of the soft term.
 
 ```python
+# pip install torch
 import torch
 import torch.nn.functional as F
 
 def kd_loss(student_logits, teacher_logits, labels, T=2.0, alpha=0.5, ignore_index=-100):
-    """student/teacher logits: [batch, seq, vocab]; labels: [batch, seq], a copy of input_ids with
-    ignore_index at masked positions (HF convention: unshifted, the shift happens below)."""
-    s = student_logits[:, :-1].float()          # position t predicts token t+1
-    t = teacher_logits[:, :-1].float()
-    y = labels[:, 1:]
-    mask = (y != ignore_index).float()
-    # soft term: KL(teacher || student) at temperature T, scaled by T^2
-    log_p_s = F.log_softmax(s / T, dim=-1)
-    p_t = F.softmax(t / T, dim=-1)
-    soft = F.kl_div(log_p_s, p_t, reduction="none").sum(-1)      # [batch, seq-1]
-    soft = (soft * mask).sum() / mask.sum() * (T * T)
-    # hard term: ordinary next-token cross-entropy against the ground-truth tokens
+    """logits: [batch, seq, vocab]; labels: input_ids with ignore_index at masked positions."""
+    s, t, y = student_logits[:, :-1].float(), teacher_logits[:, :-1].float(), labels[:, 1:]
+    mask = (y != ignore_index).float()                            # position t predicts token t+1
+    soft = F.kl_div(F.log_softmax(s / T, -1), F.softmax(t / T, -1), reduction="none").sum(-1)
+    soft = (soft * mask).sum() / mask.sum() * (T * T)             # KL(teacher || student), times T^2
     hard = F.cross_entropy(s.reshape(-1, s.size(-1)), y.reshape(-1), ignore_index=ignore_index)
     return alpha * soft + (1 - alpha) * hard
 
-# one training step; `teacher` is in eval mode with requires_grad disabled
-with torch.no_grad():
-    t_out = teacher(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-s_out = student(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
-loss = kd_loss(s_out.logits, t_out.logits, batch["labels"], T=2.0, alpha=0.7)
-loss.backward(); optimizer.step(); optimizer.zero_grad()
-# For sequence-level distillation there is no kd_loss at all: generate teacher responses offline,
-# filter them with a verifier, and run plain SFT on the survivors.
+torch.manual_seed(0)
+teacher = torch.randn(2, 6, 50)                                   # frozen teacher logits
+labels = torch.randint(0, 50, (2, 6)); labels[:, -2:] = -100      # last two positions are padding
+print(round(kd_loss(teacher.clone(), teacher, labels).item(), 2))   # 1.97: student == teacher, hard term only
+print(round(kd_loss(torch.randn(2, 6, 50), teacher, labels).item(), 2))   # 3.37: a random student, soft > 0
 ```
+
+For sequence-level distillation there is no `kd_loss` at all: generate teacher responses offline, filter
+them with a verifier, and run plain SFT on the survivors.
 
 ### See temperature expose dark knowledge
 Pure Python; runs anywhere. Same teacher logits as the table above.
@@ -255,44 +249,15 @@ import math
 
 def softmax(z, T=1.0):
     e = [math.exp(x / T) for x in z]
-    s = sum(e)
-    return [x / s for x in e]
+    return [x / sum(e) for x in e]
 
 teacher = [6, 2, 1]
-for T in (1, 2, 4, 20):
+for T in (1, 4, 20):
     p = softmax(teacher, T)
-    tail = p[1] + p[2]
-    print(f"T={T:>2}: p={[round(x, 3) for x in p]}  tail mass={tail:.1%}  p2/p3={p[1]/p[2]:.2f}")
-# T= 1: p=[0.976, 0.018, 0.007]  tail mass=2.4%  p2/p3=2.72
-# T= 2: p=[0.821, 0.111, 0.067]  tail mass=17.9%  p2/p3=1.65
-# T= 4: p=[0.604, 0.222, 0.173]  tail mass=39.6%  p2/p3=1.28   (0.6045 before rounding)
-# T=20: p=[0.385, 0.315, 0.3]  tail mass=61.5%  p2/p3=1.05    <- near uniform, ranking washes out
-```
-
-### Building per-step SFT data from verified teacher trajectories
-Pure Python. Only trajectories whose task passed survive, and each teacher action becomes one example.
-
-```python
-def per_step_examples(trajectories, steps_to_distil={"route", "rewrite", "summarise"}):
-    out = []
-    for traj in trajectories:
-        if not traj["task_passed"]:                    # verifier: tests, resolution, schema checks
-            continue
-        history = []
-        for turn in traj["turns"]:
-            if turn["role"] == "assistant" and turn["step"] in steps_to_distil:
-                out.append({"messages": history + [turn], "loss_on": "last_assistant_turn"})
-            history = history + [turn]
-    return out
-
-trajs = [{"task_passed": True, "turns": [
-            {"role": "user", "content": "compare two vector stores"},
-            {"role": "assistant", "step": "route", "content": "research"},
-            {"role": "assistant", "step": "rewrite", "content": "pgvector vs qdrant recall"},
-            {"role": "tool", "content": "...search results..."},
-            {"role": "assistant", "step": "summarise", "content": "Both support HNSW..."}]},
-         {"task_passed": False, "turns": []}]
-print(len(per_step_examples(trajs)))   # 3 examples from the passing trajectory, 0 from the failed one
+    print(f"T={T:>2}: p={[round(x, 3) for x in p]}  tail mass={p[1] + p[2]:.1%}")
+# T= 1: p=[0.976, 0.018, 0.007]  tail mass=2.4%
+# T= 4: p=[0.604, 0.222, 0.173]  tail mass=39.6%
+# T=20: p=[0.385, 0.315, 0.3]  tail mass=61.5%   <- near uniform, ranking washes out
 ```
 
 ### Worked scenario: why teams cache top-k logits
@@ -325,6 +290,9 @@ which is why the kept entries are renormalised.
 - **Refresh the student when the agent changes.** New tools, prompts or policies make old teacher
   trajectories stale; re-run the teacher on recent traffic and retrain on a schedule. Monitor the
   student's fallback rate as the drift signal.
+- **Build per-step SFT data only from verified trajectories.** Drop trajectories whose task failed, and
+  turn each distilled assistant step (route, rewrite, summarise) into one example of the history so far
+  plus that turn, with loss on that last assistant turn only.
 
 ## Trade-offs
 - **Accuracy per parameter vs teacher compute.** You pay a teacher forward pass over the whole training

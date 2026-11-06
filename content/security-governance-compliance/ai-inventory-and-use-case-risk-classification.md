@@ -211,51 +211,39 @@ flowchart TD
 
 ## Examples
 ### Classification as code, with autonomy derived from an agent's tools
-Encoding the questionnaire makes tiers repeatable and keeps the answers next to the result. For agents,
+Encoding the questionnaire makes tiers repeatable. For agents,
 autonomy is computed from the declared tool list instead of asked, so it cannot be under-reported.
 
 ```python
 TIERS = ["low", "medium", "high"]
 ANNEX_III = {"employment", "education", "essential_services", "credit_scoring", "biometric_id",
              "critical_infrastructure", "law_enforcement", "migration", "justice"}
+LEVEL = {"minor": 0, "significant": 1, "severe": 2, "internal": 0, "customers": 1, "public": 1}
 
-def agent_autonomy(tools: dict) -> str:
-    # tools: name -> "read" | "write_approved" | "write"
-    if any(p == "write" for p in tools.values()): return "automated"
-    if any(p == "write_approved" for p in tools.values()): return "human_approves"
-    return "human_decides"
+def agent_autonomy(tools: dict) -> int:
+    # tools: name -> "read" | "write_approved" | "write"; derived, so it cannot be under-reported
+    perms = set(tools.values())
+    return 2 if "write" in perms else 1 if "write_approved" in perms else 0
 
-def classify(a: dict) -> dict:
+def classify(a: dict) -> str:
     if a["prohibited_practice"]:
-        return {"tier": "prohibited", "why": ["prohibited practice: stop"]}
-    why, floor = [], 0
-    if a["area"] in ANNEX_III:
-        if a["exemption_condition"] and not a["profiles_people"]:
-            why.append("Annex III exemption claimed: document the reasoning")
-        else:
-            floor = 2
-            why.append(f"Annex III area '{a['area']}' sets floor high")
-    autonomy = agent_autonomy(a["tools"]) if "tools" in a else a["autonomy"]
-    scores = {"impact": {"minor": 0, "significant": 1, "severe": 2}[a["impact"]],
-              "autonomy": {"human_decides": 0, "human_approves": 1, "automated": 2}[autonomy],
-              "exposure": {"internal": 0, "customers": 1, "public": 1}[a["exposure"]]}
-    tier = max([floor, *scores.values()])          # maximum, never an average
-    why += [f"{k}={v}" for k, v in scores.items() if v == tier and v > 0]
-    controls = ["data controls"] if a["sensitive_data"] else []   # triggers controls, not the tier
-    return {"tier": TIERS[tier], "why": why, "extra_controls": controls, "answers": a}
+        return "prohibited"
+    exempt = a["exemption_documented"] and not a["profiles_people"]
+    floor = 2 if a["area"] in ANNEX_III and not exempt else 0
+    scores = [LEVEL[a["impact"]], agent_autonomy(a["tools"]), LEVEL[a["exposure"]]]
+    return TIERS[max(floor, *scores)]              # maximum, never an average
 
-base = dict(prohibited_practice=False, area=None, exemption_condition=False, profiles_people=False,
-            sensitive_data=False, impact="significant", exposure="customers")
-support_v1 = {**base, "tools": {"search_kb": "read", "lookup_order": "read"}}
-support_v2 = {**support_v1, "tools": {**support_v1["tools"], "issue_refund": "write"}}
-support_v3 = {**support_v1, "tools": {**support_v1["tools"], "issue_refund": "write_approved"}}
-for name, ans in [("v1 read-only", support_v1), ("v2 auto refund", support_v2),
-                  ("v3 approved refund", support_v3)]:
-    r = classify(ans)
-    print(f"{name:19} {r['tier']:7} {r['why']}")
-# v1 read-only        medium  ['impact=1', 'exposure=1']
-# v2 auto refund      high    ['autonomy=2']
-# v3 approved refund  medium  ['impact=1', 'autonomy=1', 'exposure=1']
+support = dict(prohibited_practice=False, area=None, exemption_documented=False,
+               profiles_people=False, impact="significant", exposure="customers")
+read_only = {"search_kb": "read", "lookup_order": "read"}
+for name, tools in [("v1 read-only", read_only),
+                    ("v2 auto refund", {**read_only, "issue_refund": "write"}),
+                    ("v3 approved refund", {**read_only, "issue_refund": "write_approved"})]:
+    print(f"{name:19} {classify({**support, 'tools': tools})}")
+# v1 read-only        medium
+# v2 auto refund      high
+# v3 approved refund  medium
+print(classify({**support, "area": "employment", "tools": read_only}))  # high: Annex III floor
 ```
 
 - **The agent lesson.** Adding `issue_refund` without approval moves the support agent from medium to high;

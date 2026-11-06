@@ -191,38 +191,25 @@ for avg_len in (8192, 2000):
 The server flags encode the memory and concurrency decisions above.
 
 ```python
-# Terminal (one GPU, a GQA model that fits in fp16):
-#   vllm serve meta-llama/Meta-Llama-3-8B-Instruct \
-#       --max-model-len 8192 --gpu-memory-utilization 0.9 \
-#       --max-num-seqs 128 --enable-prefix-caching
-# The startup log prints how many KV-cache blocks were allocated; that number
-# times the block size is the pool of context tokens the scheduler can hand out.
-
+# Terminal: vllm serve meta-llama/Meta-Llama-3-8B-Instruct --max-model-len 8192 \
+#             --gpu-memory-utilization 0.9 --max-num-seqs 128 --enable-prefix-caching
+# The startup log prints the KV-cache blocks allocated: blocks x block size = the token pool.
 import time
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-
-t0 = time.perf_counter()
-first = None
-n = 0
+t0, first, n = time.perf_counter(), None, 0
 stream = client.chat.completions.create(
-    model="meta-llama/Meta-Llama-3-8B-Instruct",
-    messages=[{"role": "system", "content": "You are a terse assistant."},
-              {"role": "user", "content": "Explain continuous batching in 3 sentences."}],
-    max_tokens=200,
-    stream=True,                                   # SSE: one chunk per sampled token
-)
+    model="meta-llama/Meta-Llama-3-8B-Instruct", max_tokens=200, stream=True,  # SSE chunk per token
+    messages=[{"role": "user", "content": "Explain continuous batching in 3 sentences."}])
 for chunk in stream:
     if chunk.choices and chunk.choices[0].delta.content:
-        if first is None:
-            first = time.perf_counter() - t0      # time to first token
+        first = first or time.perf_counter() - t0      # time to first token
         n += 1
-total = time.perf_counter() - t0
-print(f"TTFT={first*1000:.0f} ms, chunks={n}, "
-      f"TPOT≈{(total-first)/max(n-1,1)*1000:.1f} ms/chunk")
-# Run two copies of this script at once: TTFT barely moves, TPOT rises slightly,
-# and the server's tokens/sec roughly doubles — the signature of a batched decode loop.
+tpot = (time.perf_counter() - t0 - first) / max(n - 1, 1)
+print(f"TTFT={first*1000:.0f} ms, TPOT~{tpot*1000:.1f} ms/chunk")
+# Run two copies at once: TTFT barely moves, TPOT rises slightly, server tokens/sec
+# roughly doubles: the signature of a batched decode loop.
 ```
 
 ### Agent scenario: timing every step of a tool-calling loop
@@ -232,33 +219,23 @@ Point the same client at the engine from an agent loop and log per-step latency 
   `--tool-call-parser` matching the model's format (check the vLLM tool-calling docs for the name).
 
 ```python
-import time, json
-from openai import OpenAI
+import json, time                                      # reuses `client` from the stack example
+tools = [{"type": "function", "function": {"name": "search_docs", "parameters": {
+    "type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}}]
+messages = [{"role": "user", "content": "How do I rotate an API key?"}]
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-MODEL = "meta-llama/Llama-3.1-8B-Instruct"   # serve this one for the agent run
-tools = [{"type": "function", "function": {
-    "name": "search_docs", "description": "Search internal docs",
-    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}}]
-
-def search_docs(q):                       # stand-in tool
-    return f"3 results for {q!r}"
-
-messages = [{"role": "system", "content": "You are a support agent. Use tools."},
-            {"role": "user", "content": "How do I rotate an API key?"}]
-for step in range(8):                     # hard cap on agent steps
+for step in range(8):                                  # hard cap on agent steps
     t0 = time.perf_counter()
-    r = client.chat.completions.create(model=MODEL, messages=messages, tools=tools,
-                                       max_tokens=300)   # per-step cap, not per task
-    dt = (time.perf_counter() - t0) * 1000
+    r = client.chat.completions.create(model="meta-llama/Llama-3.1-8B-Instruct",
+                                       messages=messages, tools=tools, max_tokens=300)
     msg = r.choices[0].message
-    print(f"step {step}: {dt:.0f} ms, prompt={r.usage.prompt_tokens}, out={r.usage.completion_tokens}")
-    messages.append(msg.model_dump(exclude_none=True))   # append-only transcript
+    print(f"step {step}: {(time.perf_counter()-t0)*1000:.0f} ms, prompt={r.usage.prompt_tokens}")
+    messages.append(msg.model_dump(exclude_none=True))  # append-only transcript
     if not msg.tool_calls:
         break
-    for call in msg.tool_calls:
-        args = json.loads(call.function.arguments)
-        messages.append({"role": "tool", "tool_call_id": call.id, "content": search_docs(**args)})
+    for call in msg.tool_calls:                         # stand-in tool result
+        q = json.loads(call.function.arguments)["q"]
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": f"3 results for {q!r}"})
 # Watch prompt_tokens climb each step: that growth is what fills the KV pool.
 ```
 

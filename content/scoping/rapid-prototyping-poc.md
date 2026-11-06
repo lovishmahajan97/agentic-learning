@@ -219,36 +219,26 @@ import json, math, collections, time
 
 THRESHOLD = 0.85  # written down before any tuning, from the business requirement
 
-def call_model(question: str, context: str) -> str:
-    """Placeholder: call your LLM provider here with a fixed prompt version."""
-    raise NotImplementedError
+def call_model(question, context): raise NotImplementedError("your LLM call, fixed prompt version")
+def retrieve(question): raise NotImplementedError("thinnest retrieval that could work, e.g. BM25")
+def judge(pred, expected): return expected.lower() in pred.lower()  # strict check before an LLM judge
 
-def retrieve(question: str) -> str:
-    """Placeholder: the thinnest retrieval that could work (e.g. BM25 over the manual)."""
-    raise NotImplementedError
-
-def judge(pred: str, expected: str) -> bool:
-    """Start with expert labels or a strict string/regex check; add an LLM judge later if needed."""
-    return expected.lower() in pred.lower()
-
-def run_poc(path: str = "eval_set.jsonl", split: str = "dev") -> None:
-    rows = [json.loads(l) for l in open(path)]           # {"q", "expected", "category", "split"}
-    rows = [r for r in rows if r["split"] == split]      # iterate on dev; read held-out once
+def run_poc(path="eval_set.jsonl", split="dev"):
+    rows = [r for r in map(json.loads, open(path)) if r["split"] == split]  # q, expected, category
     errors, correct, secs = collections.Counter(), 0, []
     for r in rows:
         t0 = time.monotonic()
-        pred = call_model(r["q"], retrieve(r["q"]))
+        ok = judge(call_model(r["q"], retrieve(r["q"])), r["expected"])
         secs.append(time.monotonic() - t0)
-        if judge(pred, r["expected"]):
-            correct += 1
-        else:
+        correct += ok
+        if not ok:
             errors[r["category"]] += 1
     n = len(rows); acc = correct / n
     half = 1.96 * math.sqrt(acc * (1 - acc) / n)          # binomial 95% half-width
     p95 = sorted(secs)[int(0.95 * (n - 1))]
     print(f"[{split}] accuracy {acc:.1%} ±{half:.1%} on {n} real examples, p95 {p95:.1f}s")
     print("errors by category:", errors.most_common())
-    if split == "heldout":
+    if split == "heldout":                                # iterate on dev; read held-out once
         verdict = ("pass" if acc - half >= THRESHOLD else
                    "fail" if acc + half < THRESHOLD else "inconclusive: need more data")
         print("DECISION:", verdict)

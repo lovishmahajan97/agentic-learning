@@ -192,8 +192,8 @@ sequenceDiagram
 
 ## Examples
 ### A bounded multi-hop loop
-`llm` returns text, `retrieve` returns `(id, text)` pairs; the planner emits JSON so termination is
-explicit and loggable.
+`llm` and `retrieve` are stubs; the planner emits JSON so termination is explicit and loggable. The trace
+below is for "Who manages the engineer who wrote the INC-4812 report?".
 
 ```python
 import json
@@ -203,37 +203,29 @@ Evidence so far:
 {ev}
 Queries already tried: {tried}
 If the evidence answers the question, return {{"done": true}}.
-Otherwise extract the entity or fact you still need, and return
-{{"done": false, "query": "<a specific search query naming that entity>"}}"""
+Otherwise return {{"done": false, "query": "<a specific query naming the entity you still need>"}}"""
 
-def multi_hop(question, max_hops=3, k=5):
+def multi_hop(question, max_hops=3, k=5):        # llm(str) -> str; retrieve(q, k) -> [(id, text)]
     evidence, seen, trace = [], set(), []
-    for hop in range(max_hops):
+    for hop in range(max_hops):                   # hop cap, enforced in code
         ev = "\n".join(f"[{i}] {t}" for i, t in evidence) or "(none)"
         tried = "; ".join(t["query"] for t in trace) or "(none)"
-        try:
-            plan = json.loads(llm(PLAN.format(q=question, ev=ev, tried=tried)))
-        except ValueError:
-            break                        # malformed plan: answer from what we have
-        if plan.get("done") or not plan.get("query"):
-            break
-        hits = retrieve(plan["query"], k)
-        new = [(i, t) for i, t in hits if i not in seen]
+        plan = json.loads(llm(PLAN.format(q=question, ev=ev, tried=tried)))
+        if plan.get("done"):
+            break                                 # the planner's done signal
+        new = [(i, t) for i, t in retrieve(plan["query"], k) if i not in seen]
         trace.append({"hop": hop, "query": plan["query"], "new": len(new)})
-        if not new:                      # no progress: stop instead of looping
-            break
+        if not new:
+            break                                 # no progress: stop instead of looping
         seen.update(i for i, _ in new); evidence.extend(new)
     ev = "\n".join(f"[{i}] {t}" for i, t in evidence)
-    answer = llm(f"Question: {question}\nEvidence:\n{ev}\nAnswer with citations, "
-                 f"or say the evidence is insufficient.")
-    return answer, trace
+    return llm(f"Question: {question}\nEvidence:\n{ev}\nAnswer with citations, "
+               "or say the evidence is insufficient."), trace
 
-ans, trace = multi_hop("Who manages the engineer who wrote the report for incident INC-4812?")
 # Illustrative trace:
-#   hop 0  query="INC-4812 incident report author"      -> report: "Author: Alice Chen (Payments)"
-#   hop 1  query="Alice Chen Payments team manager"     -> org page: "Alice Chen reports to Bob Ruiz"
-#   hop 2  planner returns done=true; answer cites both passages
-# Cost of this 2-hop answer: 3 planner calls + 2 retrievals + 1 answer call, all sequential.
+#   hop 0  "INC-4812 incident report author"  -> report: "Author: Alice Chen (Payments)"
+#   hop 1  "Alice Chen Payments team manager" -> org page: "Alice Chen reports to Bob Ruiz"
+#   hop 2  done=true; 3 planner calls + 2 retrievals + 1 answer call, all sequential
 ```
 
 ### Runnable: compounding error and the cost of a beam
@@ -263,37 +255,9 @@ print(f"rerank lifts per-hop to 0.95: 3 hops -> {chain_success([0.95] * 3):.2f}"
 - **A beam is linear in width:** three bridge candidates turn 3 retrievals into 7, worth it only when hop
   one is genuinely ambiguous.
 
-### Agent scenario: the same loop as a tool-calling agent with guards in the harness
-`call_model(messages, tools)` returns `.text` and `.tool_calls`, `.as_message()` turns the reply back into
-a transcript entry, and `tool_result(id, content)` builds the provider's result message; all are stubs.
-
-```python
-def run_agent(question, max_steps=4, k=5):
-    messages = [{"role": "user", "content": question}]
-    seen, tried = set(), set()
-    for step in range(max_steps):                          # hop cap, enforced in code
-        reply = call_model(messages, tools=[SEARCH_TOOL])
-        messages.append(reply.as_message())
-        if not reply.tool_calls:
-            return reply.text, step                         # the model's "done" signal
-        for call in reply.tool_calls:
-            q = call["input"]["query"].strip()
-            key = " ".join(q.lower().split())               # normalised only for the repeat check
-            if key in tried:                                # no progress: same query again
-                content = {"status": "repeated_query", "hint": "name the entity you still need"}
-            else:
-                tried.add(key)
-                new = [(i, t) for i, t in retrieve(q, k) if i not in seen]
-                seen.update(i for i, _ in new)
-                content = ({"status": "ok", "passages": [{"id": i, "text": t} for i, t in new]}
-                           if new else {"status": "no_new_passages"})
-            messages.append(tool_result(call["id"], content))
-    messages.append({"role": "user", "content": "Search budget reached. Answer only from the passages "
-                     "above, cite their ids for every fact, and say which fact is still missing."})
-    # keep the tool defined (the transcript holds tool calls) but forbid calling it
-    final = call_model(messages, tools=[SEARCH_TOOL], tool_choice="none")
-    return final.text, max_steps                            # partial answer, never a silent timeout
-```
+### Agent scenario: token flow when the loop runs as a tool-calling agent
+In a tool-calling agent the same guards live in the harness: a max-steps cap, a repeated-query check in
+the tool executor, and a forced answer turn when the budget runs out.
 
 Illustrative token flow for the INC-4812 question, with a 2,000-token system prompt and tool schemas and
 ~1,500 tokens (5 passages) per search result:
@@ -328,6 +292,13 @@ Illustrative token flow for the INC-4812 question, with a 2,000-token system pro
 - **Feed no-progress back as a tool result.** Instead of silently stopping, return a status such as
   `repeated_query` or `no_new_passages` with a hint, so the agent can name the missing entity or give up
   cleanly. Monitor how often a hint is followed by a productive next query.
+- **Normalise queries for the repeat check.** Compare lowercased, whitespace-collapsed queries, so a
+  trivially reworded repeat still counts as no progress.
+- **Forced answer turn at the cap.** When the budget is reached, append "answer only from the passages
+  above, cite ids, say what is missing" and call the model with the search tool still defined (the
+  transcript holds tool calls) but `tool_choice="none"`, so the run ends in a partial answer, not a timeout.
+- **Treat a malformed planner response as a stop.** If the plan is not valid JSON, end the loop and answer
+  from the evidence gathered so far instead of crashing.
 
 ## Trade-offs
 - **Reach vs latency.** Latency grows with hop count and hops are strictly sequential; gate with a

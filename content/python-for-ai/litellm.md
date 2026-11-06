@@ -341,49 +341,27 @@ flowchart TD
 ```
 
 ## Examples
-### One agent loop, a model per role
-The same tool loop runs whichever provider serves each step; a cheap model decides whether tools are
-needed, a stronger one does the work. Model names are illustrative; take them from config.
-
-```python
-import json, litellm
-
-ROLES = {"router": "openai/gpt-4o-mini", "worker": "anthropic/claude-haiku-5-5"}
-tools = [{"type": "function", "function": {
-    "name": "get_order", "description": "Look up an order by id",
-    "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
-                   "required": ["order_id"]}}}]
-
-def get_order(order_id: str) -> dict:
-    return {"order_id": order_id, "status": "shipped"}
-
-def run(question: str, tenant: str, max_steps: int = 6) -> str:
-    messages = [{"role": "user", "content": question}]
-    for step in range(max_steps):
-        model = ROLES["router"] if step == 0 else ROLES["worker"]
-        resp = litellm.completion(model=model, messages=messages, tools=tools, timeout=20,
-                                  metadata={"agent": "support", "tenant": tenant, "step": step})
-        msg = resp.choices[0].message
-        print(step, resp.model, resp.usage.prompt_tokens, litellm.completion_cost(resp))
-        if resp.choices[0].finish_reason != "tool_calls":
-            return msg.content                     # same finish_reason names for every provider
-        messages.append(msg.model_dump())
-        for call in msg.tool_calls:
-            args = json.loads(call.function.arguments)   # validate before running in production
-            messages.append({"role": "tool", "tool_call_id": call.id,
-                             "content": json.dumps(get_order(**args))})
-    return "Step limit reached."
-```
-
-- **Switching models mid-run is a design choice.** History written by one model is read by another;
-  provider-specific blocks (reasoning, cache markers) do not carry over, so eval the mixed trajectory.
-- **Per-step cost** comes from `completion_cost`, so you can report cost per task and per agent role.
-
-### Router with two deployments, retries and a cross-provider fallback
-Model names are illustrative; take them from config.
+### One call shape, a model per agent role
+The same OpenAI-format call reaches two providers, and the response comes back in the same shape with a
+cost attached. Model names are illustrative; take them from config.
 
 ```python
 import litellm
+
+ROLES = {"router": "openai/gpt-4o-mini", "worker": "anthropic/claude-haiku-5-5"}
+messages = [{"role": "user", "content": "Is order 42 shipped? Answer yes or no."}]
+
+for role, model in ROLES.items():
+    resp = litellm.completion(model=model, messages=messages, timeout=20,
+                              metadata={"agent": "support", "role": role})
+    print(role, resp.choices[0].finish_reason, resp.usage.prompt_tokens, litellm.completion_cost(resp))
+# e.g. "router stop 18 2.7e-06" (illustrative): same fields for every provider
+```
+
+### Router with two deployments, retries and a cross-provider fallback
+Callers ask for the logical name `chat`; topology lives in config.
+
+```python
 from litellm import Router
 
 router = Router(
@@ -397,58 +375,18 @@ router = Router(
     fallbacks=[{"chat": ["chat-backup"]}],        # if all "chat" deployments fail
     timeout=20,
 )
-
-resp = router.completion(
-    model="chat",
-    messages=[{"role": "user", "content": "Summarise: the refund was issued on 3 May."}],
-    metadata={"feature": "ticket-summary", "tenant": "acme"},   # for cost attribution in callbacks
-)
-print(resp.model, resp.choices[0].message.content)
-print(resp.usage.prompt_tokens, resp.usage.completion_tokens, litellm.completion_cost(resp))
+resp = router.completion(model="chat", messages=[{"role": "user", "content": "Say hi."}])
+print(resp.model)                                 # whichever deployment served it, OpenAI-shaped
 ```
 
-Scenario: OpenAI returns 429s for a minute.
-1. By default the router spreads "chat" traffic across both deployments (simple shuffle).
-2. Failing calls are retried, and the OpenAI deployment goes into cooldown after repeated failures.
-3. Traffic lands on the EU Azure deployment.
-4. Only if the "chat" group as a whole fails does the request go to the Anthropic backup; the caller still
-   receives an OpenAI-shaped response.
-
-### The same topology as a proxy config
-Applications then call the proxy with any OpenAI-compatible client and a virtual key.
-
-```yaml
-model_list:
-  - model_name: chat
-    litellm_params:
-      model: openai/gpt-4o-mini
-      api_key: os.environ/OPENAI_API_KEY
-  - model_name: chat
-    litellm_params:
-      model: azure/my-gpt4o-mini-eu
-      api_base: https://example-eu.openai.azure.com
-      api_key: os.environ/AZURE_API_KEY
-    model_info:
-      base_model: azure/gpt-4o-mini      # so the price map can cost this custom name
-  - model_name: chat-backup
-    litellm_params:
-      model: anthropic/claude-haiku-5-5
-      api_key: os.environ/ANTHROPIC_API_KEY
-router_settings:
-  num_retries: 2
-  timeout: 20
-  allowed_fails: 3
-  cooldown_time: 30
-  fallbacks: [{"chat": ["chat-backup"]}]
-```
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:4000", api_key="sk-team-virtual-key", max_retries=0)
-client.chat.completions.create(model="chat", messages=[{"role": "user", "content": "hi"}])
-```
-
-`max_retries=0` on the app client leaves retries to the proxy, so they live in exactly one layer.
+- **OpenAI returns 429s for a minute.** Failing calls are retried, the OpenAI deployment goes into
+  cooldown, and traffic lands on the EU Azure deployment.
+- **Only if the whole "chat" group fails** does the request go to the Anthropic backup; the caller still
+  gets an OpenAI-shaped response.
+- **Proxy mode** holds the same topology in a YAML `model_list` plus `router_settings` (for example
+  `allowed_fails: 3`, `cooldown_time: 30`). Apps call it with
+  `OpenAI(base_url="http://localhost:4000", api_key=<virtual key>, max_retries=0)`, so retries live in
+  exactly one layer.
 
 ### Worked scenario: how stacked retries amplify an incident
 Illustrative settings, during an outage where every upstream call fails:
@@ -497,6 +435,10 @@ deadline and failure budget on top of the router.
 - **Pin the version, keep `drop_params` off globally.** Lock the LiteLLM version and upgrade deliberately
   with an eval run; enable dropping only where a known parameter gap is accepted. Watch for cost or format
   changes after upgrades.
+- **Eval mixed-model trajectories.** When roles use different providers in one run, provider-specific
+  blocks (reasoning, cache markers) do not carry over between them, so eval the whole mixed trajectory.
+- **Declare `api_key: os.environ/NAME` in proxy YAML.** Reference provider keys from the environment in
+  each `litellm_params` entry rather than writing them into the config file.
 
 ## Trade-offs
 - **Per-step model choice vs trajectory consistency.** Routing cheap steps to a small model cuts agent

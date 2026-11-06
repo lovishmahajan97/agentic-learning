@@ -221,10 +221,9 @@ cases = defaultdict(list)
 for case, act, start, end in log:
     cases[case].append((start, end, act))
 
-touch, wait, variants = defaultdict(float), defaultdict(float), Counter()
+touch, wait = defaultdict(float), defaultdict(float)
 for steps in cases.values():
     steps.sort()
-    variants[" > ".join(a for _, _, a in steps)] += 1
     prev_end = steps[0][0]
     for start, end, act in steps:
         wait[act] += start - prev_end      # time the item sat in a queue before this step
@@ -235,7 +234,7 @@ t, w = sum(touch.values()), sum(wait.values())
 print(f"touch {t:.1f}h, wait {w:.1f}h, flow efficiency {t / (t + w):.1%}")
 for act in touch:
     print(f"{act:13} touch {touch[act]:4.1f}h   wait before {wait[act]:5.1f}h")
-print(len(variants), "variants; most common:", variants.most_common(1)[0])
+print(Counter(" > ".join(a for _, _, a in s) for s in cases.values()).most_common(1))  # happy path, 2 of 3
 ```
 
 | Result across the three tickets | Value |

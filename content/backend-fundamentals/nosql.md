@@ -369,6 +369,8 @@ Designed from two access patterns, "list a user's recent sessions" and "load the
 session", each a single-partition `Query`.
 
 - **Messages are referenced, not embedded,** because a session can grow without bound.
+- **Session items** sit under `pk = TENANT#<tenant>#USER#<user>` with `sk = SESSION#<13-digit epoch ms>#<id>`,
+  so they sort newest last.
 - **Zero-padded sequence in the sort key** makes lexical order chronological: `MSG#00000010` sorts after
   `MSG#00000009`; unpadded, `MSG#10` would sort before `MSG#9`.
 - **The caller assigns `seq`** (for example from a counter on the session item).
@@ -376,18 +378,11 @@ session", each a single-partition `Query`.
   "another writer took this sequence number", which must not be silently swallowed.
 
 ```python
-import boto3, time
+import boto3
 from boto3.dynamodb.conditions import Key
 
 table = boto3.resource("dynamodb").Table("agent-app")
 Duplicate = table.meta.client.exceptions.ConditionalCheckFailedException
-
-def create_session(tenant, user, session_id, title):
-    table.put_item(Item={
-        "pk": f"TENANT#{tenant}#USER#{user}",
-        "sk": f"SESSION#{int(time.time()*1000):013d}#{session_id}",
-        "title": title, "session_id": session_id,
-    })
 
 def append_message(session_id, seq, role, content):
     key = {"pk": f"SESSION#{session_id}", "sk": f"MSG#{seq:08d}"}
@@ -400,19 +395,13 @@ def append_message(session_id, seq, role, content):
             raise                             # with the next one, or the message is lost
         # else: our own earlier attempt landed; the retry is a no-op
 
-def recent_sessions(tenant, user, limit=10):
-    r = table.query(
-        KeyConditionExpression=Key("pk").eq(f"TENANT#{tenant}#USER#{user}")
-                               & Key("sk").begins_with("SESSION#"),
-        ScanIndexForward=False, Limit=limit)              # newest first
-    return r["Items"]
+def recent_sessions(tenant, user, limit=10):  # newest first
+    return table.query(KeyConditionExpression=Key("pk").eq(f"TENANT#{tenant}#USER#{user}")
+                       & Key("sk").begins_with("SESSION#"), ScanIndexForward=False, Limit=limit)["Items"]
 
-def last_messages(session_id, limit=20):
-    r = table.query(
-        KeyConditionExpression=Key("pk").eq(f"SESSION#{session_id}")
-                               & Key("sk").begins_with("MSG#"),
-        ScanIndexForward=False, Limit=limit,
-        ConsistentRead=True)                              # read-your-own-write after append
+def last_messages(session_id, limit=20):      # consistent: read-your-own-write after append
+    r = table.query(KeyConditionExpression=Key("pk").eq(f"SESSION#{session_id}")
+                    & Key("sk").begins_with("MSG#"), ScanIndexForward=False, Limit=limit, ConsistentRead=True)
     return list(reversed(r["Items"]))
 ```
 

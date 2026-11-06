@@ -226,60 +226,38 @@ flowchart TD
 ## Examples
 ### Fail-static data-plane handler
 A minimal data-plane handler:
-- **Starts from the snapshot persisted on local disk** and refreshes it in the background.
 - **Keeps serving the old snapshot** when the control plane is unreachable.
-- **Picks the bundle with a sticky canary bucket** and enforces tenant policy locally.
-- **Stamps the snapshot version** on telemetry.
+- **Swaps whole snapshots atomically** and only to a higher version, persisting last-known-good to disk.
+- **Stamps the snapshot version** on every response.
 
-Signature verification is left out for brevity. `call_model` and `emit_span` are the application's
-existing functions.
+Signature verification is left out for brevity. The control-plane URL is unreachable on purpose, so the
+run shows fail static.
 
 ```python
-import hashlib, json, os, threading, time, urllib.request
+import json, os, pathlib, urllib.request
 
-LOCAL = "/var/lib/gateway/last_snapshot.json"
-CONF = json.load(open(LOCAL))      # last-known-good from disk, so a cold start survives an outage
+LOCAL = "last_snapshot.json"
+CONF = {"version": 41, "bundles": {"support": "support@41"}}   # in production: json.load(open(LOCAL))
 
-def refresh(url="http://control-plane/config/current", every=30):
-    """Pull the control plane's snapshot; keep serving the old one if it is unreachable."""
+def refresh(url="http://control-plane.invalid/config/current"):
     global CONF
-    while True:
-        try:
-            with urllib.request.urlopen(url, timeout=2) as r:
-                snap = json.load(r)
-            if snap["version"] > CONF["version"]:        # monotonic: a stale node never wins
-                CONF = snap                               # whole-snapshot atomic swap
-                with open(LOCAL + ".tmp", "w") as f:      # write-then-rename: a crash mid-write
-                    json.dump(snap, f)                    # must not corrupt last-known-good
-                os.replace(LOCAL + ".tmp", LOCAL)
-        except Exception as e:
-            print(f"control plane unreachable ({e}); still serving config v{CONF['version']}")
-        time.sleep(every)
+    try:                                              # any failure: keep serving the old one (fail static)
+        snap = json.load(urllib.request.urlopen(url, timeout=2))
+        if snap["version"] > CONF["version"]:        # monotonic: a stale node never wins
+            pathlib.Path(LOCAL + ".tmp").write_text(json.dumps(snap))   # write-then-rename: a crash
+            os.replace(LOCAL + ".tmp", LOCAL)                           # cannot corrupt last-known-good
+            CONF = snap                               # whole-snapshot atomic swap
+    except Exception:
+        print(f"control plane unreachable; still serving v{CONF['version']}")
 
-threading.Thread(target=refresh, daemon=True).start()
+def handle(use_case):
+    c = CONF                                          # read the pointer once per request
+    return {"bundle": c["bundles"][use_case], "config_version": c["version"]}
 
-def bucket(key):                                           # stable across replicas, unlike hash()
-    return int(hashlib.sha256(key.encode()).hexdigest(), 16) % 100
-
-def resolve(c, use_case, tenant):
-    r = c["rollouts"].get(use_case)      # {"stable": "support@41", "candidate": "support@42", "percent": 5}
-    if r and bucket(f"{r['candidate']}:{tenant}") < r["percent"]:  # salted by candidate: each
-        return r["candidate"]               # rollout picks different tenants; percent counts tenants
-    return r["stable"] if r else c["aliases"][use_case]
-
-def handle(tenant, use_case, messages):
-    """Data-plane path: every decision is a local lookup; no control-plane call per request."""
-    c = CONF                                               # read the pointer once per request
-    bundle = resolve(c, use_case, tenant)
-    model, prompt = c["bundles"][bundle]["model"], c["bundles"][bundle]["prompt"]
-    allowed = c["policy"].get(tenant, {}).get("allowed_models")
-    if allowed is not None and model not in allowed:
-        return {"error": "model not allowed for tenant", "config_version": c["version"]}
-    resp = call_model(model, prompt, messages)
-    emit_span(tenant=tenant, bundle=bundle, model=model, config_version=c["version"], usage=resp.usage)
-    return resp
-# A canary is snapshot v+1 with percent=5; promotion sets stable=support@42, percent=0; rollback sets
-# stable=support@41. None of them redeploys this process.
+refresh()                                             # in production: every 30 s in a background thread
+print(handle("support"))
+# control plane unreachable; still serving v41
+# {'bundle': 'support@41', 'config_version': 41}
 ```
 
 ### Staleness budget per entry type
@@ -314,24 +292,20 @@ still honours revocations that arrive mid-run. Names are illustrative.
 ```python
 REVOKED_TOOLS: set[tuple[str, str]] = set()     # filled by the fast revocation channel
 
-def start_run(conf: dict, tenant: str, use_case: str) -> dict:
-    pol = conf["agent_policy"][use_case].get(tenant, conf["agent_policy"][use_case]["default"])
-    return {"config_version": conf["version"], "tenant": tenant, "tools": set(pol["tools"]),
-            "approval": set(pol["needs_approval"]), "max_steps": pol["max_steps"], "steps": 0}
+def start_run(conf: dict, tenant: str) -> dict:
+    pol = conf["agent_policy"].get(tenant, conf["agent_policy"]["default"])
+    return {"config_version": conf["version"], "tenant": tenant, **pol}
 
 def check_tool(run: dict, tool: str) -> str:
     if (run["tenant"], tool) in REVOKED_TOOLS:
         return "deny: revoked"                   # revocations apply mid-run
     if tool not in run["tools"]:
         return "deny: not allowed"
-    if tool in run["approval"]:
-        return "pause: human approval"
-    return "allow"
+    return "pause: human approval" if tool in run["needs_approval"] else "allow"
 
-conf = {"version": 418, "agent_policy": {"support": {
-    "default": {"tools": ["search", "get_order"], "needs_approval": [], "max_steps": 10},
-    "acme": {"tools": ["search", "get_order", "refund"], "needs_approval": ["refund"], "max_steps": 15}}}}
-run = start_run(conf, "acme", "support")
+conf = {"version": 418, "agent_policy": {"default": {"tools": ["search"], "needs_approval": []},
+    "acme": {"tools": ["search", "refund"], "needs_approval": ["refund"]}}}
+run = start_run(conf, "acme")
 print([check_tool(run, t) for t in ("search", "refund", "delete_account")])
 REVOKED_TOOLS.add(("acme", "refund"))
 print(check_tool(run, "refund"), "| run pinned to config", run["config_version"])
@@ -377,6 +351,11 @@ Illustrative midday outage of the control-plane database on a well-built platfor
 - **Agent policy in the snapshot.** Publish tool allow-lists, step budgets and approval rules per tenant as
   part of the config snapshot, pin it at run start and enforce it in the runtime before each tool call.
   Monitor denied tool calls per tenant and runs stopped at the step cap.
+- **Sticky, salted canary buckets.** Bucket by `sha256(f"{candidate}:{tenant}") % 100`, never Python's
+  `hash()`, so every replica agrees and each rollout picks different tenants. A canary is snapshot v+1 with
+  `percent=5`; promotion and rollback are new snapshots, never a redeploy.
+- **Enforce the tenant's model allow-list in the handler** before calling the model, and return the config
+  version with the refusal.
 
 ## Trade-offs
 - **Snapshots vs propagation delay.** No per-request dependency on the control plane, but changes land

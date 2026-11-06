@@ -269,126 +269,47 @@ step lands inside the cache TTL.
 - **Lesson:** an append-only transcript with a moving cache point cuts this run's input cost about 3.7×;
   any edit to earlier turns throws that away from the edit onward.
 
-### Tool-result cache for read-only agent tools
-Read-only tools declare a TTL; write tools are never cached. The key carries tool name, tool version,
-tenant and canonical arguments; failures are not stored.
-
-```python
-import functools, hashlib, json, redis
-r = redis.Redis()
-
-def cached_tool(name, version, ttl_s, read_only=True):
-    def wrap(fn):
-        if not read_only:
-            return fn                                   # writes are never cached: use idempotency keys
-        @functools.wraps(fn)
-        def inner(tenant, **args):
-            raw = json.dumps({"t": name, "v": version, "tenant": tenant, "a": args},
-                             sort_keys=True, separators=(",", ":"))
-            k = "tool:" + hashlib.sha256(raw.encode()).hexdigest()
-            if (hit := r.get(k)) is not None:
-                return json.loads(hit) | {"_cache": "hit"}
-            out = fn(tenant, **args)
-            if out.get("ok"):                           # never cache a failed tool call
-                r.set(k, json.dumps(out), ex=ttl_s)
-            return out
-        return inner
-    return wrap
-
-@cached_tool("get_exchange_rate", version="v2", ttl_s=30)        # volatile data: seconds
-def get_exchange_rate(tenant, base, quote): ...
-
-@cached_tool("search_catalogue", version="v5", ttl_s=4 * 3600)   # catalogue: hours
-def search_catalogue(tenant, query, limit=10): ...
-```
-
 ### Exact-match cache in Redis
-Versioned, tenant-scoped keys, single-flight on misses, a rule against caching partial or refused answers,
-and a reverse index so the ingestion pipeline can purge every cached answer that used a changed document.
+Versioned, tenant-scoped keys, a rule against caching partial or refused answers, and a reverse index so
+the ingestion pipeline can purge every cached answer that used a changed document. `call_model` is a
+stand-in; point `redis.Redis()` at a local Redis (or `fakeredis`) to run it.
 
 ```python
-import hashlib, json, time, redis
+import hashlib, json, redis
 r = redis.Redis()
 VERSIONS = {"prompt": "support-v14", "index": "kb-2026-10-19", "embed": "text-embed-v2"}
+call_model = lambda *a, **p: {"finish_reason": "stop", "source_doc_ids": ["kb-12"]}  # model stand-in
 
-def exact_key(tenant, model, params, messages):
-    body = json.dumps({"v": VERSIONS, "t": tenant, "m": model, "p": params, "msgs": messages},
-                      sort_keys=True, separators=(",", ":"))      # canonical form: same input, same hash
+def exact_key(tenant, model, params, messages):              # canonical JSON: same input, same hash
+    body = json.dumps({"v": VERSIONS, "t": tenant, "m": model, "p": params, "msgs": messages}, sort_keys=True)
     return "resp:" + hashlib.sha256(body.encode()).hexdigest()
 
-def cached_complete(tenant, model, messages, params={"temperature": 0}, ttl=6 * 3600, tries=10):
-    k = exact_key(tenant, model, messages=messages, params=params)
+def cached_complete(tenant, model, messages, params={"temperature": 0}, ttl=6 * 3600):
+    k = exact_key(tenant, model, params, messages)
     if (hit := r.get(k)):
         return json.loads(hit) | {"cache": "exact"}
-    if not r.set(k + ":lock", "1", nx=True, ex=30):              # single-flight: one caller fills the key
-        if tries == 0:
-            return call_model(model, messages, **params) | {"cache": "bypass"}
-        time.sleep(0.2)
-        return cached_complete(tenant, model, messages, params, ttl, tries - 1)
-    try:
-        out = call_model(model, messages, **params)
-        if out["finish_reason"] == "stop" and not out.get("refusal"):   # never cache partial or refused
-            r.set(k, json.dumps(out), ex=ttl)
-            for doc_id in out.get("source_doc_ids", []):             # reverse index for event-driven purge
-                r.sadd(f"deps:{tenant}:{doc_id}", k)
-                r.expire(f"deps:{tenant}:{doc_id}", ttl)
-        return out | {"cache": "miss"}
-    finally:
-        r.delete(k + ":lock")
+    out = call_model(model, messages, **params)
+    if out["finish_reason"] == "stop" and not out.get("refusal"):   # never cache partial or refused
+        r.set(k, json.dumps(out), ex=ttl)
+        for doc_id in out.get("source_doc_ids", []):               # reverse index for event-driven purge
+            r.sadd(f"deps:{tenant}:{doc_id}", k)
+    return out | {"cache": "miss"}
 
-def on_document_updated(tenant, doc_id):                         # called by the ingestion pipeline
-    keys = r.smembers(f"deps:{tenant}:{doc_id}")
-    if keys:
-        r.delete(*keys)
-    r.delete(f"deps:{tenant}:{doc_id}")
+def on_document_updated(tenant, doc_id):                           # called by the ingestion pipeline
+    r.delete(*r.smembers(f"deps:{tenant}:{doc_id}"), f"deps:{tenant}:{doc_id}")
+
+msgs = [{"role": "user", "content": "How long do refunds take?"}]
+print(cached_complete("acme", "m1", msgs)["cache"])  # miss
+print(cached_complete("acme", "m1", msgs)["cache"])  # exact
+on_document_updated("acme", "kb-12")
+print(cached_complete("acme", "m1", msgs)["cache"])  # miss: the purge removed the stale answer
 ```
 
 - **Bumping `VERSIONS["prompt"]` at deploy time** cold-starts the cache without any purge code.
 - **The reverse index handles what versioning cannot:** a single document changing under an unchanged
   prompt.
-- **Simplification 1, the lock:** it is released unconditionally, so a model call that outlives the lock's
-  30 s expiry deletes a lock another caller now holds. Store a random token and delete only if it still
-  matches (a small Lua compare-and-delete).
-- **Simplification 2, the purge race:** described above; it needs the document versions stored with each
-  answer and checked on read. Both fixes follow.
-
-### Hardening: token lock and version-checked reads
-The two fixes, as drop-in helpers. Capture document versions at *retrieval* time, before generating, so an
-answer built from an old document carries the old version.
-
-```python
-import json, uuid, redis
-r = redis.Redis()
-
-RELEASE = r.register_script("""
-if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end
-return 0
-""")                                                          # compare-and-delete, atomic in Redis
-
-def acquire(k, ttl=30):
-    token = uuid.uuid4().hex                                  # unique per caller
-    return token if r.set(k + ":lock", token, nx=True, ex=ttl) else None
-
-def release(k, token):
-    RELEASE(keys=[k + ":lock"], args=[token])                 # deletes the lock only if it is still ours
-
-def read_versions(tenant, doc_ids):                           # call at RETRIEVAL time, before generating
-    vals = r.mget([f"docver:{tenant}:{d}" for d in doc_ids])  # ingestion writes a content hash per doc
-    return {d: (v.decode() if v else None) for d, v in zip(doc_ids, vals)}
-
-def store(k, out, versions, ttl):
-    r.set(k, json.dumps(out | {"doc_versions": versions}), ex=ttl)
-
-def get_if_current(tenant, k):
-    hit = r.get(k)
-    if not hit:
-        return None
-    entry = json.loads(hit)
-    used = entry.get("doc_versions", {})
-    if used and read_versions(tenant, list(used)) != used:    # a source changed since generation: a miss
-        return None
-    return entry
-```
+- **Left out for brevity:** single-flight locking on misses and version-checked reads; see Production
+  patterns.
 
 ### Worked economics: is the semantic cache paying?
 Illustrative numbers plugged into the savings formula; similarity thresholds are examples, not
@@ -437,6 +358,15 @@ for threshold, hit, false_hit in ((0.97, 0.30, 0.003), (0.92, 0.45, 0.012)):
 - **Sampled false-hit audit.** Send a small share of semantic hits (say 1%) to a judge or reviewer that
   asks whether the cached answer addresses the new query. Monitor false-hit rate per threshold and per
   feature, and tighten the threshold when it rises.
+- **Token lock for single-flight misses.** Take the fill lock with `SET key:lock <random token> NX EX 30`
+  and release it with a Lua compare-and-delete, so a model call that outlives the 30 s expiry cannot delete
+  another caller's lock; after about ten short waits, bypass the cache and call the model.
+- **Version-checked reads.** Capture each source document's content hash at retrieval time, before
+  generating, store it with the answer, and treat a hit whose versions no longer match as a miss. Give
+  reverse-index sets the same TTL as the answers they point to.
+- **Tool-result cache keys and failures.** Key read-only tool results on tool name, tool version, tenant
+  and canonical arguments; never store a failed tool call, and never cache write tools (use idempotency
+  keys instead).
 
 ## Trade-offs
 - **Hit rate vs false hits.** Looser keys and lower similarity thresholds raise both together; the right

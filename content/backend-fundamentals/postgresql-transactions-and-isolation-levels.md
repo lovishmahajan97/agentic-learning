@@ -413,10 +413,8 @@ flowchart TD
   statements, such as checking a budget and then inserting the run that consumes it.
 
 ```python
-import time, psycopg
+import time, psycopg   # psycopg 3.x
 from psycopg.errors import SerializationFailure
-
-DSN = "postgresql://app@localhost/app"
 
 def reserve_atomic(conn, tenant_id, cost):
     row = conn.execute(
@@ -430,13 +428,11 @@ def reserve_serializable(conn, tenant_id, cost, run_id, attempts=5):
         try:
             with conn.transaction():          # call on an idle connection: SET must come first
                 conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-                used, budget = conn.execute(
-                    "SELECT tokens_used, budget FROM tenants WHERE id = %s",
-                    (tenant_id,)).fetchone()
+                used, budget = conn.execute("SELECT tokens_used, budget FROM tenants WHERE id = %s",
+                                            (tenant_id,)).fetchone()
                 if used + cost > budget:
                     return False
-                conn.execute("UPDATE tenants SET tokens_used = %s WHERE id = %s",
-                             (used + cost, tenant_id))
+                conn.execute("UPDATE tenants SET tokens_used = %s WHERE id = %s", (used + cost, tenant_id))
                 conn.execute("INSERT INTO runs (id, tenant_id, cost) VALUES (%s, %s, %s)",
                              (run_id, tenant_id, cost))   # unique id makes retries idempotent
                 return True
@@ -444,10 +440,7 @@ def reserve_serializable(conn, tenant_id, cost, run_id, attempts=5):
             time.sleep(0.01 * 2 ** attempt)
     raise RuntimeError("could not reserve budget after retries")
 
-with psycopg.connect(DSN) as conn:
-    ok = reserve_atomic(conn, tenant_id=42, cost=800)
-    conn.commit()
-    print("reserved" if ok else "over budget")
+# usage: with psycopg.connect(DSN) as conn: reserve_atomic(conn, 42, 800); conn.commit()
 ```
 
 Run two copies of either function concurrently against a tenant at 999,000 of 1,000,000 with a cost of

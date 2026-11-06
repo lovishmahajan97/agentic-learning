@@ -207,42 +207,38 @@ import time, uuid
 TRUSTED = {"user", "verified_tool", "operator"}        # write gating: never "retrieved_text"
 
 def upsert_memory(user_id, text, source, kind="semantic"):
-    if source not in TRUSTED:
-        return "rejected_untrusted_source"
-    if tombstones.blocks(user_id, text):               # erased user, or keyed hash of a forgotten fact
-        return "rejected_tombstoned"
+    if source not in TRUSTED or tombstones.blocks(user_id, text):   # tombstones checked on every write
+        return "rejected"
     neighbors = store.search(user_id=user_id, query=text, k=3, active_only=True)   # scoped first
     listing = "\n".join(f"{i}: {n['text']}" for i, n in enumerate(neighbors)) or "none"
-    decision = llm_json(f"New statement: {text}\nExisting memories:\n{listing}\n"
-        'Return {"action": "add|update|ignore|delete", "target": <index of existing memory or null>}')
-    now, mid = time.time(), str(uuid.uuid4())
-    t = decision.get("target")
-    if decision["action"] in ("update", "delete") and not (isinstance(t, int) and 0 <= t < len(neighbors)):
-        decision["action"] = "add"                     # model named no valid target: fail safe
-    if decision["action"] == "ignore":
+    d = llm_json(f"New statement: {text}\nExisting memories:\n{listing}\n"
+                 'Return {"action": "add|update|ignore|delete", "target": <index or null>}')
+    if d["action"] == "ignore":
         return "ignored_duplicate"
-    if decision["action"] in ("update", "delete"):
-        old = neighbors[t]
-        store.update(old["id"], active=False, superseded_by=mid if decision["action"] == "update" else None,
-                     ended_at=now)                      # keep history; retrieval filters active_only
-        if decision["action"] == "delete":
-            audit("memory_retracted", user_id, old["id"]); return "deleted"
-    importance = llm_json(f"Rate 1-10 how important to remember: {text}. Return {{\"score\": n}}")["score"]
+    t, mid, now = d.get("target"), str(uuid.uuid4()), time.time()
+    old = neighbors[t]["id"] if d["action"] in ("update", "delete") and t in range(len(neighbors)) else None
+    if old:                                              # no valid target: fail safe to a plain add
+        store.update(old, active=False, ended_at=now,    # supersede, keep history
+                     superseded_by=mid if d["action"] == "update" else None)
+        if d["action"] == "delete":
+            return "deleted"
+    score = llm_json(f"Rate 1-10 how important to remember: {text}. Return {{\"score\": n}}")["score"]
     store.insert({"id": mid, "user_id": user_id, "text": text, "kind": kind, "source": source,
-                  "importance": importance, "created_at": now, "last_accessed": now, "active": True})
-    audit("memory_written", user_id, mid)
-    return decision["action"]
+                  "importance": score, "created_at": now, "last_accessed": now, "active": True})
+    return "updated" if old else "added"
+```
 
+Erasure, in the same module:
+
+```python
 def erase_user(user_id):
     ids = store.ids(user_id=user_id, include_inactive=True)
-    store.delete_many(ids)                               # raw records
-    vector_index.delete(ids)                             # derived index, same ids
+    store.delete_many(ids); vector_index.delete(ids)     # raw records and the derived index, same ids
     summary_store.delete(user_id=user_id)                # compaction summaries that embed facts
     tombstones.add(user_id, ids, at=time.time())         # block re-extraction from old transcripts
     left = store.count(user_id=user_id, include_inactive=True) + vector_index.count(user_id=user_id)
     if left:                                             # verify by count, not by similarity search
         raise RuntimeError(f"erasure incomplete for {user_id}: {left} records remain")
-    audit("user_erased", user_id, len(ids))
 ```
 
 The decisions that matter:
@@ -255,48 +251,33 @@ The decisions that matter:
   filter or a score threshold can return nothing while rows still exist.
 
 ### Scheduled retention pass: TTL by kind and a per-user cap
-Pure Python; runs as is. Lifetimes, cap and history window are illustrative; set them from your
-retention policy.
+Pure Python; runs as is. Lifetimes and cap are illustrative; set them from your retention policy.
 
 ```python
 DAY = 86400
 TTL = {"episodic": 30 * DAY, "semantic": 365 * DAY, "procedural": None}   # illustrative lifetimes
 CAP_PER_USER = 3                                                            # tiny for the demo
-HISTORY_DAYS = 90                    # how long superseded rows stay for audit (set by your policy)
 
 def retention_pass(rows, now):
     """Expire by kind, then cap per user by evicting the lowest importance, oldest first."""
-    keep, evicted = [], []
-    for r in rows:
-        ttl = TTL[r["kind"]]
-        expired = ttl is not None and now - r["last_accessed"] > ttl
-        stale_history = not r["active"] and now - r["ended_at"] > HISTORY_DAYS * DAY
-        (evicted if expired or stale_history else keep).append(r)
-    by_user = {}
-    for r in keep:
-        by_user.setdefault(r["user_id"], []).append(r)
-    final = []
-    for user, items in by_user.items():
-        items.sort(key=lambda r: (r["importance"], r["last_accessed"]), reverse=True)
-        final += items[:CAP_PER_USER]
-        evicted += items[CAP_PER_USER:]
-    return final, evicted
+    live = [r for r in rows if TTL[r["kind"]] is None or now - r["last_accessed"] <= TTL[r["kind"]]]
+    live.sort(key=lambda r: (r["importance"], r["last_accessed"]), reverse=True)
+    keep, count = [], {}
+    for r in live:
+        count[r["user_id"]] = count.get(r["user_id"], 0) + 1
+        if count[r["user_id"]] <= CAP_PER_USER:
+            keep.append(r)
+    return keep, [r for r in rows if r not in keep]
 
 now = 1_000 * DAY
-rows = [
-    {"id": "e1", "user_id": "u1", "kind": "episodic", "importance": 3, "last_accessed": now - 45 * DAY, "active": True},
-    {"id": "s1", "user_id": "u1", "kind": "semantic", "importance": 8, "last_accessed": now - 200 * DAY, "active": True},
-    {"id": "s2", "user_id": "u1", "kind": "semantic", "importance": 6, "last_accessed": now - 120 * DAY,
-     "active": False, "ended_at": now - 100 * DAY},
-    {"id": "s3", "user_id": "u1", "kind": "semantic", "importance": 2, "last_accessed": now - 5 * DAY, "active": True},
-    {"id": "s4", "user_id": "u1", "kind": "semantic", "importance": 5, "last_accessed": now - 1 * DAY, "active": True},
-    {"id": "p1", "user_id": "u1", "kind": "procedural", "importance": 9, "last_accessed": now - 900 * DAY, "active": True},
-]
+rows = [{"id": i, "user_id": "u1", "kind": k, "importance": imp, "last_accessed": now - age * DAY}
+        for i, k, imp, age in [("e1", "episodic", 3, 45), ("s1", "semantic", 8, 200),
+                               ("s3", "semantic", 2, 5), ("s4", "semantic", 5, 1),
+                               ("p1", "procedural", 9, 900)]]
 final, evicted = retention_pass(rows, now)
 print("keep:", [r["id"] for r in final])      # ['p1', 's1', 's4']
-print("evict:", [r["id"] for r in evicted])   # ['e1', 's2', 's3']
+print("evict:", [r["id"] for r in evicted])   # ['e1', 's3']
 ```
-
 Evicted ids must then go through the same multi-store delete as erasure (raw store, index, summaries),
 or the index drifts from the source of truth.
 
@@ -326,6 +307,9 @@ or the index drifts from the source of truth.
   failures and time to complete against your SLA.
 - **Audit every mutation.** Log memory writes, supersessions, retractions and erasures with user, source
   and id, never the erased text. Monitor audit coverage: every memory row should trace to a write event.
+- **Purge superseded rows after a history window.** Keep inactive rows only as long as audit needs (for
+  example 90 days after `ended_at`), then evict them in the retention pass. Monitor inactive rows older
+  than the window; it should be zero.
 
 ## Trade-offs
 - **Fresh results vs tuning knobs.** Blending recency and importance keeps results fresh and relevant, but

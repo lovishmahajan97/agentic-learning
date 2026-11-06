@@ -409,94 +409,63 @@ stateDiagram-v2
 ```
 
 ## Examples
-### Embedding pipeline with dedup, limiter and checkpoints
-The API enqueues one job per document with a deterministic id (a double-submit is harmless), a worker
-with bounded concurrency and a provider rate limit processes it, and the processor is idempotent
-because the vector write keys on document id and chunk index.
-
-Each BullMQ object gets its own ioredis connection from a factory here; BullMQ also duplicates a
-Worker's connection internally for its blocking commands, and refuses a Worker connection whose
-`maxRetriesPerRequest` is not `null`.
-
-Install both packages with `npm i bullmq ioredis`: since BullMQ 6, ioredis is an optional peer
-dependency, not a bundled one (checked against bullmq 6.7.0 and ioredis 6.0.0, 2026-11).
+### Embedding pipeline with dedup, limiter and idempotent writes
+The API enqueues one job per document with a deterministic id (a double-submit is harmless); a worker
+with bounded concurrency and a provider rate limit processes it, and the write keys on document id and
+chunk index, so a retry resumes instead of redoing work.
 
 ```ts
+// npm i bullmq ioredis   (ioredis is an optional peer since BullMQ 6; checked bullmq 6.7.0, ioredis 6.0.0)
 import IORedis from "ioredis";
-import { Queue, Worker, QueueEvents } from "bullmq";
+import { Queue, Worker } from "bullmq";
 const conn = () => new IORedis(process.env.REDIS_URL!, { maxRetriesPerRequest: null });  // required for Workers
 
 export const embedQueue = new Queue("embed", { connection: conn(),
-  defaultJobOptions: { attempts: 5, backoff: { type: "exponential", delay: 2_000 },
-                       removeOnComplete: { count: 1_000 }, removeOnFail: { age: 7 * 24 * 3600 } } });
+  defaultJobOptions: { attempts: 5, backoff: { type: "exponential", delay: 2_000 } } });
 
-export async function enqueueEmbedding(docId: string, tenant: string) {
-  await embedQueue.add("embed-doc", { docId, tenant }, { jobId: `embed-${docId}` });   // dedup by id (no ':' allowed)
-}
+export const enqueueEmbedding = (docId: string) =>
+  embedQueue.add("embed-doc", { docId }, { jobId: `embed-${docId}` });   // dedup by id (no ':' allowed)
 
-// worker.ts — its own process; several replicas share the queue
-const worker = new Worker("embed", async (job) => {
-  const { docId } = job.data as { docId: string; tenant: string };
-  const chunks = await loadChunks(docId);
+new Worker("embed", async (job) => {
+  const chunks = await loadChunks(job.data.docId);
   for (let i = 0; i < chunks.length; i++) {
-    if (await embeddingExists(docId, i)) continue;                   // resume, do not redo, after a retry
+    if (await embeddingExists(job.data.docId, i)) continue;          // resume after a retry
     try {
-      const vec = await embed(chunks[i].text);                       // provider call
-      await upsertEmbedding(docId, i, vec);                           // idempotent: (docId, i) is unique
+      await upsertEmbedding(job.data.docId, i, await embed(chunks[i].text));  // (docId, i) is unique
     } catch (e: any) {
       if (e.status === 429) { await embedQueue.rateLimit(30_000); throw Worker.RateLimitError(); }
       throw e;                                                       // anything else: retry with backoff
     }
-    await job.updateProgress(Math.round(((i + 1) / chunks.length) * 100));
   }
   return { chunks: chunks.length };
 }, { connection: conn(), concurrency: 4, limiter: { max: 50, duration: 60_000 } });
-
-worker.on("failed", (job, err) => console.error("embed failed", job?.id, job?.attemptsMade, err.message));
-
-// api.ts — stream progress to a client without being the worker
-const events = new QueueEvents("embed", { connection: conn() });
-events.on("progress", ({ jobId, data }) => notifyClient(jobId, data));
 ```
 
 ### Agent scenario: one job per agent step
-Each job runs exactly one model turn plus its tool calls, checkpoints the step in Postgres, and enqueues
-the next step with a deterministic id. A crash or retry repeats one step, never the whole run.
+Each job runs one model turn plus its tool calls, checkpoints the step in Postgres, and enqueues the next
+step with a deterministic id. A crash or retry repeats one step, never the whole run.
 
 ```ts
-import { Queue, Worker } from "bullmq";
-// conn() is the ioredis factory from the previous example; loadRun, saveStep, callModel, runTools are app code
-
+// conn() is the factory above; loadRun, saveStep, callModel, runTools are app code
 const steps = new Queue("agent-steps", { connection: conn(),
-  defaultJobOptions: { attempts: 4, backoff: { type: "exponential", delay: 2_000 }, removeOnComplete: { count: 5_000 } } });
-
-export const startRun = (runId: string) =>
-  steps.add("step", { runId, step: 0 }, { jobId: `run-${runId}-step-0` });
+  defaultJobOptions: { attempts: 4, backoff: { type: "exponential", delay: 2_000 } } });
+const next = (runId: string, step: number) =>
+  steps.add("step", { runId, step }, { jobId: `run-${runId}-step-${step}` });   // no-op if it exists
 
 new Worker("agent-steps", async (job) => {
   const { runId, step } = job.data as { runId: string; step: number };
-  const run = await loadRun(runId);                          // transcript and status from Postgres
-  if (run.lastStep >= step) {                                // already committed: a redelivery
-    if (run.lastStep === step && !run.done)                  // crashed before enqueuing the next step?
-      await steps.add("step", { runId, step: step + 1 }, { jobId: `run-${runId}-step-${step + 1}` });  // no-op if it exists
+  const run = await loadRun(runId);
+  if (run.lastStep >= step) {                                // redelivery: step already committed
+    if (run.lastStep === step && !run.done) await next(runId, step + 1);   // crashed before enqueuing?
     return { skipped: true };
   }
-  if (step >= 20) { await saveStep(runId, step, { status: "budget-exhausted" }); return { done: true }; }
   const turn = await callModel(run.messages);                // model call outside any transaction
-  const results = turn.toolCalls.length ? await runTools(turn.toolCalls, `run-${runId}-step-${step}`) : [];
+  const results = await runTools(turn.toolCalls, `run-${runId}-step-${step}`);  // idempotency key
   await saveStep(runId, step, { turn, results });            // one transaction, unique (runId, step)
-  if (turn.toolCalls.length === 0) return { done: true };    // final answer
-  await steps.add("step", { runId, step: step + 1 }, { jobId: `run-${runId}-step-${step + 1}` });
-  return { next: step + 1 };
-}, { connection: conn(), concurrency: 8, limiter: { max: 50, duration: 60_000 } });
+  if (turn.toolCalls.length === 0 || step >= 20) return { done: true };
+  await next(runId, step + 1);
+}, { connection: conn(), concurrency: 8 });
 ```
-
-- **Tool idempotency keys.** The job id string passed to `runTools` lets side-effecting tools dedupe a
-  repeated step on their side.
-- **Crash between `saveStep` and the next `add`.** The redelivered job finds its step committed and
-  re-adds the next step under the same deterministic id, a no-op if it already exists. If the job is
-  never redelivered (it exhausted `maxStalledCount` and failed), the run still stalls; the outbox pattern
-  (write the next-step request in the same transaction as the step) closes that gap.
 
 ### Worked scenario: what the settings above mean in time
 Using the queue defaults above (`attempts: 5`, exponential backoff with a 2-second base delay) and the
@@ -508,27 +477,6 @@ worker limiter of 50 jobs per 60 seconds.
 | Time to start 10,000 document jobs | 10,000 ÷ 50 per minute | ~200 minutes, however many workers you add |
 | Jobs in flight per replica | `concurrency: 4` | 4 documents at once; 3 replicas give 12 |
 | A 429 at chunk 300 of a 500-chunk document | `rateLimit(30_000)` then retry | queue pauses 30 s, job resumes at chunk 300 thanks to `embeddingExists` |
-
-### Production snippet: nightly evals and clean shutdown
-A scheduler registered by every producer replica still yields one run per night, and the worker drains
-in-flight jobs on `SIGTERM` instead of leaving them to the stall checker.
-
-```ts
-import { Queue, Worker } from "bullmq";
-// conn() is the ioredis factory from the previous example
-
-const evalQueue = new Queue("evals", { connection: conn() });
-await evalQueue.upsertJobScheduler("nightly-regression",
-  { pattern: "0 2 * * *", tz: "UTC" },                               // 02:00 every day; set tz explicitly
-  { name: "run-suite", data: { suite: "regression" }, opts: { attempts: 2 } });
-
-const evalWorker = new Worker("evals", runSuite, { connection: conn(), concurrency: 1 });
-
-process.on("SIGTERM", async () => {
-  await evalWorker.close();                                         // stop claiming, wait for active jobs
-  process.exit(0);
-});
-```
 
 ## Production patterns
 - **One job per agent step, state in Postgres.** When agent runs take many steps, make each step a job
@@ -552,6 +500,18 @@ process.on("SIGTERM", async () => {
 - **Run a dead-letter review loop.** Keep failures with `removeOnFail: { age: ... }`, inspect them in a
   dashboard such as Bull Board, and re-run fixed ones with `job.retry()`. Monitor failed counts grouped
   by error message and attempt.
+- **Bound what Redis keeps.** Set `removeOnComplete: { count: 1_000 }` and `removeOnFail: { age: 7 * 24 * 3600 }`
+  in `defaultJobOptions`, and log `failed` events with job id and `attemptsMade`.
+- **One ioredis connection per BullMQ object.** Use a factory; BullMQ duplicates a Worker's connection for
+  blocking commands and refuses one whose `maxRetriesPerRequest` is not `null`.
+- **Progress without polling the worker.** Call `job.updateProgress(pct)` in the processor and subscribe
+  with `new QueueEvents(name).on("progress", ...)` in the API process.
+- **Cap agent steps in the job.** Stop a run at a step budget (for example 20) and record it as
+  `budget-exhausted`. A job that exhausts `maxStalledCount` is never redelivered, so the run stalls unless
+  the next-step request is written through the outbox.
+- **Schedule recurring jobs idempotently.** `queue.upsertJobScheduler("nightly-regression", { pattern:
+  "0 2 * * *", tz: "UTC" }, ...)` from every producer replica still yields one run per night; set `tz`
+  explicitly.
 
 ## Trade-offs
 - **Speed and sharing vs durability.** Redis makes claim, renew and move microsecond-fast and lets any

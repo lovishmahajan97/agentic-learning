@@ -269,7 +269,7 @@ A scripted model replays a tool call and an answer; replace it with a real chat 
 
 ```python
 # pip install langgraph langchain-core ; offline: a scripted model stands in for a real one
-from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.graph import StateGraph, MessagesState, START
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.tools import tool
 from langchain_core.messages import AIMessage
@@ -280,14 +280,10 @@ def get_weather(city: str) -> str:
     """Current weather for a city."""
     return f"{city}: 18C, light rain"
 
-class ScriptedModel(GenericFakeChatModel):
-    def bind_tools(self, tools, **kwargs):
-        return self
-
-llm = ScriptedModel(messages=iter([
+llm = GenericFakeChatModel(messages=iter([      # real: init_chat_model("openai:gpt-4o-mini").bind_tools([get_weather])
     AIMessage("", tool_calls=[{"name": "get_weather", "args": {"city": "Oslo"}, "id": "t1"}]),
     AIMessage("Oslo is 18C with light rain; take an umbrella."),
-])).bind_tools([get_weather])           # real: init_chat_model("openai:gpt-4o-mini").bind_tools([...])
+]))
 
 def call_model(state: MessagesState) -> dict:
     return {"messages": [llm.invoke(state["messages"])]}   # add_messages reducer appends
@@ -300,67 +296,49 @@ builder.add_conditional_edges("agent", tools_condition)  # -> "tools" if tool ca
 builder.add_edge("tools", "agent")                       # the loop
 graph = builder.compile()
 
-out = graph.invoke({"messages": [("user", "Do I need an umbrella in Oslo?")]},
-                   {"recursion_limit": 10})              # hard cap on supersteps
+out = graph.invoke({"messages": [("user", "Umbrella in Oslo?")]}, {"recursion_limit": 10})  # cap on supersteps
 print([m.type for m in out["messages"]])                 # ['human', 'ai', 'tool', 'ai']
-print(out["messages"][-1].content)
 ```
 
 ### Conditional routing plus parallel fan-out
-A triage agent classifies a ticket, routes it, and for bugs searches three sources in parallel with
-`Send`; the `operator.add` reducer collects the findings.
+A router sends billing tickets to one node and fans every other ticket out to three parallel searches
+with `Send`; the `operator.add` reducer collects the findings.
 
 ```python
 import operator
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
 class Triage(TypedDict):
     ticket: str
-    category: str
     findings: Annotated[list[str], operator.add]   # reducer: parallel writes are concatenated
     reply: str
 
-def classify(state: Triage) -> dict:                # a model call with structured output in practice
-    t = state["ticket"].lower()
-    return {"category": "billing" if "charge" in t else "bug" if "error" in t else "other"}
-
-def route(state: Triage) -> Literal["billing", "investigate", "escalate"]:
-    return {"billing": "billing", "bug": "investigate"}.get(state["category"], "escalate")
-
-def fan_out(state: Triage):                         # map step: one task per source, run in parallel
-    return [Send("search", {"source": s, "ticket": state["ticket"]}) for s in ("logs", "docs", "issues")]
-
-def search(task: dict) -> dict:
-    return {"findings": [f"{task['source']}: match for '{task['ticket'][:12]}'"]}
-
-def billing(state: Triage) -> dict:
-    return {"reply": "Refund queued."}
+def route(state: Triage):                          # plain Python router on state
+    if "charge" in state["ticket"].lower():
+        return "billing"
+    return [Send("search", {"source": s}) for s in ("logs", "docs", "issues")]  # parallel fan-out
 
 def summarize(state: Triage) -> dict:
     return {"reply": f"{len(state['findings'])} findings: " + "; ".join(sorted(state["findings"]))}
 
 g = StateGraph(Triage)
-for name, fn in [("classify", classify), ("billing", billing), ("search", search), ("summarize", summarize)]:
-    g.add_node(name, fn)
-g.add_node("investigate", lambda s: {})            # no-op hub that fans out
-g.add_node("escalate", lambda s: {"reply": "Sent to a human."})
-g.add_edge(START, "classify")
-g.add_conditional_edges("classify", route)          # Literal return type documents the targets
-g.add_conditional_edges("investigate", fan_out, ["search"])
-g.add_edge("search", "summarize")                   # fan-in: waits for all three branches
-for end in ("billing", "summarize", "escalate"):
-    g.add_edge(end, END)
+g.add_node("billing", lambda s: {"reply": "Refund queued."})
+g.add_node("search", lambda task: {"findings": [f"{task['source']}: match"]})
+g.add_node("summarize", summarize)
+g.add_conditional_edges(START, route, ["billing", "search"])
+g.add_edge("search", "summarize")                  # fan-in: waits for all three branches
+g.add_edge("billing", END)
 app = g.compile()
-print(app.invoke({"ticket": "Error 500 on checkout", "findings": []})["reply"])   # 3 findings: ...
-print(app.invoke({"ticket": "Double charge on my card", "findings": []})["reply"])  # Refund queued.
+print(app.invoke({"ticket": "Error 500 on checkout"})["reply"])     # 3 findings: docs: match; ...
+print(app.invoke({"ticket": "Double charge on my card"})["reply"])  # Refund queued.
 ```
 
 - **Without the reducer** on `findings`, three parallel writes to one key in the same superstep raise an
   `InvalidUpdateError` instead of merging.
-- **The router is plain Python** here; in production `classify` is a model call returning a Pydantic
-  category, and the router stays deterministic.
+- **The router is plain Python** here; in production a model node first writes a typed category into
+  state, and the router stays deterministic.
 
 ## Production patterns
 - **Keep routers deterministic.** Let a model node write a typed decision into state (via structured

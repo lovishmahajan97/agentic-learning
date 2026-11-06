@@ -295,15 +295,13 @@ flowchart TD
 ```
 
 ## Examples
-### Tracing plus an offline experiment, without LangChain
-A traced retriever and chain, a wrapped OpenAI client so the model call is an `llm` run with tokens, a
-`session_id` so traces form a thread, then an experiment with a code evaluator against a one-example golden
-dataset. Evaluator signatures and the `{"output": ...}` wrapping follow the current SDK; older releases used
-`(run, example)` evaluators.
+### Tracing a RAG answer without LangChain
+A traced retriever and chain, a wrapped OpenAI client so the model call is an `llm` run with tokens, and a
+`session_id` so traces form a thread.
 
 ```python
 # pip install langsmith openai ; env: LANGSMITH_TRACING=true LANGSMITH_API_KEY=... LANGSMITH_PROJECT=support-bot
-from langsmith import Client, traceable, evaluate
+from langsmith import traceable
 from langsmith.wrappers import wrap_openai
 from openai import OpenAI
 
@@ -315,86 +313,56 @@ def retrieve(question: str) -> list[str]:
 
 @traceable(run_type="chain", name="support_answer")
 def answer(question: str) -> str:
-    docs = retrieve(question)
-    resp = llm.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "Answer only from this context:\n" + "\n".join(docs)},
-                  {"role": "user", "content": question}])
+    context = "\n".join(retrieve(question))
+    resp = llm.chat.completions.create(model="gpt-4o-mini", messages=[
+        {"role": "system", "content": "Answer only from this context:\n" + context},
+        {"role": "user", "content": question}])
     return resp.choices[0].message.content
 
-# Production call: metadata.session_id groups this trace with others into a Thread in the UI
-answer("How do I reset my password?", langsmith_extra={"metadata": {"session_id": "conv-17"}})
+print(answer("How do I reset my password?", langsmith_extra={"metadata": {"session_id": "conv-17"}}))
+# e.g. Go to Settings > Security > Reset password.
+```
 
-# Offline experiment against a golden dataset
-ls = Client()
-if not ls.has_dataset(dataset_name="support-golden"):
-    ds = ls.create_dataset("support-golden")
-    ls.create_examples(dataset_id=ds.id,
-                       inputs=[{"question": "How do I reset my password?"}],
-                       outputs=[{"answer": "Settings > Security > Reset password"}])
+- **In the UI:** `support_answer` → `retrieve` and `support_answer` → `llm` run, three runs sharing one
+  `trace_id`. `retrieve` ends first, so its end record often arrives before its parent's; `dotted_order` puts
+  it in place.
+- **Thread grouping reads the root:** `metadata.session_id` on the root call groups traces into a Thread.
+- **The `llm` run** records the messages, the response and the provider's usage, from which cost is priced.
+
+### An offline experiment with a code evaluator
+Evaluator signatures and the `{"output": ...}` wrapping follow the current SDK; older releases used
+`(run, example)` evaluators.
+
+```python
+from langsmith import Client, evaluate
+
+ls = Client()                                            # create the golden dataset once
+ds = ls.create_dataset("support-golden")
+ls.create_examples(dataset_id=ds.id, inputs=[{"question": "How do I reset my password?"}],
+                   outputs=[{"answer": "Settings > Security > Reset password"}])
 
 def mentions_reference(outputs: dict, reference_outputs: dict) -> bool:      # a code evaluator
     return reference_outputs["answer"].lower() in outputs["output"].lower()
 
 evaluate(lambda inputs: answer(inputs["question"]),      # a str result is stored as {"output": ...}
-         data="support-golden", evaluators=[mentions_reference],
-         experiment_prefix="system-prompt-v2")
+         data="support-golden", evaluators=[mentions_reference], experiment_prefix="system-prompt-v2")
 ```
 
-- **In the UI:** `support_answer` → `retrieve` and `support_answer` → `ChatOpenAI`-style `llm` run; the
-  experiment appears under the dataset with one traced run per example and a `mentions_reference` score.
-- **Mechanically,** the production call creates three runs sharing one `trace_id`. `retrieve` starts and ends
-  first, so its end record is often posted before `support_answer` has ended; `dotted_order` puts it in place.
-- **The `llm` run** records the messages, the response and the provider's usage, from which cost is priced.
-- **Thread grouping reads the root.** The `session_id` is set on the root call.
-- **In the experiment,** `evaluate` calls the lambda once per example, so each example yields its own trace,
-  and the evaluator's boolean becomes a feedback row keyed `mentions_reference` on that trace's root run.
-
-### Joining a tool service to the caller's trace
-LangSmith's propagation across an HTTP hop: the caller sends its run tree as headers, the callee continues it.
-`do_work` is your own `@traceable` function.
-
-```python
-import httpx
-import langsmith as ls
-from fastapi import FastAPI, Request
-from langsmith.run_helpers import get_current_run_tree
-
-@ls.traceable(run_type="chain")
-def call_tool_service(payload: dict) -> dict:
-    headers = get_current_run_tree().to_headers()        # LangSmith trace headers, not W3C traceparent
-    return httpx.post("http://tools:8000/run", json=payload, headers=headers).json()
-
-app = FastAPI()                                          # the tool service
-
-@app.post("/run")
-async def run(request: Request):
-    payload = await request.json()
-    with ls.tracing_context(parent=request.headers):     # runs inside become children of the caller's run
-        return await do_work(payload)
-```
-
-If a proxy strips unknown headers, the callee's runs appear as separate root traces.
+- **Each example yields its own trace,** and the evaluator's boolean becomes a feedback row keyed
+  `mentions_reference` on that trace's root run.
 
 ### Evaluating an agent's trajectory, not just its answer
-A plain-Python agent whose tools are `tool` runs, evaluated on whether it finished, whether its refund
-decision matches the reference and whether it repeated a tool call. The target returns the tool sequence so
-code evaluators can read it.
-
-`decide` stands for one model call (through a wrapped client) that returns either a tool request or a final
-answer; each `refund-tasks` example has a `should_refund` reference.
+The target returns the tool sequence so code evaluators can score the path as well as the outcome. `decide`
+stands for one model call that returns a tool request or a final answer; each `refund-tasks` example has a
+`should_refund` reference.
 
 ```python
 from langsmith import traceable, evaluate
 
 @traceable(run_type="tool")
-def lookup_order(order_id: str) -> dict:
-    return {"order_id": order_id, "status": "shipped", "days_late": 3}
-
+def lookup_order(order_id: str) -> dict: return {"order_id": order_id, "status": "shipped"}
 @traceable(run_type="tool")
-def issue_refund(order_id: str) -> dict:
-    return {"order_id": order_id, "refunded": True}
-
+def issue_refund(order_id: str) -> dict: return {"order_id": order_id, "refunded": True}
 TOOLS = {"lookup_order": lookup_order, "issue_refund": issue_refund}
 
 @traceable(run_type="chain", name="refund_agent")
@@ -410,23 +378,16 @@ def refund_agent(task: str, max_steps: int = 6) -> dict:
 
 def no_repeated_calls(outputs: dict) -> bool:             # trajectory evaluator
     return len(outputs["tool_calls"]) == len(set(outputs["tool_calls"]))
-
-def answered(outputs: dict) -> bool:
-    return outputs["answer"] is not None
-
+def answered(outputs: dict) -> bool: return outputs["answer"] is not None   # finished within the budget
 def refund_decision_correct(outputs: dict, reference_outputs: dict) -> bool:   # outcome evaluator
-    refunded = any(c.startswith("issue_refund:") for c in outputs["tool_calls"])
-    return refunded == reference_outputs["should_refund"]
+    return any(c.startswith("issue_refund:") for c in outputs["tool_calls"]) == reference_outputs["should_refund"]
 
 evaluate(lambda inputs: refund_agent(inputs["task"]), data="refund-tasks",
-         evaluators=[no_repeated_calls, answered, refund_decision_correct],
-         experiment_prefix="refund-agent-v3")
+         evaluators=[no_repeated_calls, answered, refund_decision_correct], experiment_prefix="refund-agent-v3")
 ```
 
-- **Each example is one traced agent run,** so a failing `no_repeated_calls` score links straight to the
-  run tree where the repeat happened.
 - **The answer can be right while the trajectory is wrong;** scoring both catches agents that succeed by
-  brute force and would be slow and expensive in production.
+  brute force, and a failing `no_repeated_calls` score links straight to the run tree where the repeat happened.
 
 ### Worked comparison: reading two experiments
 Illustrative numbers for a 200-example golden set, baseline versus `system-prompt-v2`.
@@ -459,6 +420,13 @@ broke 3" a readable statement rather than an average. Open the 3 regressions bef
   personal data before runs are posted. Monitor a sampled audit of stored runs.
 - **Drain in serverless.** Call `wait_for_all_tracers()` or the client's flush at the end of each handler.
   Monitor root runs with missing children.
+- **Create datasets idempotently.** Guard dataset setup with `has_dataset(dataset_name=...)`, because
+  `create_dataset` fails when the name already exists.
+- **Propagate across HTTP hops.** The caller sends `get_current_run_tree().to_headers()` (LangSmith headers,
+  not W3C `traceparent`) and the callee wraps its work in `tracing_context(parent=request.headers)`; if a
+  proxy strips unknown headers, the callee's runs appear as separate root traces.
+- **Score whether the agent answered at all** (an `answered` evaluator: `outputs["answer"] is not None`)
+  next to trajectory and outcome checks, so step-budget exhaustion shows up as its own failure.
 
 ## Trade-offs
 - **Integration vs lock-in.** Deepest LangChain and LangGraph integration (node state, tool calls, streamed

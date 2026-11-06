@@ -218,58 +218,36 @@ A minimal registry showing the three operations that matter:
 - **Move a label** with compare-and-set and a move log.
 - **Fetch with a TTL cache** that serves stale on failure.
 
-A real deployment backs `store` with a database and adds the bundled-file fallback for a cold start while
-the registry is down.
+A real deployment backs these dicts with a database, stores author, note and eval evidence on each
+version, and adds the bundled-file fallback for a cold start while the registry is down.
 
 ```python
 import hashlib, json, time
-
 class PromptRegistry:
-    def __init__(self, store):                 # store: {"versions": {name: [...]}, "labels": {(name, label): {...}}}
-        self.store, self._cache = store, {}
-
-    def register(self, name, messages, model, params, author, note):
+    def __init__(self):
+        self.versions, self.labels, self.moves, self._cache = {}, {}, [], {}
+    def register(self, name, messages, model, params):
         body = json.dumps({"messages": messages, "model": model, "params": params}, sort_keys=True)
         digest = hashlib.sha256(body.encode()).hexdigest()[:12]
-        versions = self.store["versions"].setdefault(name, [])
-        for v in versions:
-            if v["digest"] == digest:
-                return v["version"]            # same content, same version: registering is idempotent
-        v = {"version": len(versions) + 1, "digest": digest, "messages": messages, "model": model,
-             "params": params, "author": author, "note": note, "created": time.time(), "evals": {}}
-        versions.append(v)                     # append-only: a version is never edited or deleted
-        return v["version"]
-
-    def set_label(self, name, label, version, by, expected):   # deploy and rollback are both this one call
-        cur = self.store["labels"].get((name, label), {}).get("version")
-        if cur != expected:                    # compare-and-set: a concurrent move must not be clobbered
+        vs = self.versions.setdefault(name, [])         # append-only: never edited or deleted
+        if same := [v["version"] for v in vs if v["digest"] == digest]:
+            return same[0]                              # same content, same version: idempotent
+        vs.append({"version": len(vs) + 1, "digest": digest, "messages": messages, "model": model, "params": params})
+        return len(vs)
+    def set_label(self, name, label, version, by, expected):   # deploy and rollback are both this call
+        cur = self.labels.get((name, label))
+        if cur != expected:                             # compare-and-set: never clobber a concurrent move
             raise RuntimeError(f"{name}:{label} is v{cur}, not v{expected}")
-        self.store["labels"][(name, label)] = {"version": version, "by": by, "at": time.time()}
-        self.store.setdefault("moves", []).append((name, label, cur, version, by, time.time()))  # rollback target
-
+        self.labels[(name, label)] = version
+        self.moves.append((name, label, cur, version, by, time.time()))   # rollback target and audit
     def get(self, name, label="production", ttl=60):
-        now, hit = time.time(), self._cache.get((name, label))
-        if hit and now - hit["at"] < ttl:
-            return hit["v"]
-        try:
-            ver = self.store["labels"][(name, label)]["version"]
-            v = self.store["versions"][name][ver - 1]
-            self._cache[(name, label)] = {"v": v, "at": now}
-            return v
-        except Exception:
-            if hit:
-                return hit["v"]                # registry down: serve stale rather than fail the request
-            raise
-
-reg = PromptRegistry({"versions": {}, "labels": {}})
-v1 = reg.register("support_answer",
-                  [{"role": "system", "content": "Answer using only the provided context: {{context}}"},
-                   {"role": "user", "content": "{{question}}"}],
-                  model="vendor-model-2025-04-14",        # a dated snapshot id, never a floating alias
-                  params={"temperature": 0.2, "max_tokens": 600}, author="ana", note="initial")
-reg.set_label("support_answer", "production", v1, by="ci:release-42", expected=None)
-p = reg.get("support_answer")
-# Log p["version"] and p["digest"] on every trace so any answer resolves to its exact prompt.
+        hit = self._cache.get((name, label))
+        if not hit or time.time() - hit[1] >= ttl:
+            try:
+                hit = self._cache[(name, label)] = (self.versions[name][self.labels[(name, label)] - 1], time.time())
+            except Exception:
+                if not hit: raise                       # registry down: serve stale rather than fail
+        return hit[0]
 ```
 
 ### Guarded promotion, strict rendering and rollback
@@ -278,45 +256,27 @@ deployed code declares it supplies that variable, and rollback reads its target 
 
 ```python
 import re
-
 VAR = re.compile(r"\{\{(\w+)\}\}")
 
-def template_vars(messages):
-    return {name for msg in messages for name in VAR.findall(msg["content"])}
-
-def render(messages, **values):            # fail loudly instead of sending a literal placeholder
-    def sub(m):
-        if m.group(1) not in values:
-            raise KeyError(f"missing template variable {m.group(1)!r}")
-        return str(values[m.group(1)])
-    return [{**msg, "content": VAR.sub(sub, msg["content"])} for msg in messages]
+def render(messages, **values):        # KeyError on a missing variable, never a literal placeholder
+    return [{**m, "content": VAR.sub(lambda x: str(values[x.group(1)]), m["content"])} for m in messages]
 
 def promote(reg, name, version, app_provides, by):
-    v = reg.store["versions"][name][version - 1]
-    missing = template_vars(v["messages"]) - set(app_provides)
-    if missing:                            # the variable set is the prompt/code interface
-        raise RuntimeError(f"v{version} needs {sorted(missing)}; deployed code does not supply them")
-    cur = reg.store["labels"].get((name, "production"), {}).get("version")
-    reg.set_label(name, "production", version, by=by, expected=cur)
+    needed = {n for m in reg.versions[name][version - 1]["messages"] for n in VAR.findall(m["content"])}
+    if needed - set(app_provides):     # the variable set is the prompt/code interface
+        raise RuntimeError(f"v{version} needs {sorted(needed - set(app_provides))}")
+    reg.set_label(name, "production", version, by, expected=reg.labels.get((name, "production")))
 
-def rollback(reg, name, by):
-    moves = [m for m in reg.store["moves"] if m[:2] == (name, "production")]
-    _, _, prev, cur, _, _ = moves[-1]      # the move log knows what the label pointed at before
-    if prev is None:
-        raise RuntimeError("nothing to roll back to")
-    reg.set_label(name, "production", prev, by=by, expected=cur)
-
-v2 = reg.register("support_answer",
-                  [{"role": "system", "content": "Tier {{customer_tier}}. Use only: {{context}}"},
-                   {"role": "user", "content": "{{question}}"}],
-                  model="vendor-model-2025-04-14", params={"temperature": 0.2, "max_tokens": 600},
-                  author="raj", note="tier-aware tone")
-try:
-    promote(reg, "support_answer", v2, {"context", "question"}, by="ci:release-43")
-except RuntimeError as e:
-    print("blocked:", e)          # blocked: v2 needs ['customer_tier']; deployed code does not supply them
+reg, model = PromptRegistry(), "vendor-model-2025-04-14"    # a dated snapshot, never a floating alias
+msgs = lambda system: [{"role": "system", "content": system}, {"role": "user", "content": "{{question}}"}]
+v1 = reg.register("support_answer", msgs("Use only: {{context}}"), model, {"temperature": 0.2})
+v2 = reg.register("support_answer", msgs("Tier {{customer_tier}}. Use only: {{context}}"), model, {"temperature": 0.2})
+promote(reg, "support_answer", v1, {"context", "question"}, by="ci:release-42")
+try: promote(reg, "support_answer", v2, {"context", "question"}, by="ci:release-43")
+except RuntimeError as e: print("blocked:", e)     # blocked: v2 needs ['customer_tier']
 promote(reg, "support_answer", v2, {"context", "question", "customer_tier"}, by="ci:release-44")
-rollback(reg, "support_answer", by="oncall:lee")   # production is v1 again, and the move is logged
+reg.set_label("support_answer", "production", reg.moves[-1][2], "oncall:lee", expected=v2)  # rollback
+print(reg.get("support_answer")["version"])   # 1; log version and digest on every trace
 ```
 
 ### An agent run that pins its prompt version
@@ -333,8 +293,7 @@ def run_agent(reg, task, llm, tools, span, max_steps=10):
     pin = {"prompt": "support_agent", "version": p["version"], "digest": p["digest"]}
     messages = render(p["messages"], question=task["question"], context="")
     for step in range(max_steps):
-        reply = llm(model=p["model"], params=p["params"], messages=messages,
-                    tools=p.get("tools", []))     # tool descriptions are versioned with the prompt
+        reply = llm(model=p["model"], params=p["params"], messages=messages, tools=p.get("tools", []))
         span(step=step, **pin, tool=reply.get("tool_call"))   # every step carries the same pin
         if not reply.get("tool_call"):
             return reply["content"], pin

@@ -320,92 +320,66 @@ flowchart TD
 
 ## Examples
 ### Agent scenario: tool schema, JSON Schema and a repair loop
-A tool definition whose Zod schema produces both the TypeScript argument type and the JSON Schema sent to the
-model, with a repair loop that feeds validation issues back when the model's arguments do not parse. Unknown
-keys are rejected because an extra key from a model usually means it misread the schema.
+One Zod schema gives the TypeScript argument type and the JSON Schema sent to the model; when the model's
+arguments do not parse, the issues go back to it. Unknown keys are rejected because an extra key from a
+model usually means it misread the schema.
 
 ```ts
+// npm i zod@^4   (on Zod 3: z.string().datetime(), zod-to-json-schema)
 import { z } from "zod";
 
 const ScheduleArgs = z.object({
   title: z.string().min(1).describe("Short title for the calendar event"),
-  start: z.iso.datetime({ offset: true })                 // without offset: only a trailing "Z"
-    .describe("ISO 8601 start time with timezone offset"),
+  start: z.iso.datetime({ offset: true }).describe("ISO 8601 start time with timezone offset"),
   durationMinutes: z.number().int().min(5).max(480).default(30),
-  attendees: z.array(z.email()).max(20).default([]),
 }).strict();
-type ScheduleArgs = z.infer<typeof ScheduleArgs>;       // output: durationMinutes: number (required)
-type ScheduleInput = z.input<typeof ScheduleArgs>;      // input: durationMinutes?: number
+type ScheduleArgs = z.infer<typeof ScheduleArgs>;           // output: durationMinutes is required
+export const parameters = z.toJSONSchema(ScheduleArgs, { io: "input" });  // defaulted fields optional for the model
 
-export const scheduleTool = {
-  name: "schedule_event",
-  description: "Create a calendar event",
-  // Zod 4 APIs throughout (on Zod 3: z.string().datetime(), z.string().email(), zod-to-json-schema).
-  // io "input" describes ScheduleInput: defaulted fields are optional for the model.
-  parameters: z.toJSONSchema(ScheduleArgs, { io: "input" }),
-  run: async (args: ScheduleArgs) => ({ id: "evt_123", ...args }),
-};
-
-type ModelCall = (messages: Array<{ role: string; content: string }>) => Promise<string>;
-
-export async function callToolWithRepair(rawArgs: string, model: ModelCall, maxRepairs = 2) {
-  let text = rawArgs;
-  for (let attempt = 0; attempt <= maxRepairs; attempt++) {
-    let json: unknown = undefined;
-    try { json = JSON.parse(text); } catch { /* reported as a syntax problem below */ }
-    const result = ScheduleArgs.safeParse(json);
-    if (result.success) return scheduleTool.run(result.data);   // result.data is typed and trusted
-    const issues = json === undefined ? "(root): not valid JSON" : result.error.issues
-      .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("\n");
+export async function callToolWithRepair(raw: string, model: (prompt: string) => Promise<string>, maxRepairs = 2) {
+  for (let attempt = 0; ; attempt++) {
+    let json: unknown;
+    try { json = JSON.parse(raw); } catch { /* reported as a syntax problem below */ }
+    const r = ScheduleArgs.safeParse(json);
+    if (r.success) return r.data;                              // typed and trusted
+    const issues = json === undefined ? "(root): not valid JSON"
+      : r.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("\n");
     if (attempt === maxRepairs) throw new Error(`tool args invalid after repairs:\n${issues}`);
-    text = await model([
-      { role: "system", content: "Return only JSON matching the schema; fix the listed problems." },
-      { role: "user", content: `Previous arguments:\n${text}\n\nProblems:\n${issues}` },
-    ]);
+    raw = await model(`Return only JSON matching the schema.\nPrevious arguments:\n${raw}\n\nProblems:\n${issues}`);
   }
-  throw new Error("unreachable");
 }
 
-const port = z.coerce.number().int().min(1).max(65535).parse(process.env.PORT ?? "3000");
-void port;
+const bad = '{"title":"Sync","start":"2026-11-02T10:00:00","room":"4B"}';  // no offset, unknown key
+console.log(await callToolWithRepair(bad, async () => '{"title":"Sync","start":"2026-11-02T10:00:00+01:00"}'));
+// { title: 'Sync', start: '2026-11-02T10:00:00+01:00', durationMinutes: 30 }
 ```
 
 ### Boot-time config and a request body that returns 400
-Zod 4. Config is parsed once at startup so a bad deploy crashes immediately, not on the first request. The
-request parser returns path and message only, never the raw input, so client responses cannot leak payloads.
+Config is parsed once at startup so a bad deploy crashes immediately. The request parser returns path and
+message only, never the raw input, so client responses cannot leak payloads.
 
 ```ts
 import { z } from "zod";
 
 const Env = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
-  MODEL_API_KEY: z.string().min(1),
-  ENABLE_TOOLS: z.stringbool().default(false),           // "false" -> false, unlike z.coerce.boolean()
-  LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+  ENABLE_TOOLS: z.stringbool().default(false),              // "false" -> false, unlike z.coerce.boolean()
 });
-export const env = Env.parse(process.env);                // throws at boot with every bad variable listed
+export const env = Env.parse(process.env);                   // throws at boot with every bad variable listed
 
 const ChatRequest = z.strictObject({
   model: z.enum(["fast", "smart"]),
-  messages: z.array(z.strictObject({
-    role: z.enum(["user", "assistant"]),
-    content: z.string().min(1).max(32_000),
-  })).min(1).max(100),
-  temperature: z.number().min(0).max(2).default(1),
+  messages: z.array(z.object({ role: z.enum(["user", "assistant"]), content: z.string().min(1) })).min(1),
 });
-export type ChatRequest = z.output<typeof ChatRequest>;
 
 export function parseChatRequest(body: unknown) {
   const r = ChatRequest.safeParse(body);
-  if (r.success) return { ok: true as const, data: r.data };   // temperature filled in: 1
-  return {
-    ok: false as const,
-    status: 400,
-    issues: r.error.issues.map((i) => ({ path: i.path.join(".") || "(root)", message: i.message })),
-  };
+  if (r.success) return { ok: true as const, data: r.data };
+  return { ok: false as const, status: 400, issues: r.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`) };
 }
-// parseChatRequest({ model: "gpt-x", messages: [], temprature: 0.2 }) yields three issues:
-// model (invalid option), messages (too small), (root) (unrecognized key "temprature")
+
+console.log(env, parseChatRequest({ model: "gpt-x", messages: [], temprature: 0.2 }).issues);
+// three issues: model (invalid option), messages (too small), (root) (unrecognized key "temprature")
 ```
 
 ### Worked scenario: a model upgrade raises tool-argument failures
@@ -438,6 +412,9 @@ A team tracks `safeParse` failures per tool after switching model versions (illu
 - **Bounded repair with metrics.** `safeParse` model output, send `issues` back at most two times, then fail
   explicitly. Emit failure rate, repair success rate and extra tokens per tool; a rising failure rate usually
   means a prompt or model change.
+- **Cap sizes in request and tool schemas.** Bound strings and arrays (for example message content at
+  32,000 characters, 100 messages per request, 20 attendees per event) so one body cannot blow up a prompt
+  or a bill.
 
 ## Trade-offs
 - **One schema vs coupling.** One schema gives type, parser and model contract together, but couples the wire

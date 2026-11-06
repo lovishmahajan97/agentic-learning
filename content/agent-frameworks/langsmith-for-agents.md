@@ -283,19 +283,14 @@ pass to `evaluate`.
 # pip install langsmith agentevals ; the evaluator part runs offline
 from agentevals.trajectory.match import create_trajectory_match_evaluator
 
-def tool_calls(*calls):                     # helper: OpenAI-style assistant message with tool calls
-    return {"role": "assistant", "content": "", "tool_calls": [
-        {"function": {"name": n, "arguments": a}} for n, a in calls]}
+def call(name):                          # OpenAI-style assistant message with one tool call
+    return {"role": "assistant", "content": "",
+            "tool_calls": [{"function": {"name": name, "arguments": "{}"}}]}
 
-reference = [
-    {"role": "user", "content": "Refund order A-1001"},
-    tool_calls(("order_status", '{"order_id": "A-1001"}')),
-    {"role": "tool", "content": "delivered"},
-    tool_calls(("issue_refund", '{"order_id": "A-1001"}')),
-    {"role": "tool", "content": "refund-77"},
-    {"role": "assistant", "content": "Refunded, reference refund-77."},
-]
-skipped_check = [reference[0], reference[3], reference[4], reference[5]]   # refunded without looking up
+user = {"role": "user", "content": "Refund order A-1001"}
+reference = [user, call("order_status"), {"role": "tool", "content": "delivered"},
+             call("issue_refund"), {"role": "tool", "content": "refund-77"}]
+skipped_check = [user, call("issue_refund"), {"role": "tool", "content": "refund-77"}]  # no lookup
 
 strict = create_trajectory_match_evaluator(trajectory_match_mode="strict")
 superset = create_trajectory_match_evaluator(trajectory_match_mode="superset", tool_args_match_mode="ignore")
@@ -305,49 +300,38 @@ print(superset(outputs=reference, reference_outputs=skipped_check)) # extra call
 ```
 
 ### An experiment over a real agent
-Needs LangSmith and OpenAI keys and a dataset named `refund-agent-golden` whose examples hold a
-`question` input and reference `messages` and `answer` outputs.
+Needs `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY`, `OPENAI_API_KEY` and a dataset named
+`refund-agent-golden` whose examples hold a `question` input and reference `messages` and `answer` outputs.
 
 ```python
 # pip install langsmith langchain langchain-openai agentevals openevals
-# env: LANGSMITH_TRACING=true LANGSMITH_API_KEY=... LANGSMITH_PROJECT=refund-agent OPENAI_API_KEY=...
 from langsmith import evaluate
 from langchain.agents import create_agent
-from langchain_core.tools import tool
 from agentevals.trajectory.match import create_trajectory_match_evaluator
 from openevals.llm import create_llm_as_judge
 from openevals.prompts import CORRECTNESS_PROMPT
 
-@tool
 def order_status(order_id: str) -> str:
     """Delivery status for an order id."""
     return "delivered"
 
-@tool
 def issue_refund(order_id: str) -> str:
     """Refund a delivered order. Always check order_status first."""
     return "refund-77"
 
-agent = create_agent("openai:gpt-4o-mini", tools=[order_status, issue_refund],
-                     system_prompt="Refund agent. Verify delivery before refunding.")
-
-def target(inputs: dict) -> dict:                      # one traced agent run per example
-    result = agent.invoke({"messages": [{"role": "user", "content": inputs["question"]}]})
-    return {"messages": result["messages"], "answer": result["messages"][-1].content}
-
-match = create_trajectory_match_evaluator(trajectory_match_mode="superset", tool_args_match_mode="ignore")
+agent = create_agent("openai:gpt-4o-mini", tools=[order_status, issue_refund])  # plain functions work
+tool_path = create_trajectory_match_evaluator(trajectory_match_mode="superset", tool_args_match_mode="ignore")
 judge = create_llm_as_judge(prompt=CORRECTNESS_PROMPT, model="openai:gpt-4o-mini", feedback_key="correct")
 
-def tool_path(outputs: dict, reference_outputs: dict):  # did it call at least the reference tools?
-    return match(outputs=outputs["messages"], reference_outputs=reference_outputs["messages"])
+def target(inputs: dict) -> dict:                      # one traced agent run per example
+    msgs = agent.invoke({"messages": [{"role": "user", "content": inputs["question"]}]})["messages"]
+    return {"messages": msgs, "answer": msgs[-1].content}   # tool_path reads the "messages" key
 
 def correct(inputs: dict, outputs: dict, reference_outputs: dict):
     return judge(inputs=inputs["question"], outputs=outputs["answer"],
                  reference_outputs=reference_outputs["answer"])
 
-if __name__ == "__main__":
-    evaluate(target, data="refund-agent-golden", evaluators=[tool_path, correct],
-             experiment_prefix="gpt-4o-mini-prompt-v3", max_concurrency=4, num_repetitions=3)
+evaluate(target, data="refund-agent-golden", evaluators=[tool_path, correct], num_repetitions=3)
 ```
 
 - **In the UI:** one experiment row per example and repetition, each linked to its full agent trace, with
@@ -382,6 +366,8 @@ Illustrative numbers from a refund agent's regression dataset.
   fallback copy in the repo so a hub outage cannot take the agent down.
 - **Watch online scores per agent node.** Online evaluators on sampled traces track judge scores, tool
   errors and cost per run; alert on drops after deploys.
+- **Name and throttle experiments.** Pass `experiment_prefix` with model and prompt version (for example
+  `gpt-4o-mini-prompt-v3`) and a `max_concurrency` (for example 4) to `evaluate` to stay under rate limits.
 
 ## Trade-offs
 - **Native LangGraph integration vs lock-in.** Zero-code tracing and graph-aware views are strongest with

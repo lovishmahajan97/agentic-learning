@@ -250,45 +250,37 @@ Daily traffic is 1,000,000 requests:
 
 ### Step-level routing inside an agent, plus the calculator
 The agent loop picks a logical name per step type; the gateway resolves it. The calculator reproduces
-the table above and the sizing rule. Swap in your own traffic mix and price card.
+the table above. Swap in your own traffic mix and price card.
 
 ```python
 STEP_TIER = {"plan": "frontier", "choose_tool": "frontier",      # hard decisions stay strong
-             "summarise_tool_result": "workhorse", "format_answer": "workhorse",
-             "guardrail_check": "small"}
+             "summarise_tool_result": "workhorse", "format_answer": "workhorse"}
 
 def model_for(step_type):
     return STEP_TIER.get(step_type, "frontier")   # unknown step types default to the safe tier
 
 PRICE = {"frontier": (10, 30), "workhorse": (1, 3), "small": (0.1, 0.3)}  # illustrative, per 1M tokens
 
-def daily_cost(slices):
-    """slices: list of (calls_per_day, in_tokens, out_tokens, tier)."""
-    total = 0.0
-    for calls, n_in, n_out, tier in slices:
-        p_in, p_out = PRICE[tier]
-        total += calls * (n_in * p_in + n_out * p_out) / 1e6
-    return total
+def daily_cost(slices):                           # slices: (calls_per_day, in_tokens, out_tokens, tier)
+    return sum(n * (i * PRICE[t][0] + o * PRICE[t][1]) / 1e6 for n, i, o, t in slices)
 
 single = [(700_000, 300, 10, "frontier"), (250_000, 3_000, 250, "frontier"),
           (300_000, 20_000, 2_000, "frontier")]
 tiered = [(700_000, 300, 10, "small"), (250_000, 3_000, 250, "workhorse"),
           (300_000, 20_000, 2_000, "frontier")]
-routed = tiered[:2] + [(100_000, 20_000, 2_000, "frontier"), (200_000, 20_000, 2_000, "workhorse")]
+routed = tiered[:2] + [(100_000, 20_000, 2_000, model_for("plan")),
+                       (200_000, 20_000, 2_000, model_for("summarise_tool_result"))]
 
-base = daily_cost(single)
 for name, s in (("single", single), ("tiered", tiered), ("routed", routed)):
     c = daily_cost(s)
-    print(f"{name:7s} {c:9,.0f} units/day  saving {1 - c / base:4.0%}")
+    print(f"{name:7s} {c:9,.0f} units/day  saving {1 - c / daily_cost(single):4.0%}")
 # single 89,685 (0%), tiered 78,961 (12%), routed 32,161 (64%)
-
-def earns_a_place(req_per_month, cost_a, cost_b, added_errors, cost_per_error, fixed_monthly):
-    return req_per_month * (cost_a - cost_b) - added_errors * cost_per_error > fixed_monthly
 ```
 
-With an illustrative fixed cost of 2,000 units a month per entry and no added errors: the
-classification family (about 21M requests a month) saves ≈ 68,600 units a month and clears it easily; a
-30,000-request-a-month team task with the same per-request saving gains ≈ 98 units and does not.
+The sizing rule above, with an illustrative fixed cost of 2,000 units a month per entry and no added
+errors: the classification family (about 21M requests a month) saves ≈ 68,600 units a month and clears
+it easily; a 30,000-request-a-month team task with the same per-request saving gains ≈ 98 units and
+does not.
 
 ### A registry record
 Field names are this lesson's schema, not a specific product's format; values are illustrative.

@@ -338,14 +338,12 @@ flowchart TD
 ```
 
 ## Examples
-### Event-log store with catch-up, dedup, repair and a derived view
+### Event-log store with catch-up, dedup and repair
 The store appends sequence-numbered events, serves catch-up by sequence number, dedupes submissions on
-the client-generated turn id, repairs dangling tool calls after a crash, and derives the model context
-from the log plus the latest summary.
+the client-generated turn id, and repairs dangling tool calls after a crash. Deriving the model context
+from the log is the Lab's job.
 
 ```python
-import json
-
 class ConversationStore:
     def __init__(self):
         self.events, self.turns = {}, {}
@@ -360,10 +358,9 @@ class ConversationStore:
         return [e for e in self.events.get(cid, []) if e["seq"] > after_seq]
 
     def submit(self, cid, turn_id, text):                # idempotent on turn_id
-        if turn_id in self.turns:
-            return self.turns[turn_id]
-        self.append(cid, "user", {"text": text, "turn_id": turn_id})
-        self.turns[turn_id] = {"state": "accepted", "run_id": None}
+        if turn_id not in self.turns:
+            self.append(cid, "user", {"text": text, "turn_id": turn_id})
+            self.turns[turn_id] = {"state": "accepted", "run_id": None}
         return self.turns[turn_id]
 
     def repair(self, cid):                               # after a crash
@@ -374,16 +371,6 @@ class ConversationStore:
             self.append(cid, "tool_result", {"id": call_id,
                         "error": "interrupted: outcome unknown, check before retrying"})
         return len(calls - results)
-
-def build_context(store, cid, recent=40):
-    """Derive the model view: latest summary (if any) plus the events after it."""
-    log = store.events.get(cid, [])
-    summary = next((e for e in reversed(log) if e["type"] == "summary"), None)
-    tail = [e for e in log if summary is None or e["seq"] > summary["seq"]][-recent:]
-    # a real view also moves the cut so it never separates a tool call from its result
-    msgs = [{"role": "system", "content": summary["payload"]["text"]}] if summary else []
-    # mapping event types to the provider's message format is omitted for brevity
-    return msgs + [{"role": e["type"], "content": json.dumps(e["payload"])} for e in tail]
 ```
 
 ### Worked trace: one crash in a refund conversation
@@ -440,6 +427,8 @@ for e in s.since("c1", after_seq=3):                     # client reconnects
 - **Per-conversation data keys for deletion.** Envelope-encrypt payloads with a per-conversation key held
   in a KMS and delete the key on erasure requests, deleting derived summaries alongside. Monitor erasure
   completion time against the policy deadline.
+- **Never cut the context window between a tool call and its result.** When the derived view keeps
+  only the latest summary plus recent events, move the cut so every tool call keeps its result.
 
 ## Trade-offs
 - **Event log vs storage cost.** An append-only log with derived views preserves every detail and enables

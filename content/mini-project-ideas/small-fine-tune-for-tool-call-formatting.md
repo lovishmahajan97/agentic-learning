@@ -293,25 +293,18 @@ TOOLS = [{"type": "function", "function": {
     "parameters": {"type": "object", "required": ["city"],
                    "properties": {"city": {"type": "string"}, "unit": {"type": "string", "enum": ["c", "f"]}}}}}]
 
-def render(user, call=None, reply=None):
-    """call = (name, args) for a tool call, or reply = text when no tool is needed."""
-    if call:
-        out = {"role": "assistant", "content": "",
-               "tool_calls": [{"type": "function", "function": {"name": call[0], "arguments": call[1]}}]}
-    else:
-        out = {"role": "assistant", "content": reply}
-    msgs = [{"role": "user", "content": user}, out]
-    return {"text": tok.apply_chat_template(msgs, tools=TOOLS, tokenize=False)}
-
-rows = [render("What's the weather in Oslo in fahrenheit?", call=("get_weather", {"city": "Oslo", "unit": "f"})),
-        render("Thanks, that's all!", reply="You're welcome!")]       # replace with 1,000-2,000 generated rows
+call = {"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Oslo", "unit": "f"}}}
+chats = [[{"role": "user", "content": "What's the weather in Oslo in fahrenheit?"},
+          {"role": "assistant", "content": "", "tool_calls": [call]}],
+         [{"role": "user", "content": "Thanks, that's all!"},              # a no-tool example
+          {"role": "assistant", "content": "You're welcome!"}]]            # replace with 1,000-2,000 generated chats
+rows = [{"text": tok.apply_chat_template(c, tools=TOOLS, tokenize=False)} for c in chats]
 print(rows[0]["text"])                                                 # check the tool-call format by eye
 
 ds = Dataset.from_list(rows * 50).train_test_split(test_size=0.1, seed=0)
 lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, target_modules="all-linear", task_type="CAUSAL_LM")
-args = SFTConfig(output_dir="out", num_train_epochs=2, learning_rate=2e-4,
-                 per_device_train_batch_size=8, logging_steps=10, seed=0,
-                 eval_strategy="steps", eval_steps=10)       # without this, validation loss is never computed
+args = SFTConfig(output_dir="out", num_train_epochs=2, learning_rate=2e-4, per_device_train_batch_size=8,
+                 eval_strategy="steps", eval_steps=10)  # without eval_strategy, validation loss is never computed
 trainer = SFTTrainer(model=BASE, args=args, train_dataset=ds["train"], eval_dataset=ds["test"], peft_config=lora)
 trainer.train()
 trainer.save_model("out/adapter")                                      # saves only the small adapter weights
@@ -345,9 +338,11 @@ def score(output, gold, schemas):
     return {"parsed": True, "valid": True,
             "correct": call["name"] == gold["name"] and call["arguments"] == gold["arguments"]}
 
-def report(rows):
-    n = len(rows)
-    return {k: round(sum(r[k] for r in rows) / n, 3) for k in ("parsed", "valid", "correct")}
+schemas = {"get_weather": {"type": "object", "required": ["city"],
+                           "properties": {"unit": {"type": "string", "enum": ["c", "f"]}}}}
+out = '<tool_call>{"name": "get_weather", "arguments": {"city": "Oslo", "unit": "celsius"}}</tool_call>'
+print(score(out, {"name": "get_weather", "arguments": {"city": "Oslo"}}, schemas))
+# {'parsed': True, 'valid': False, 'correct': False}    "celsius" breaks the enum
 ```
 
 ### Milestones, time estimates and done-when checks

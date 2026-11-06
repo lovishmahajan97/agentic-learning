@@ -190,39 +190,29 @@ flowchart TD
 ### Corpus-side overlap check with split scores
 Hash every 13-word shingle in the training documents, flag each eval item whose shingles intersect the
 set, and report accuracy on the clean and flagged subsets separately. The split-score comparison is the
-actionable output. Numbers in the comment are illustrative.
+actionable output. Runs as is on toy data; numbers in the comment are illustrative.
 
 ```python
 import hashlib, re
-from collections import defaultdict
 
-N = 13
-def shingles(text: str, n: int = N):
+N = 13                                            # the GPT-3 report's n-gram length
+def shingles(text: str, n: int = N) -> set:
     toks = re.findall(r"\w+", text.lower())
-    for i in range(max(0, len(toks) - n + 1)):
-        yield hashlib.blake2b(" ".join(toks[i:i + n]).encode(), digest_size=8).digest()
+    return {hashlib.blake2b(" ".join(toks[i:i + n]).encode(), digest_size=8).digest()
+            for i in range(len(toks) - n + 1)}
 
-def build_index(train_docs) -> set:
-    seen = set()
-    for doc in train_docs:                      # streams a corpus; swap the set for a Bloom filter at scale
-        seen.update(shingles(doc))
-    return seen
-
-def flag_items(eval_items, index: set) -> dict[str, bool]:
-    return {it["id"]: any(s in index for s in shingles(it["question"] + " " + it["answer"]))
-            for it in eval_items}
-
-def split_scores(eval_items, flagged: dict, correct: dict) -> dict:
-    buckets = defaultdict(list)
-    for it in eval_items:
-        buckets["flagged" if flagged[it["id"]] else "clean"].append(correct[it["id"]])
-    return {k: (len(v), round(sum(v) / len(v), 3)) for k, v in buckets.items() if v}
-
-index = build_index(iter_training_docs())       # your fine-tuning set, or an open pretraining shard
-flagged = flag_items(eval_items, index)
-print(split_scores(eval_items, flagged, model_correct))
-# e.g. {'clean': (712, 0.78), 'flagged': (288, 0.93)}  -> a 15-point gap is a candidate memorization
-# signal; report the clean-subset score and remove flagged items from fine-tuning data.
+train_docs = ["Quiz: what is the boiling point of water at sea level in degrees Celsius? 100."]
+eval_items = [  # question + answer text, and whether the model got it right
+    {"text": "What is the boiling point of water at sea level in degrees Celsius? 100", "correct": True},
+    {"text": "Which planet in our solar system has the most confirmed moons right now? Saturn", "correct": False},
+]
+index = set().union(*map(shingles, train_docs))  # stream the corpus; use a Bloom filter at scale
+split = {"clean": [], "flagged": []}
+for it in eval_items:
+    split["flagged" if shingles(it["text"]) & index else "clean"].append(it["correct"])
+print({k: (len(v), sum(v) / len(v)) for k, v in split.items()})
+# {'clean': (1, 0.0), 'flagged': (1, 1.0)}. On a real set, e.g. clean (712, 0.78) vs flagged
+# (288, 0.93): a 15-point gap is a candidate memorization signal; report the clean-subset score.
 ```
 
 - **Read the gap carefully.** Flagged items are not a random subset: items copied around the web tend
@@ -265,25 +255,17 @@ def norm_hash(text: str) -> str:                 # case- and whitespace-insensit
     return hashlib.sha256(" ".join(re.findall(r"\w+", text.lower())).encode()).hexdigest()
 
 CANARY = f"EVAL-CANARY {uuid.uuid4()}"            # generate once per eval set, store with it, never reuse
-
-golden = [{"id": "g1", "input": "Can I get a refund after 30 days?"},
-          {"id": "g2", "input": "My parcel shows delivered but never arrived."}]
+golden = {norm_hash("Can I get a refund after 30 days?"): "g1"}
 finetune = ['{"prompt": "can I get a REFUND after 30 days?", "completion": "..."}',
             '{"prompt": "How do I change my address?", "completion": "..."}',
             json.dumps({"prompt": "header", "completion": CANARY})]
 
-def leak_report(golden, finetune_lines, canary):
-    fps = {norm_hash(g["input"]): g["id"] for g in golden}
-    hits = []
-    for n, line in enumerate(finetune_lines, 1):
-        rec = json.loads(line)
-        if canary in line:
-            hits.append((n, "canary"))
-        if (gid := fps.get(norm_hash(rec["prompt"]))):
-            hits.append((n, f"golden item {gid}"))
-    return hits
-
-hits = leak_report(golden, finetune, CANARY)
+hits = []
+for n, line in enumerate(finetune, 1):
+    if CANARY in line:
+        hits.append((n, "canary"))
+    if gid := golden.get(norm_hash(json.loads(line)["prompt"])):
+        hits.append((n, f"golden item {gid}"))
 print(hits)                                       # [(1, 'golden item g1'), (3, 'canary')]
 raise SystemExit(1 if hits else 0)                # block the fine-tuning job on any hit
 ```
@@ -294,27 +276,20 @@ raise SystemExit(1 if hits else 0)                # block the fine-tuning job on
 ### Agent scenario: catching answer lookup in a search-enabled agent's traces
 After an eval run, scan each trace's tool results for the item's reference answer. A hit means the
 agent may have found the answer rather than worked it out. Reuses `shingles` from the first example
-with a shorter n, because answers are short.
+with a shorter n, because answers are short; call `saw_answer` on each passing item's trace.
 
 ```python
-SEARCH_TOOLS = {"web_search", "fetch_url"}            # the tools that can bring outside text in
+SEARCH_TOOLS = {"web_search", "fetch_url"}       # the tools that can bring outside text in
 
-def lookup_flags(runs, items, n=6):
-    """runs: id -> {"pass": bool, "trace": [{"tool": str, "result": str}, ...]}"""
-    flags = {}
-    for it in items:
-        ans = set(shingles(it["answer"], n))
-        pages = [str(t["result"]) for t in runs[it["id"]]["trace"] if t["tool"] in SEARCH_TOOLS]
-        if not ans:                                   # answer shorter than n words: exact substring check
-            hit = any(it["answer"].lower() in p.lower() for p in pages)
-        else:
-            hit = any(ans & set(shingles(p, n)) for p in pages)
-        flags[it["id"]] = hit
-    return flags
+def saw_answer(trace: list[dict], answer: str, n: int = 6) -> bool:
+    pages = [str(t["result"]) for t in trace if t["tool"] in SEARCH_TOOLS]
+    ans = shingles(answer, n)
+    if not ans:                                   # answer shorter than n words: exact substring check
+        return any(answer.lower() in p.lower() for p in pages)
+    return any(ans & shingles(p, n) for p in pages)
 
-flags = lookup_flags(runs, eval_items)
-passed = [i for i in flags if runs[i]["pass"]]
-print(f"{sum(flags[i] for i in passed)} of {len(passed)} passes saw the answer in a tool result")
+trace = [{"tool": "fetch_url", "result": "Benchmark answer key: item 41 is 'Paris, in 1783'."}]
+print(saw_answer(trace, "Paris, in 1783"))        # True: count this pass as unverified
 ```
 
 | Illustrative run, 165 research tasks | Count |

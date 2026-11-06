@@ -291,37 +291,23 @@ flowchart TD
 ### Starter code: a GitHub server with the Python SDK
 Type hints become the input schema and the docstring becomes the description the model reads. This uses
 the 1.x SDK; on 2.x the class is `MCPServer` from `mcp.server.mcpserver` (check the SDK migration guide).
+Resources work the same way: `@mcp.resource("github://{owner}/{name}/readme")` on a function that returns text.
 
 ```python
 import os, httpx
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("my-github")
-API = "https://api.github.com"
-HEADERS = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
-           "Accept": "application/vnd.github+json"}
-
-def gh(path: str, **params) -> list | dict:
-    r = httpx.get(f"{API}{path}", headers=HEADERS, params=params, timeout=10)
-    if r.status_code == 401:
-        raise ValueError("GitHub token invalid or expired")
-    r.raise_for_status()
-    return r.json()
+HEADERS = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}", "Accept": "application/vnd.github+json"}
 
 @mcp.tool()
 def list_my_open_issues(repo: str, limit: int = 10) -> list[dict]:
     """List open issues in owner/repo, newest first. Returns number, title, labels and url."""
-    items = gh(f"/repos/{repo}/issues", state="open", per_page=min(limit, 50))
-    return [{"number": i["number"], "title": i["title"], "url": i["html_url"],
-             "labels": [l["name"] for l in i["labels"]]} for i in items if "pull_request" not in i]
-
-@mcp.resource("github://{owner}/{name}/readme")
-def readme(owner: str, name: str) -> str:
-    """The README of a repository as raw Markdown."""
-    r = httpx.get(f"{API}/repos/{owner}/{name}/readme",
-                  headers={**HEADERS, "Accept": "application/vnd.github.raw"}, timeout=10)
+    r = httpx.get(f"https://api.github.com/repos/{repo}/issues", headers=HEADERS,
+                  params={"state": "open", "per_page": min(limit, 50)}, timeout=10)
     r.raise_for_status()
-    return r.text
+    return [{"number": i["number"], "title": i["title"], "url": i["html_url"],          # trimmed fields only
+             "labels": [l["name"] for l in i["labels"]]} for i in r.json() if "pull_request" not in i]
 
 @mcp.prompt()
 def weekly_triage(repo: str) -> str:
@@ -363,6 +349,8 @@ An illustrative run of the same request against two designs of the same server.
   recorded API fixture, so a renamed argument fails CI before a host sees it.
 - **Log every call with arguments and latency.** Write to stderr or a file, never stdout, because stdout carries
   the stdio protocol stream. Count calls and errors per tool.
+- **Turn auth failures into clear tool errors.** Map a 401 to "GitHub token invalid or expired" instead of a raw
+  HTTP error, and set a request timeout (10 s) on every API call, so the model can tell the user what to fix.
 
 ## Trade-offs
 - **stdio vs Streamable HTTP.** stdio is trivial to run and keeps the token on your machine; HTTP lets many users

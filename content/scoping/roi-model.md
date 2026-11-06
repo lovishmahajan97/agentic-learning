@@ -221,29 +221,27 @@ model takes volume and handle time from the baseline, loaded cost and capture ra
 cost per ticket from a token measurement on real traffic.
 
 ```python
-BASE = dict(tickets=40_000, min_saved=4.0, cost_per_min=0.80, capture=0.6,
+BASE = dict(tickets=40_000, min_saved=4.0, cost_per_min=0.80, capture=0.6,  # min_saved is net of review
             adoption_ramp=[0.2, 0.35, 0.5, 0.6, 0.7], adoption_steady=0.7,
-            ai_cost_per_ticket=0.04, review_min=0.0, platform=6_000, upkeep=10_000,
-            build=180_000)                  # review_min=0: min_saved is measured net of review
+            ai_cost_per_ticket=0.04, platform=6_000, upkeep=10_000, build=180_000)
 
-def monthly(p, month):
-    ramp = p["adoption_ramp"][month] if month < len(p["adoption_ramp"]) else 1.0
-    a = min(ramp, p["adoption_steady"])          # the plateau caps the ramp
-    benefit = p["tickets"] * a * (p["min_saved"] - p["review_min"]) * p["cost_per_min"] * p["capture"]
+def monthly(p, m):
+    ramp = p["adoption_ramp"][m] if m < len(p["adoption_ramp"]) else 1.0
+    a = min(ramp, p["adoption_steady"])                       # the plateau caps the ramp
+    benefit = p["tickets"] * a * p["min_saved"] * p["cost_per_min"] * p["capture"]
     run = p["tickets"] * p["ai_cost_per_ticket"] + p["platform"] + p["upkeep"]  # drafts for every ticket
     return benefit, run
 
 def evaluate(p, months=24, rate=0.10):
+    flows = [monthly(p, m) for m in range(months)]
     cum, payback, npv = -p["build"], None, -p["build"]
-    for m in range(months):
-        b, r = monthly(p, m)
+    for m, (b, r) in enumerate(flows):
         cum += b - r
         npv += (b - r) / (1 + rate / 12) ** (m + 1)
         if payback is None and cum >= 0:
             payback = m + 1
-    benefit = sum(monthly(p, m)[0] for m in range(months))
-    cost = p["build"] + sum(monthly(p, m)[1] for m in range(months))
-    return dict(roi=(benefit - cost) / cost, payback=payback, npv=round(npv))
+    cost = p["build"] + sum(r for _, r in flows)
+    return dict(roi=(sum(b for b, _ in flows) - cost) / cost, payback=payback, npv=round(npv))
 
 print("base", evaluate(BASE))                      # ROI ~ +100%, payback month 8, NPV ~ 517k
 for k, v in [("capture", 0.3), ("adoption_steady", 0.4), ("min_saved", 2.5), ("upkeep", 20_000)]:
@@ -251,11 +249,8 @@ for k, v in [("capture", 0.3), ("adoption_steady", 0.4), ("min_saved", 2.5), ("u
 # capture 0.3 -> ROI ~ 0, no payback in 24 months; adoption 0.4 -> +19%, month 16
 # min_saved 2.5 -> +25%, month 15;               upkeep 20k -> +43%, month 11
 
-lo, hi = 0.0, 10.0                                 # break-even on minutes saved
-for _ in range(40):
-    mid = (lo + hi) / 2
-    lo, hi = (mid, hi) if evaluate({**BASE, "min_saved": mid})["roi"] < 0 else (lo, mid)
-print(f"break-even minutes saved: {hi:.2f}")       # ~2.0
+grid = [x / 100 for x in range(1000)]                # break-even on minutes saved, 0.01 steps
+print(min(m for m in grid if evaluate({**BASE, "min_saved": m})["roi"] >= 0))   # 2.01 (about 2)
 ```
 
 What the run tells you:

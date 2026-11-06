@@ -180,12 +180,9 @@ Steps 1-5 in code: an argument-aware classifier, a durable pending store and a h
   idempotency key deduplicates the effect); any other execution is refused.
 
 ```python
-import hashlib, json
-
 READ_ONLY = {"search", "read_file", "get_order", "run_sql_readonly"}   # SQL via a read-only DB role
 
-def risk(tool: str, args: dict, env: str) -> str:
-    """Classify by effect: the same tool can be safe or consequential depending on arguments."""
+def risk(tool: str, args: dict, env: str) -> str:   # classify by effect, not by tool name alone
     if tool in READ_ONLY:
         return "safe"
     if tool == "issue_refund" and 0 < args["amount"] <= 50:
@@ -194,13 +191,10 @@ def risk(tool: str, args: dict, env: str) -> str:
         return "low_risk"          # reversible: scratch and staging files can be restored
     return "consequential"         # default-deny: anything unrecognized, including raw run_sql, is gated
 
-def call_hash(tool, args):
-    return hashlib.sha256(json.dumps({"tool": tool, "args": args}, sort_keys=True).encode()).hexdigest()
-
 def execute(run_id, step, tool, args, env, tools, store, approver):
     key = f"{run_id}:{step}"                     # idempotency key: a retry cannot run the effect twice
     if risk(tool, args, env) == "consequential":
-        h = call_hash(tool, args)
+        h = call_hash(tool, args)                # normalized hash, defined in the next example
         approval = store.get_approval(run_id, h)
         if approval is None:
             store.save_pending(run_id, step, tool, args, h, preview=tools[tool].dry_run(**args))
@@ -210,8 +204,7 @@ def execute(run_id, step, tool, args, env, tools, store, approver):
         if approval.expired() or not approver.may_approve(approval.by, tool):
             return {"status": "denied", "reason": "approval expired or approver not authorized"}
         if store.claimed_by(run_id, h) != key:   # first use, not a retry of this step after a failure
-            preview = tools[tool].dry_run(**args)
-            if preview != approval.preview:      # the world changed since it was approved: ask again
+            if (preview := tools[tool].dry_run(**args)) != approval.preview:   # world changed: ask again
                 store.save_pending(run_id, step, tool, args, h, preview=preview)   # must also drop the old approval
                 return {"status": "awaiting_approval", "request": h, "reason": "effect changed"}
             if not store.claim(run_id, h, key):  # atomic compare-and-set: one execution key per approval

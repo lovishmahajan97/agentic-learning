@@ -213,42 +213,40 @@ Sample size for a 60% to 63% lift, the test on the resulting data, and a sample-
 
 ```python
 import math
-
-def phi(x: float) -> float:                        # standard normal CDF
-    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+from statistics import NormalDist
 
 Z_ALPHA, Z_POWER = 1.959964, 0.841621              # two-sided alpha = 0.05, power = 0.80
+
+def p_value(z: float) -> float:
+    return 2 * (1 - NormalDist().cdf(abs(z)))
 
 def n_per_arm(p1: float, p2: float) -> int:
     pbar = (p1 + p2) / 2
     num = Z_ALPHA * math.sqrt(2 * pbar * (1 - pbar)) + Z_POWER * math.sqrt(p1 * (1 - p1) + p2 * (1 - p2))
     return math.ceil((num / abs(p2 - p1)) ** 2)
 
-def two_proportion(x1: int, n1: int, x2: int, n2: int) -> dict:
+def two_proportion(x1: int, n1: int, x2: int, n2: int) -> tuple:
     p1, p2, p = x1 / n1, x2 / n2, (x1 + x2) / (n1 + n2)
     z = (p2 - p1) / math.sqrt(p * (1 - p) * (1 / n1 + 1 / n2))
-    se = math.sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)
-    lo, hi = p2 - p1 - Z_ALPHA * se, p2 - p1 + Z_ALPHA * se
-    return {"lift_pp": round(100 * (p2 - p1), 2), "z": round(z, 2),
-            "p_value": round(2 * (1 - phi(abs(z))), 4), "ci95_pp": (round(100 * lo, 2), round(100 * hi, 2))}
+    se = math.sqrt(p1 * (1 - p1) / n1 + p2 * (1 - p2) / n2)  # unpooled SE for the interval
+    ci = (round(100 * (p2 - p1 - Z_ALPHA * se), 1), round(100 * (p2 - p1 + Z_ALPHA * se), 1))
+    return round(z, 2), round(p_value(z), 4), ci
 
-def sample_ratio_mismatch(n1: int, n2: int, expected: float = 0.5) -> float:
+def sample_ratio_mismatch(n1: int, n2: int) -> float:     # planned 50/50 split
     n = n1 + n2
-    z = (n1 - expected * n) / math.sqrt(n * expected * (1 - expected))
-    return 2 * (1 - phi(abs(z)))                   # small p-value: assignment or logging is biased
+    return round(p_value((n1 - n / 2) / math.sqrt(n / 4)), 4)
 
-print(n_per_arm(0.60, 0.63))                           # users per arm needed for a 3-point lift
-print(two_proportion(x1=2460, n1=4100, x2=2583, n2=4100))
-print(sample_ratio_mismatch(4100, 4350))               # planned 50/50; investigate before reading results
+print(n_per_arm(0.60, 0.63))                      # 4129 users per arm for a 3-point lift
+print(two_proportion(2460, 4100, 2583, 4100))     # (2.79, 0.0052, (0.9, 5.1)): a real lift
+print(sample_ratio_mismatch(4100, 4350))          # 0.0065: SRM, the test is void
 ```
 
 ### CUPED and the cost of peeking, simulated
-Runnable on Python 3.10+ (it uses `statistics.covariance` and `statistics.correlation`). The first part
-shows ρ ≈ 0.7 halving variance; the second runs A/A tests with no real effect and stops at the first
-"significant" daily look.
+Runnable on Python 3.10+. The first part shows ρ ≈ 0.7 halving variance; the second runs A/A tests
+with no real effect and stops at the first "significant" daily look.
 
 ```python
-import math, random, statistics as st
+import math, random, statistics as st             # Python 3.10+ (statistics.covariance)
 
 random.seed(7)
 
@@ -257,30 +255,25 @@ def cuped(pre: list[float], post: list[float]) -> list[float]:
     mu = st.mean(pre)
     return [y - theta * (x - mu) for x, y in zip(pre, post)]
 
-# per-user minutes saved: last month's value predicts this month's (rho about 0.7)
-pre = [random.gauss(10, 3) for _ in range(20_000)]
-post = [0.7 * x + random.gauss(3, 3 * math.sqrt(1 - 0.7 ** 2)) for x in pre]
-adj = cuped(pre, post)
-print(f"rho={st.correlation(pre, post):.2f}  variance ratio={st.variance(adj) / st.variance(post):.2f}")
+pre = [random.gauss(10, 3) for _ in range(20_000)]          # last month's minutes saved per user
+post = [0.7 * x + random.gauss(3, 3 * math.sqrt(1 - 0.7 ** 2)) for x in pre]   # rho about 0.7
+print(round(st.variance(cuped(pre, post)) / st.variance(post), 2))  # about 0.51 = 1 - rho^2
 
-def peeking_false_positive_rate(n_tests=2000, days=14, users_per_day=200, p=0.6):
-    hits = 0
-    for _ in range(n_tests):                       # A/A tests: no real effect exists
-        xa = xb = na = nb = 0
-        for _ in range(days):
-            xa += sum(random.random() < p for _ in range(users_per_day)); na += users_per_day
-            xb += sum(random.random() < p for _ in range(users_per_day)); nb += users_per_day
-            pool = (xa + xb) / (na + nb)
-            z = (xb / nb - xa / na) / math.sqrt(pool * (1 - pool) * (1 / na + 1 / nb))
-            if abs(z) > 1.96:                      # stop at the first "significant" day
-                hits += 1
-                break
-    return hits / n_tests
+def aa_test_with_daily_peeks(days=14, users_per_day=200, p=0.6) -> bool:
+    xa = xb = n = 0                                # A/A test: no real effect exists
+    for _ in range(days):
+        n += users_per_day
+        xa += sum(random.random() < p for _ in range(users_per_day))
+        xb += sum(random.random() < p for _ in range(users_per_day))
+        pool = (xa + xb) / (2 * n)
+        if abs(xb - xa) / n / math.sqrt(pool * (1 - pool) * 2 / n) > 1.96:
+            return True                            # stopped at the first "significant" day
+    return False
 
-print(f"false-positive rate with daily peeks: {peeking_false_positive_rate():.2f}")
-# Prints rho=0.70, variance ratio about 0.51 (1 - 0.7^2), and a peeking false-positive rate
-# around 0.2: fourteen daily looks turn a nominal 5% error rate into roughly 1 in 5.
+print(sum(aa_test_with_daily_peeks() for _ in range(1000)) / 1000)  # about 0.2, not the nominal 0.05
 ```
+
+- **Reading it:** fourteen daily looks turn a nominal 5% error rate into roughly 1 in 5.
 
 ## Production patterns
 - **Deterministic salted bucketing with exposure logging.** Compute the bucket from user ID and a

@@ -282,7 +282,6 @@ A toy embedding and a scripted model let this run without keys; the pipeline is 
 
 ```python
 # pip install langchain-core numpy ; runs offline (toy embeddings, scripted model)
-from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_core.prompts import ChatPromptTemplate
@@ -298,29 +297,19 @@ class ToyEmbeddings(Embeddings):          # bag of words; use a real embedding m
     def embed_documents(self, texts):
         return [self.embed_query(t) for t in texts]
 
-store = InMemoryVectorStore(embedding=ToyEmbeddings())
-store.add_documents([
-    Document("Refunds: return items within 30 days of delivery.", metadata={"src": "policy.md"}),
-    Document("Shipping to the EU takes 5-7 business days.", metadata={"src": "shipping.md"}),
-])
+store = InMemoryVectorStore.from_texts(["Refunds: return items within 30 days of delivery.",
+                                        "Shipping to the EU takes 5-7 business days."], ToyEmbeddings())
 retriever = store.as_retriever(search_kwargs={"k": 1})      # a Runnable: str -> list[Document]
-
-def format_docs(docs):
-    return "\n".join(f"[{d.metadata['src']}] {d.page_content}" for d in docs)
+format_docs = lambda docs: "\n".join(d.page_content for d in docs)
 
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "Answer only from the context and cite the [source].\n\nContext:\n{context}"),
-    ("human", "{question}"),
-])
-llm = GenericFakeChatModel(messages=iter([AIMessage("Within 30 days of delivery [policy.md].")]))
+    ("system", "Answer only from the context.\n\nContext:\n{context}"), ("human", "{question}")])
+llm = GenericFakeChatModel(messages=iter([AIMessage("Within 30 days of delivery.")]))
 # real model: from langchain.chat_models import init_chat_model; llm = init_chat_model("openai:gpt-4o-mini")
 
-chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}   # dict runs both branches
-    | prompt | llm | StrOutputParser()
-)
-print(retriever.invoke("Can I return it after 20 days?")[0].metadata)   # {'src': 'policy.md'}
-print(chain.invoke("Can I return it after 20 days?"))
+chain = ({"context": retriever | format_docs, "question": RunnablePassthrough()}  # dict runs both branches
+         | prompt | llm | StrOutputParser())
+print(chain.invoke("Can I return it after 20 days?"))                      # Within 30 days of delivery.
 ```
 
 ### A tool-calling agent with `create_agent`
@@ -349,11 +338,10 @@ model = ScriptedModel(messages=iter([
 ]))
 # real model: model = "openai:gpt-4o-mini" (any provider string init_chat_model accepts)
 
-agent = create_agent(model, tools=[order_status],
-                     system_prompt="You are a support agent. Use tools; never guess order data.")
+agent = create_agent(model, tools=[order_status], system_prompt="Use tools; never guess order data.")
 result = agent.invoke({"messages": [{"role": "user", "content": "Where is order A-1001?"}]})
 for m in result["messages"]:
-    print(f"{m.type:>5}: {m.content or m.tool_calls}")
+    print(f"{m.type:>5}: {m.content or m.tool_calls}")   # human, ai (tool call), tool, ai
 print(order_status.args_schema.model_json_schema()["properties"])
 ```
 

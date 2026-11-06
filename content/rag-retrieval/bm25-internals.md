@@ -232,26 +232,20 @@ factor is 1.0 and each matching term adds its IDF (illustrative).
 
 ### Agent keyword tool that reports evidence, not raw scores
 The tool returns rank, a per-query normalized score and the matched terms, so the agent (and your traces)
-can see why a hit came back. It reuses the analyzer from the from-scratch example below.
+can see why a hit came back. It reuses the analyzer and index from the from-scratch example below.
 
 ```python
-import re
-
-analyze = lambda s: re.findall(r"[a-z0-9]+", s.lower())   # same analyzer as the index
-
 def keyword_search(query, docs, bm25, k=5):
-    """docs: {id: text}; bm25(query, doc_id) -> raw score."""
+    """docs: {id: text}; bm25(query, doc_id) -> raw score; analyze is the index's own analyzer."""
     raw = {d: bm25(query, d) for d in docs}
     ranked = [d for d in sorted(raw, key=raw.get, reverse=True) if raw[d] > 0][:k]
     if not ranked:
         return {"results": [], "note": "No keyword matches. Try synonyms or semantic_search."}
-    top = raw[ranked[0]]
     q_terms = set(analyze(query))
-    return {"results": [
-        {"id": d, "rank": i + 1,
-         "relative_score": round(raw[d] / top, 2),           # 1.0 = best for THIS query only
-         "matched_terms": sorted(q_terms & set(analyze(docs[d])))}
-        for i, d in enumerate(ranked)]}
+    return {"results": [{"id": d, "rank": i + 1,
+                         "relative_score": round(raw[d] / raw[ranked[0]], 2),   # 1.0 = best for THIS query only
+                         "matched_terms": sorted(q_terms & set(analyze(docs[d])))}
+                        for i, d in enumerate(ranked)]}
 ```
 
 ### BM25 from scratch
@@ -274,22 +268,17 @@ N, avgdl = len(docs), sum(dl.values()) / len(docs)
 df = Counter(term for c in tf.values() for term in c)        # documents containing each term
 
 def idf(term):                                               # Lucene form: +1 keeps it positive
-    n = df.get(term, 0)
-    return math.log((N - n + 0.5) / (n + 0.5) + 1)
+    return math.log((N - df[term] + 0.5) / (df[term] + 0.5) + 1)
 
 def bm25(query, d, k1=1.2, b=0.75):
-    score = 0.0
-    for term in analyze(query):
-        f = tf[d].get(term, 0)
-        if f == 0:
-            continue
-        length_factor = 1 - b + b * dl[d] / avgdl              # >1 for long docs, <1 for short
-        score += idf(term) * f * (k1 + 1) / (f + k1 * length_factor)
-    return score
+    length_factor = 1 - b + b * dl[d] / avgdl                # >1 for long docs, <1 for short
+    return sum(idf(t) * tf[d][t] * (k1 + 1) / (tf[d][t] + k1 * length_factor)
+               for t in analyze(query) if tf[d][t])
 
 for q in ["indemnification cap", "contract term", "the"]:
     ranked = sorted(docs, key=lambda d: -bm25(q, d))
     print(f"{q!r:24}", [(d, round(bm25(q, d), 2)) for d in ranked])
+print(keyword_search("indemnification cap", docs, bm25)["results"][0])  # A, rank 1, both terms matched
 ```
 
 - **"the"** scores every document low and nearly equally, because it appears in all three.
@@ -303,17 +292,10 @@ pieces for one hit.
 ```json
 PUT /manuals
 {
-  "settings": {
-    "index": {
-      "similarity": { "short_sections": { "type": "BM25", "k1": 1.2, "b": 0.3 } }
-    }
-  },
-  "mappings": {
-    "properties": {
-      "title": { "type": "text" },
-      "body":  { "type": "text", "similarity": "short_sections" }
-    }
-  }
+  "settings": { "index": { "similarity": { "short_sections": { "type": "BM25", "k1": 1.2, "b": 0.3 } } } },
+  "mappings": { "properties": {
+    "title": { "type": "text" },
+    "body":  { "type": "text", "similarity": "short_sections" } } }
 }
 
 GET /manuals/_search

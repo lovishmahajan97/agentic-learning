@@ -219,8 +219,8 @@ flowchart TD
 
 ## Examples
 ### Small-to-big: match sentences, return sections
-Sentence-level matching and section-level return with a local embedding model. Each sentence carries a
-`parent` pointer; parents are deduplicated and scored by their best sentence.
+Sentence-level matching and section-level return with a local embedding model. Each sentence carries its
+parent section id; parents are deduplicated and scored by their best sentence.
 
 ```python
 import re, numpy as np
@@ -234,29 +234,24 @@ sections = {
     "support/hours": "Support operates on weekdays. Enterprise plans include weekend coverage.",
 }
 model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+units = [(sid, s) for sid, text in sections.items() for s in re.split(r"(?<=[.!?])\s+", text)]
+E = model.encode([s for _, s in units], normalize_embeddings=True)   # one vector per sentence
 
-units, parent = [], []
-for sid, text in sections.items():
-    for sent in re.split(r"(?<=[.!?])\s+", text.strip()):
-        units.append(sent); parent.append(sid)
-E = model.encode(units, normalize_embeddings=True)          # one vector per sentence
-
-def retrieve(query: str, k_units: int = 6, k_parents: int = 2):
-    q = model.encode([query], normalize_embeddings=True)[0]
-    scores = E @ q                                             # cosine on unit vectors
+def retrieve(query, k_units=6, k_parents=2):
+    scores = E @ model.encode([query], normalize_embeddings=True)[0]  # cosine on unit vectors
     best = {}
-    for i in np.argsort(-scores)[:k_units]:                   # match small ...
-        p = parent[i]
-        best[p] = max(best.get(p, -1.0), float(scores[i]))     # ... dedupe and score parents by max child
-    ranked = sorted(best.items(), key=lambda kv: -kv[1])[:k_parents]
-    return [(p, round(s, 3), sections[p]) for p, s in ranked]  # ... return big
+    for i in np.argsort(-scores)[:k_units]:                           # match small ...
+        sid = units[i][0]
+        best[sid] = max(best.get(sid, -1.0), float(scores[i]))        # ... score parent by best child
+    return sorted(best.items(), key=lambda kv: -kv[1])[:k_parents]
 
-for hit in retrieve("how much can fees be capped at?"):
-    print(hit)
-# Ran with sentence-transformers 6.2.0: "billing/caps" first (0.841), "billing/invoicing" second.
-# The best child is "Fees are capped per contract year", not the twelve-months sentence, which is why
-# returning the section matters: the generator still gets the figure and the tax exclusion.
+for sid, score in retrieve("how much can fees be capped at?"):
+    print(sid, round(score, 3), "->", sections[sid])                  # ... return big
+# billing/caps 0.841 first, billing/invoicing 0.653 second (sentence-transformers 6.2.0)
 ```
+
+The best child is "Fees are capped per contract year", not the twelve-months sentence, which is why
+returning the section matters: the generator still gets the figure and the tax exclusion.
 
 ### Agent scenario: search snippets plus a read tool
 Two tools built on the index above. The agent decides which hits deserve the full parent.
@@ -276,7 +271,7 @@ def run_tool(name, args):
     if name == "search":
         q = model.encode([args["query"]], normalize_embeddings=True)[0]
         top = np.argsort(-(E @ q))[:5]
-        return "\n".join(f"{parent[i]}: {units[i]}" for i in top)
+        return "\n".join(f"{units[i][0]}: {units[i][1]}" for i in top)
     if name == "read_section":
         return sections.get(args["section_id"], "Unknown section_id.")
 ```
@@ -290,7 +285,6 @@ Return the parent when evidence is concentrated, the children when it is scatter
 
 ```python
 def auto_merge(child_hits, children_of, ratio=0.5):
-    """Replace a parent's retrieved children with the parent when enough of them matched."""
     out = {}
     for pid, kids in children_of.items():
         hit = [c for c in kids if c in child_hits]

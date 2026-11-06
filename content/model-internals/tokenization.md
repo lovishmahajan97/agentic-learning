@@ -174,7 +174,7 @@ flowchart TD
 
 ## Examples
 ### A BPE trainer and encoder in about thirty lines
-A complete, runnable BPE trainer and encoder in about thirty lines. The corpus is tiny so you can trace
+A runnable BPE trainer and encoder. The corpus is tiny so you can trace
 the merges by hand; the mechanism is identical to what produced GPT-2's 50k merges.
 
 ```python
@@ -183,17 +183,10 @@ from collections import Counter
 corpus = "low low low lower lower lowest newer newer newest wider widest".split()
 words = Counter(tuple(w) + ("</w>",) for w in corpus)      # symbols per word, with end-of-word marker
 
-def pair_stats(words):
-    stats = Counter()
-    for sym, freq in words.items():
-        for a, b in zip(sym, sym[1:]):
-            stats[(a, b)] += freq
-    return stats
-
 def apply_merge(seq, pair):
     out, i = [], 0
     while i < len(seq):
-        if i < len(seq) - 1 and (seq[i], seq[i + 1]) == pair:
+        if tuple(seq[i:i + 2]) == pair:
             out.append(pair[0] + pair[1]); i += 2
         else:
             out.append(seq[i]); i += 1
@@ -201,19 +194,18 @@ def apply_merge(seq, pair):
 
 merges = []
 for step in range(8):                                        # vocab = base symbols + 8 merges
-    stats = pair_stats(words)
+    stats = Counter()
+    for sym, freq in words.items():
+        for pair in zip(sym, sym[1:]): stats[pair] += freq
     best = max(stats, key=stats.get)                         # most frequent adjacent pair
     merges.append(best)
     words = Counter({tuple(apply_merge(list(s), best)): f for s, f in words.items()})
     print(step, best, stats[best])
 # 0 ('l','o') 6 | 1 ('lo','w') 6 | 2 ('e','r') 5 | 3 ('er','</w>') 5 | 4 ('low','</w>') 3 | ...
-
-def encode(word):                                            # apply merges in learned order
+def encode(word):                                            # replay merges in learned order
     seq = list(word) + ["</w>"]
-    for pair in merges:
-        seq = apply_merge(seq, pair)
+    for pair in merges: seq = apply_merge(seq, pair)
     return seq
-
 print(encode("lowest"), encode("slowest"))
 # ['low', 'est</w>'] ['s', 'low', 'est</w>']  <- unseen "slowest" still encodes, no <unk>
 ```
@@ -230,23 +222,17 @@ it against the usage fields.
 import json, tiktoken
 
 enc = tiktoken.get_encoding("cl100k_base")       # use the tokenizer of the model you actually call
-tools = [
-    {"name": "search_orders", "description": "Find a customer's orders by email or order id.",
-     "parameters": {"type": "object", "properties": {
-         "email": {"type": "string"}, "order_id": {"type": "string"}}}},
-    {"name": "refund_order", "description": "Refund an order. Requires order_id and reason.",
-     "parameters": {"type": "object", "properties": {
-         "order_id": {"type": "string"}, "reason": {"type": "string"}},
-         "required": ["order_id", "reason"]}},
-]
+tool = {"name": "refund_order", "description": "Refund an order. Requires order_id and reason.",
+        "parameters": {"type": "object", "properties": {
+            "order_id": {"type": "string"}, "reason": {"type": "string"}},
+            "required": ["order_id", "reason"]}}
 
-schema_tokens = sum(len(enc.encode(json.dumps(t))) for t in tools)
-uuid_tokens = len(enc.encode("3f2b8c1e-9a4d-4e7b-8f21-6c0d5a9e7b13"))
-steps, n_tools = 12, 40                           # a 12-step run with 40 similar tools
-print(f"2 tools: {schema_tokens} tokens; one UUID: {uuid_tokens} tokens")
-print(f"~{schema_tokens / 2 * n_tools * steps:,.0f} schema tokens per run before any caching")
-# 2 tools: 119 tokens; one UUID: 34 tokens
-# ~28,560 schema tokens per run before any caching
+per_tool = len(enc.encode(json.dumps(tool)))
+uuid = len(enc.encode("3f2b8c1e-9a4d-4e7b-8f21-6c0d5a9e7b13"))
+print(f"one tool: {per_tool} tokens; one UUID: {uuid} tokens")
+print(f"40 tools x 12 steps: ~{per_tool * 40 * 12:,} schema tokens before caching")
+# one tool: 65 tokens; one UUID: 34 tokens
+# 40 tools x 12 steps: ~31,200 schema tokens before caching
 ```
 
 - **Reading the output:** a UUID costs 34 tokens, nearly one per character instead of the ~9 that 36

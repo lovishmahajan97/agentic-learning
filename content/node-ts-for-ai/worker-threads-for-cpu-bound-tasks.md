@@ -367,63 +367,34 @@ flowchart TD
 ```
 
 ## Examples
-### A minimal pool for top-k similarity
-A minimal pool that dispatches top-k cosine-similarity jobs to workers, transferring the query vector instead
-of cloning it.
-
-The embedding matrix lives in a `SharedArrayBuffer`: passing an ordinary `Float32Array` as
-`workerData` would structured-clone the whole ~1.2 GB matrix into every worker. The worker file and the pool
-live in separate modules; this listing shows both with the worker guarded by `isMainThread`.
-
-The idle workers keep the process alive after the result prints, so a real pool needs a `close()` that
-calls `worker.terminate()` on shutdown.
+### Share the matrix, transfer the query
+One worker scores a query against an embedding matrix. The matrix lives in a `SharedArrayBuffer`, so the
+worker reads the same memory instead of a clone; the query goes in the transfer list, so it moves in O(1)
+and is detached on the main thread. Save as `topk.ts` and run `node topk.ts` (Node 22.18+ strips types).
 
 ```ts
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
-import { availableParallelism } from "node:os";
-
-type Job = { query: Float32Array; k: number };
-type Hit = { index: number; score: number };
 
 if (!isMainThread) {
-  const vectors = workerData.vectors as Float32Array;      // flattened [n, dim], L2-normalised, shared
-  const dim = workerData.dim as number;
-  parentPort!.on("message", ({ query, k }: Job) => {
-    const hits: Hit[] = [];
-    for (let i = 0, n = vectors.length / dim; i < n; i++) {
-      let dot = 0;                                          // dot of unit vectors = cosine
+  const { vectors, dim } = workerData as { vectors: Float32Array; dim: number }; // shared, not cloned
+  parentPort!.on("message", (query: Float32Array) => {
+    let best = -1, bestScore = -Infinity;
+    for (let i = 0; i < vectors.length / dim; i++) {
+      let dot = 0;                                          // = cosine once rows are L2-normalised
       for (let d = 0; d < dim; d++) dot += query[d]! * vectors[i * dim + d]!;
-      hits.push({ index: i, score: dot });
+      if (dot > bestScore) { bestScore = dot; best = i; }
     }
-    hits.sort((a, b) => b.score - a.score);
-    parentPort!.postMessage(hits.slice(0, k));             // small result: cloning is fine
+    parentPort!.postMessage({ best, bestScore });          // small result: cloning is fine
   });
 } else {
-  class Pool {                                              // minimal: no crash replacement
-    private idle: Worker[] = []; private queue: Array<() => void> = [];
-    constructor(file: URL, data: unknown, size = Math.max(1, availableParallelism() - 1)) {
-      for (let i = 0; i < size; i++) this.idle.push(new Worker(file, { workerData: data }));
-    }
-    run(job: Job): Promise<Hit[]> {
-      return new Promise((resolve, reject) => {
-        const start = () => {
-          const w = this.idle.pop()!;
-          const onError = (e: Error) => { w.off("message", onMsg); reject(e); };
-          const onMsg = (hits: Hit[]) => {
-            w.off("error", onError); this.idle.push(w); this.queue.shift()?.(); resolve(hits);
-          };
-          w.once("message", onMsg).once("error", onError);
-          w.postMessage(job, [job.query.buffer as ArrayBuffer]); // transfer: O(1), query detached here
-        };
-        this.idle.length ? start() : this.queue.push(start);
-      });
-    }
-  }
-  const dim = 1536, n = 200_000;                            // 200k x 1536 x 4 B = ~1.2 GB
-  const vectors = new Float32Array(new SharedArrayBuffer(n * dim * 4)); // shared, not cloned per worker
-  const pool = new Pool(new URL(import.meta.url), { vectors, dim });
-  const hits = await pool.run({ query: new Float32Array(dim).fill(0.01), k: 5 });
-  console.log(hits[0]);                                    // main loop stayed free to serve streams
+  const dim = 1536, n = 10_000;
+  const vectors = new Float32Array(new SharedArrayBuffer(n * dim * 4)).fill(0.01);
+  vectors[42 * dim] = 1;                                   // make row 42 the best match
+  const w = new Worker(new URL(import.meta.url), { workerData: { vectors, dim } });
+  const query = new Float32Array(dim).fill(0.01);
+  w.postMessage(query, [query.buffer as ArrayBuffer]);     // transfer: O(1), detached here
+  console.log(query.length);                               // 0
+  w.once("message", (r) => { console.log(r); w.terminate(); }); // { best: 42, bestScore: ~0.1635 }
 }
 ```
 
@@ -493,6 +464,9 @@ Illustrative numbers for an ingestion service that also answers chat.
   accidental large clones.
 - **Tag worker telemetry.** Include the worker's `threadId` and the job id in every log line, and propagate the
   trace id in the job message, since workers have their own globals.
+- **Close the pool on shutdown.** Idle workers keep the process alive, so a pool needs a `close()` that calls
+  `worker.terminate()` on each worker; and never pass a large ordinary `Float32Array` as `workerData`, since
+  it is structured-cloned into every worker (a 1.2 GB matrix times the pool size).
 
 ## Trade-offs
 - **Parallelism vs memory.** Workers give true parallelism for JavaScript on multi-core machines, but every

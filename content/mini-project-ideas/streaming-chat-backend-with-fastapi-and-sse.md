@@ -305,49 +305,29 @@ import json, os
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
-from pydantic import BaseModel
 
-app = FastAPI()
-client = AsyncOpenAI()
-MODEL = os.environ.get("CHAT_MODEL", "set-me")
-
-class ChatIn(BaseModel):
-    conversation_id: str
-    message: str
+app, client = FastAPI(), AsyncOpenAI()
 
 def sse(event: str, data: dict, eid: int) -> str:
-    return f"id: {eid}\nevent: {event}\ndata: {json.dumps(data)}\n\n"
+    return f"id: {eid}\nevent: {event}\ndata: {json.dumps(data)}\n\n"    # the blank line ends the event
 
 async def stream_tokens(messages):
-    stream = await client.chat.completions.create(model=MODEL, messages=messages, stream=True)
+    stream = await client.chat.completions.create(model=os.environ["CHAT_MODEL"], messages=messages, stream=True)
     async for chunk in stream:
         if chunk.choices and chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
 
 @app.post("/chat")
-async def chat(body: ChatIn, request: Request):
-    messages = [{"role": "user", "content": body.message}]      # load history from your DB here
-
+async def chat(body: dict, request: Request):    # {"conversation_id", "message"}
     async def events():
-        eid, parts, status = 0, [], "interrupted"      # stays interrupted unless the loop finishes
-        yield sse("start", {"conversation_id": body.conversation_id}, eid)
-        try:
-            async for text in stream_tokens(messages):
-                if await request.is_disconnected():
-                    break
-                eid += 1
-                parts.append(text)
-                yield sse("token", {"text": text}, eid)
-            else:
-                status = "complete"                     # the stream ended without a break
-        except Exception:
-            status = "error"
-            yield sse("error", {"code": "upstream_failed"}, eid + 1)
-        finally:
-            pass  # save "".join(parts) with status here; finally also runs when the server closes the stream
-        if status == "complete":
-            yield sse("done", {"chars": sum(map(len, parts))}, eid + 1)
-
+        parts = []
+        yield sse("start", {"conversation_id": body["conversation_id"]}, 0)
+        async for text in stream_tokens([{"role": "user", "content": body["message"]}]):
+            if await request.is_disconnected():
+                return                                   # client left: stop, and send no done
+            parts.append(text)
+            yield sse("token", {"text": text}, len(parts))
+        yield sse("done", {"chars": sum(map(len, parts))}, len(parts) + 1)
     return StreamingResponse(events(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 ```
@@ -396,6 +376,11 @@ async def test_events_in_order(monkeypatch):
   final status on one trace, and alert on the share of `interrupted` and `error` turns.
 - **Portfolio polish.** A README with the event table and a curl example, the ordering and disconnect
   tests in CI, a GIF of the UI streaming a tool step, and a Dockerfile with an nginx config.
+- **Report upstream failures as an `error` event.** Once streaming starts the status is already 200, so
+  catch exceptions inside the generator, emit `event: error` with a code, and save the turn with status
+  `error` (or `interrupted` on disconnect) in a `finally` block.
+- **Type the request body.** Declare a Pydantic model (`conversation_id`, `message`) instead of a plain
+  `dict`, so a malformed request gets a 422 before any tokens are spent.
 
 ## Trade-offs
 - **SSE vs WebSockets.** SSE is one-way over plain HTTP, works with standard auth and proxies, and the

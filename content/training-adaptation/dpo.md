@@ -170,34 +170,22 @@ flowchart TD
 
 ## Examples
 ### The DPO loss from sequence log-probs
-Reference log-probs are precomputed. Shapes are `[batch]` after summing per-token log-probs over
-response tokens; the helper shows the masked sum.
+Inputs are sequence log-probs (per-token log-probs summed over response tokens only) of the chosen (w)
+and rejected (l) responses under the policy and the frozen reference.
 
 ```python
 import torch, torch.nn.functional as F
 
-def seq_logprob(logits, ids, response_mask):
-    """Sum of log p(token) over response tokens. logits [B,T,V], ids [B,T], mask [B,T] (1 on response)."""
-    lp = torch.log_softmax(logits[:, :-1].float(), -1).gather(-1, ids[:, 1:, None])[..., 0]
-    return (lp * response_mask[:, 1:]).sum(-1)                          # [B]
-
 def dpo_loss(pol_w, pol_l, ref_w, ref_l, beta=0.1):
-    """pol_*/ref_*: sequence log-probs of chosen (w) and rejected (l) under policy / reference."""
     margin = beta * ((pol_w - ref_w) - (pol_l - ref_l))                 # implicit reward margin
-    loss = -F.logsigmoid(margin).mean()
-    reward_acc = (margin > 0).float().mean()                            # fraction of pairs ranked right
-    return loss, margin, reward_acc
+    return -F.logsigmoid(margin).mean(), margin
 
 # One pair, numbers illustrative. Policy has drifted toward chosen and away from rejected.
 pol_w, ref_w = torch.tensor([-40.0]), torch.tensor([-42.0])            # chosen: +2 nats vs reference
 pol_l, ref_l = torch.tensor([-35.0]), torch.tensor([-33.0])            # rejected: -2 nats vs reference
-loss, margin, acc = dpo_loss(pol_w, pol_l, ref_w, ref_l)
-print(f"margin={margin.item():.2f} loss={loss.item():.3f} reward_acc={acc.item():.0%}")
-# margin = 0.1 * (2 - (-2)) = 0.40 ; loss = -log sigma(0.40) = 0.513 ; accuracy 100%
-
-# Watch during training: loss falling, reward_acc rising toward ~0.7-0.9 on a held-out set,
-# and chosen log-prob (pol_w) NOT falling steadily. If pol_w drops while margin grows,
-# probability mass is leaving both responses: likelihood displacement.
+loss, margin = dpo_loss(pol_w, pol_l, ref_w, ref_l)
+print(f"margin={margin.item():.2f} loss={loss.item():.3f}")
+# margin=0.40 loss=0.513   (0.1 * (2 - (-2)) = 0.40 ; -log sigma(0.40) = 0.513)
 ```
 
 - **Note the scale.** A 4-nat total swing across responses of dozens of tokens is a small per-token
@@ -221,39 +209,31 @@ Preference probability is σ(β × log-ratio margin). Computed for the 4-nat swi
 
 ### Turning agent runs into DPO pairs
 Two runs of the same task that share a history and then diverge make a natural pair: the shared prefix
-is the prompt, and each run's first diverging assistant turn is chosen or rejected. The output is the conversational
-prompt / chosen / rejected format TRL's DPO trainer accepts.
+is the prompt, and each run's first diverging assistant turn is chosen or rejected. The output is the
+conversational prompt / chosen / rejected format TRL's DPO trainer accepts.
 
 ```python
-def shared_prefix(a, b):
-    n = 0
-    while n < min(len(a), len(b)) and a[n] == b[n]:
-        n += 1
-    return n
-
 def runs_to_pair(run_good, run_bad):
-    """Each run is a list of chat messages. Pair only the first diverging step, and only if both
-    sides of it are assistant turns (a tool result that differed is not the agent's decision)."""
-    n = shared_prefix(run_good, run_bad)
-    if n == min(len(run_good), len(run_bad)):
-        return None                                   # the runs never diverge
-    if run_good[n]["role"] != "assistant" or run_bad[n]["role"] != "assistant":
-        return None
+    """Pair only the first diverging step, and only if both sides are assistant turns."""
+    n = 0
+    while n < min(len(run_good), len(run_bad)) and run_good[n] == run_bad[n]:
+        n += 1
+    if n == min(len(run_good), len(run_bad)) or run_good[n]["role"] != "assistant" \
+            or run_bad[n]["role"] != "assistant":
+        return None                       # never diverge, or a tool result differed, not the agent
     return {"prompt": run_good[:n], "chosen": [run_good[n]], "rejected": [run_bad[n]]}
 
-history = [{"role": "system", "content": "Support agent. Tools: get_order, refund."},
-           {"role": "user", "content": "Refund order A-1042, it arrived broken."}]
+history = [{"role": "user", "content": "Refund order A-1042, it arrived broken."}]
 good = history + [{"role": "assistant", "content": "", "tool_calls": [{"type": "function",
                    "function": {"name": "refund", "arguments": {"order_id": "A-1042"}}}]}]
-bad = history + [{"role": "assistant", "content": "Could you confirm your order number?"}]  # needless ask
-
+bad = history + [{"role": "assistant", "content": "Could you confirm your order number?"}]
 pair = runs_to_pair(good, bad)
-call = pair["chosen"][0]["tool_calls"][0]["function"]["name"]
-print(len(pair["prompt"]), "shared messages; chosen calls", call, "| rejected:", pair["rejected"][0]["content"])
-# 2 shared messages; chosen calls refund | rejected: Could you confirm your order number?
-# Label which run is better with users, experts or a calibrated judge. Only the step where they diverge
-# is kept, so the pair isolates one decision and contains no tool-result tokens to score.
+print(pair["chosen"][0]["tool_calls"][0]["function"]["name"], "|", pair["rejected"][0]["content"])
+# refund | Could you confirm your order number?
 ```
+
+Label which run is better with users, experts or a calibrated judge. Only the step where they diverge is
+kept, so the pair isolates one decision and contains no tool-result tokens to score.
 
 ### Production run with TRL
 A typical first round on the SFT checkpoint. Argument names follow recent TRL releases; check your
@@ -270,15 +250,12 @@ tok = AutoTokenizer.from_pretrained(name)
 pairs = load_dataset("json", data_files="pairs.jsonl", split="train")   # prompt / chosen / rejected
 split = pairs.train_test_split(test_size=0.05, seed=0)
 
-args = DPOConfig(
-    output_dir="dpo-round1",
-    beta=0.1,                        # the KL leash
-    num_train_epochs=1,              # small pair sets overfit fast
-    learning_rate=5e-7,              # far below SFT rates; tune per model
-    per_device_train_batch_size=4,
-    precompute_ref_log_probs=True,   # reference scored once, not every step
-    eval_strategy="steps", eval_steps=100,
-)
+args = DPOConfig(output_dir="dpo-round1",
+                 beta=0.1,                        # the KL leash
+                 num_train_epochs=1,              # small pair sets overfit fast
+                 learning_rate=5e-7,              # far below SFT rates; tune per model
+                 eval_strategy="steps", eval_steps=100,   # held-out reward accuracy
+                 precompute_ref_log_probs=True)   # reference scored once, not every step
 trainer = DPOTrainer(model=model, ref_model=None,   # None: TRL builds the frozen reference itself
                      args=args, train_dataset=split["train"], eval_dataset=split["test"],
                      processing_class=tok)
@@ -317,6 +294,10 @@ The length creep is the warning sign to check the chosen-to-rejected length rati
 - **Audit length before training.** Compute the chosen-to-rejected length ratio over the dataset and the
   share of pairs where chosen is longer. If it is heavily skewed, rebalance pairs or try SimPO, and
   monitor mean output length every round.
+- **Sum log-probs over response tokens only, in fp32.** Mask prompt and padding tokens out of the
+  sequence log-prob and upcast logits before `log_softmax`; TRL does this for you, a hand-written loss must.
+- **Expect held-out reward accuracy around 0.7 to 0.9.** It is the fraction of held-out pairs with a
+  positive implicit reward margin.
 
 ## Trade-offs
 - **Cheap and stable vs offline.** One trainable model and a cached reference instead of four networks

@@ -208,40 +208,31 @@ numpy 2.0 and stubbed models).
 ```python
 import time, numpy as np
 
-store = []                                       # [{user, text, vec, ts, source, kind}]
+store = []                                       # [{user, text, vec, ts}]
 
 def embed(text):                                 # any embedding model; returns unit vector
     v = np.asarray(embedding_model(text), dtype=float)
     return v / np.linalg.norm(v)
 
 def write_memories(user_id, transcript):
-    facts = llm_json(f"From this conversation extract durable facts about the user or their "
-                     f"environment as a JSON list of short statements. Ignore chit-chat.\n{transcript}")
-    for f in facts:
-        vec = embed(f)
-        mine = [m for m in store if m["user"] == user_id]
+    for f in llm_json(f"List durable facts about the user as a JSON list of strings.\n{transcript}"):
+        vec, mine = embed(f), [m for m in store if m["user"] == user_id]
         near = max(mine, key=lambda m: float(vec @ m["vec"]), default=None)
         if near is not None and float(vec @ near["vec"]) > 0.92:   # threshold is model-specific
             near.update(text=f, vec=vec, ts=time.time())  # crude "newest wins" supersede
-            continue
-        store.append({"user": user_id, "text": f, "vec": vec, "ts": time.time(),
-                      "source": "user_conversation", "kind": "semantic"})
+        else:
+            store.append({"user": user_id, "text": f, "vec": vec, "ts": time.time()})
 
 def recall(user_id, query, k=5, half_life_days=30):
     q = embed(query)
-    scored = []
-    for m in store:
-        if m["user"] != user_id:                 # scope first: never cross users
-            continue
-        age_days = (time.time() - m["ts"]) / 86400
-        recency = 0.5 ** (age_days / half_life_days)
-        scored.append((0.8 * float(q @ m["vec"]) + 0.2 * recency, m))
-    top = sorted(scored, key=lambda s: -s[0])[:k]
+    def rank(m):
+        recency = 0.5 ** ((time.time() - m["ts"]) / 86400 / half_life_days)
+        return 0.8 * float(q @ m["vec"]) + 0.2 * recency
+    mine = [m for m in store if m["user"] == user_id]       # scope first: never cross users
     return "\n".join(f"- ({time.strftime('%Y-%m-%d', time.localtime(m['ts']))}) {m['text']}"
-                     for _, m in top)
+                     for m in sorted(mine, key=rank, reverse=True)[:k])
 
-system = "You are a deployment assistant.\n\nKnown about this user (may be stale):\n" \
-         + recall("u42", "help me ship the payments service")
+system = "Known about this user (may be stale):\n" + recall("u42", "help me ship the payments service")
 ```
 
 - **Illustrative values:** the weights, the 0.92 threshold and the half-life. Copy the shape: scope by
@@ -255,29 +246,24 @@ system = "You are a deployment assistant.\n\nKnown about this user (may be stale
   win; the update-policy lesson uses an explicit add/update/ignore decision that keeps history for audit.
 
 ### Episodic scoring: why the importance term matters
-Pure Python; runs as is. The decay, weights and ratings are illustrative.
+Pure Python; runs as is. The decay and ratings are illustrative; all three terms are weighted 1.
 
 ```python
 DECAY = 0.995                       # per hour since last access (illustrative)
-W_REL, W_REC, W_IMP = 1.0, 1.0, 1.0
 
-episodes = [  # relevance would come from cosine(embed(q), embed(m)); fixed here for clarity
-    {"text": "prod database deleted by a migration, restored from backup", "rel": 0.55,
-     "hours_since_access": 24 * 40, "importance": 10},
-    {"text": "user said thanks after the deploy", "rel": 0.50, "hours_since_access": 2, "importance": 1},
-    {"text": "deploy failed: missing env var PAYMENTS_KEY", "rel": 0.80,
-     "hours_since_access": 24 * 6, "importance": 7},
+episodes = [  # rel would come from cosine(embed(q), embed(m)); fixed here for clarity
+    {"text": "prod database deleted by a migration", "rel": 0.55, "hours": 24 * 40, "importance": 10},
+    {"text": "user said thanks after the deploy", "rel": 0.50, "hours": 2, "importance": 1},
+    {"text": "deploy failed: missing env var", "rel": 0.80, "hours": 24 * 6, "importance": 7},
 ]
 
 def score(m, use_importance=True):
-    recency = DECAY ** m["hours_since_access"]
     importance = (m["importance"] - 1) / 9          # 1-10 rating rescaled to [0, 1]
-    return W_REL * m["rel"] + W_REC * recency + (W_IMP * importance if use_importance else 0)
+    return m["rel"] + DECAY ** m["hours"] + (importance if use_importance else 0)
 
 for flag in (False, True):
     ranked = sorted(episodes, key=lambda m: -score(m, flag))
-    print("with importance" if flag else "without importance",
-          [f"{m['text'][:28]} ({score(m, flag):.2f})" for m in ranked])
+    print([f"{m['text']} {score(m, flag):.2f}" for m in ranked])
 # without importance: "user said thanks" ranks first (1.49), the deleted database last (0.56)
 # with importance:    deploy failure 1.95, deleted database 1.56, thanks 1.49
 ```

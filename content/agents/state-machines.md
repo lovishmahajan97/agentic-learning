@@ -171,82 +171,56 @@ stateDiagram-v2
 
 ## Examples
 ### A bug-fix agent as a small machine
-- **Per-state tools:** the model sees only its state's tools; the table decides what each call means.
-- **PROPOSE has no model tools.** Its event comes from outside (a reviewer approves or rejects), because
-  a plan the model approves itself is not reviewed.
-- **Legality is checked *before* the tool executes**, so a rejected call has no side effect.
+- **Per-state tools:** the model may only call its state's tools; the table decides what each call means.
+- **PROPOSE has no model tools.** Its `approve` or `reject` event comes from a reviewer, because a plan
+  the model approves itself is not reviewed.
+- **Legality and the guard are checked before anything changes,** so a rejected call has no effect; in a
+  live loop, run these checks before executing the tool.
 - **An edit clears `tests_passed`**, so a stale pass cannot satisfy the guard.
-- **Bounded failure:** the third retry and repeated illegal calls end in FAILED; the rejection count is
-  checkpointed, so a crash cannot reset it.
-- **Simplification:** on resume the model is re-asked and may pick a different call under the same
-  per-step key; production checkpoints the pending call first and replays it.
+- **Left out for brevity:** the retry and rejection counters, and checkpointing the pending call so a
+  resume replays it; Production patterns covers both.
 
 ```python
-from enum import Enum
-from pydantic import BaseModel        # checked with pydantic 2.14 on Python 3.12 (needs 3.10+ for `str | None`)
+from dataclasses import dataclass
 
-class S(str, Enum):
-    INVESTIGATE = "investigate"; PROPOSE = "propose"; APPLY = "apply"
-    VERIFY = "verify"; DONE = "done"; FAILED = "failed"
+TOOLS = {"investigate": ["read_file", "submit_plan"],
+         "apply": ["edit_file", "run_tests"], "verify": ["finish", "retry"]}
+TABLE = {("investigate", "submit_plan"): "propose", ("propose", "approve"): "apply",
+         ("propose", "reject"): "investigate", ("apply", "run_tests"): "verify",
+         ("verify", "retry"): "apply", ("verify", "finish"): "done",
+         ("verify", "attempts_exhausted"): "failed"}    # harness event: bounded retries end here
 
-class Data(BaseModel):
-    plan: str | None = None
+@dataclass
+class Data:
     tests_passed: bool = False
-    attempts: int = 0
 
-TOOLS = {S.INVESTIGATE: ["read_file", "grep", "submit_plan"],
-         S.APPLY: ["edit_file", "run_tests"], S.VERIFY: ["read_file", "finish", "retry"]}
-TABLE = {(S.INVESTIGATE, "submit_plan"): S.PROPOSE, (S.PROPOSE, "approve"): S.APPLY,
-         (S.PROPOSE, "reject"): S.INVESTIGATE, (S.APPLY, "run_tests"): S.VERIFY,
-         (S.VERIFY, "retry"): S.APPLY, (S.VERIFY, "finish"): S.DONE}
-
-def check(state: S, event: str, d: Data) -> None:      # runs BEFORE any side effect
-    if event not in TOOLS[state]:
-        raise ValueError(f"{event} is not allowed in {state.value}")
-    if TABLE.get((state, event)) is S.DONE and not d.tests_passed:   # guard lives in code
+def step(state, event, d, result=None):
+    if event not in TOOLS.get(state, []):
+        raise ValueError(f"{event} is not allowed in {state}")
+    if TABLE.get((state, event)) == "done" and not d.tests_passed:   # guard lives in code
         raise ValueError("cannot finish: tests have not passed")
+    if event == "edit_file": d.tests_passed = False     # an edit makes the old pass stale
+    if event == "run_tests": d.tests_passed = result
+    return TABLE.get((state, event), state)             # non-phase tools self-loop
 
-def run(model, reviewer, execute, store, run_id, max_rejections=5):
-    state, d, step, rejections = store.load(run_id) or (S.INVESTIGATE, Data(), 0, 0)
-    feedback = None
-    while state not in (S.DONE, S.FAILED):
-        if state is S.PROPOSE:                       # external event: a reviewer decides, not the model
-            state = TABLE[(state, reviewer(d.plan))]   # "approve" or "reject"
-        else:
-            call = model.next_action(state, d, tools=TOOLS[state], feedback=feedback)
-            try:
-                check(state, call.name, d); feedback = None
-            except ValueError as e:                  # reject, tell the model why, re-prompt
-                rejections, feedback = rejections + 1, str(e)
-                state = S.FAILED if rejections >= max_rejections else state
-                store.save(run_id, state, d, step, rejections); continue
-            result = execute(call, idempotency_key=f"{run_id}:{step}")   # same key if re-run after a crash
-            if call.name == "edit_file": d.tests_passed = False          # an edit makes the old result stale
-            if call.name == "run_tests": d.tests_passed = result.ok
-            if call.name == "submit_plan": d.plan = call.args["plan"]
-            d.attempts += call.name == "retry"
-            state = (S.FAILED if d.attempts >= 3       # bounded retry ends in a terminal state
-                     else TABLE.get((state, call.name), state))   # non-phase tools self-loop
-        step += 1
-        store.save(run_id, state, d, step, rejections)     # checkpoint after every transition
-    return state
+d = Data(tests_passed=True)                  # a pass recorded before one more tweak
+s = step("apply", "edit_file", d)            # clears tests_passed
+s = step(s, "run_tests", d, result=False)    # -> verify
+try:
+    step(s, "finish", d)
+except ValueError as e:
+    print(s, "|", e)                         # verify | cannot finish: tests have not passed
 ```
 
 ### Unit-testing the machine without a model
-Runs as-is. Because the table is data, termination, guard coverage and tool placement are plain asserts
-you can put in CI.
+Append to the example above. Because the table is data, termination, guard coverage and tool placement
+are plain asserts you can put in CI.
 
 ```python
 from collections import deque
 
 TERMINAL = {"done", "failed"}
-TABLE = {("investigate", "submit_plan"): "propose", ("propose", "approve"): "apply",
-         ("propose", "reject"): "investigate", ("apply", "run_tests"): "verify",
-         ("verify", "retry"): "apply", ("verify", "finish"): "done",
-         ("verify", "attempts_exhausted"): "failed"}
 GUARDED = {("verify", "finish")}                 # transitions that must have a guard in code
-TOOLS = {"investigate": ["read_file", "grep", "submit_plan"],
-         "apply": ["edit_file", "run_tests"], "verify": ["read_file", "finish", "retry"]}
 CONSEQUENTIAL = {"edit_file"}
 
 def reachable(start):
@@ -296,6 +270,11 @@ A guard that reads a fact nobody clears. Each row is one transition in the persi
   stall.
 - **Versioned data schema.** Store a `schema_version` with each checkpoint and migrate on load, because a
   run resumed next week carries last week's schema.
+- **Bounded failure with checkpointed counters.** Cap retries (for example 3) and repeated illegal calls
+  (for example 5) with a transition to FAILED, and checkpoint both counts so a crash cannot reset them.
+- **Replay the pending call on resume.** Checkpoint the chosen tool call before executing it and replay it
+  under the same per-step idempotency key (`run_id:step`), rather than re-asking the model, which may pick
+  a different call.
 
 ## Trade-offs
 - **Enforceable invariants vs up-front design.** You must know the phases before you ship, which is cheap

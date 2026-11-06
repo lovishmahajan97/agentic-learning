@@ -311,85 +311,20 @@ stateDiagram-v2
 ```
 
 ## Examples
-### Agent scenario: readiness from local flags, tools degrade instead of failing the pod
-An agent service loads prompts and the tool registry in lifespan. Readiness reads local flags only; a
-background task tracks tool-backend health and hides failing tools from the agent.
-
-```python
-import asyncio
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Response
-
-class AgentState:
-    prompts_loaded = False
-    tools: dict = {}            # name -> tool client, built in lifespan
-    tool_ok: dict = {}          # name -> last health result, updated in the background
-    draining = False
-
-s = AgentState()
-
-async def watch_tools(interval_s: float = 15.0):
-    while True:
-        for name, tool in s.tools.items():
-            try:
-                async with asyncio.timeout(2.0):
-                    s.tool_ok[name] = await tool.ping()      # your client's cheap health call
-            except Exception:
-                s.tool_ok[name] = False
-        await asyncio.sleep(interval_s)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    s.tools = await build_tool_registry()                    # connect tool backends, MCP sessions
-    s.prompts_loaded = await load_prompt_versions()
-    watcher = asyncio.create_task(watch_tools())
-    yield
-    s.draining = True
-    watcher.cancel()
-
-app = FastAPI(lifespan=lifespan)
-
-@app.get("/livez", include_in_schema=False)
-async def livez():
-    return {"ok": True}
-
-@app.get("/readyz", include_in_schema=False)
-async def readyz(response: Response):
-    ready = s.prompts_loaded and bool(s.tools) and not s.draining   # local state only
-    response.status_code = 200 if ready else 503
-    return {"ready": ready}
-
-def available_tools() -> list:
-    """What the agent loop offers the model this step: failing backends are hidden."""
-    return [t for name, t in s.tools.items() if s.tool_ok.get(name, True)]
-```
-
-- **A search-API outage now costs one tool, not the service:** readiness stays 200, the agent answers
-  without search, and `/health/details` shows which tool is down.
-- **`build_tool_registry`, `load_prompt_versions` and `tool.ping` are your own code;** the split between
-  local flags and shared-dependency handling is the point.
-
 ### Liveness, readiness and a draining flag
-A service that loads an embedding model in lifespan.
+Readiness reads local flags that lifespan sets; liveness checks nothing but the event loop.
 
 ```python
-import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response
+from fastapi.testclient import TestClient
 
-class State:
-    model = None
-    pools_ready = False
-    draining = False
-
-state = State()
-
+state = {"model": None, "draining": False}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    state.model = await asyncio.to_thread(load_embedding_model)   # ~60-90 s; off the event loop
-    state.pools_ready = True
+    state["model"] = "embedder"      # real code: await asyncio.to_thread(load_model), ~60-90 s
     yield
-    state.draining = True            # in case anything polls during cleanup
+    state["draining"] = True
 
 app = FastAPI(lifespan=lifespan)
 
@@ -399,22 +334,20 @@ async def livez():
 
 @app.get("/readyz", include_in_schema=False)
 async def readyz(response: Response):
-    ready = state.model is not None and state.pools_ready and not state.draining
+    ready = state["model"] is not None and not state["draining"]   # local state only
     response.status_code = 200 if ready else 503
-    return {"model": state.model is not None, "pools": state.pools_ready, "draining": state.draining}
+    return {"ready": ready}
 
 @app.post("/internal/drain", include_in_schema=False)     # called by preStop
 async def drain():
-    state.draining = True
-    return {"draining": True}
+    state["draining"] = True
 
-def load_embedding_model():
-    ...
+with TestClient(app) as c:
+    print(c.get("/readyz").status_code, c.post("/internal/drain").status_code,
+          c.get("/readyz").status_code, c.get("/livez").status_code)   # 200 200 503 200
 ```
 
-Probe configuration to match: `startupProbe` on `/livez` with `periodSeconds: 5, failureThreshold: 30`
-(150 s for model load), `livenessProbe` on `/livez` with defaults, `readinessProbe` on `/readyz` with
-`periodSeconds: 5`:
+Probe configuration to match:
 
 ```yaml
 startupProbe:
@@ -428,20 +361,15 @@ readinessProbe:
   periodSeconds: 5
 ```
 
-- **Probes see nothing until the load finishes.** Uvicorn runs lifespan startup before it even binds the
-  port, so every probe gets connection refused; that is why the startup probe must cover the whole load.
-- **Under Gunicorn or `uvicorn --workers`** the parent has already bound the socket, so the kernel
-  completes the TCP handshake and the probe waits out its `timeoutSeconds`. It looks like a timeout rather
-  than a refusal, but counts the same.
-- **The `model` check in `/readyz`** matters if you later switch to loading in a background task after
-  startup.
+- **Probes see nothing until the load finishes.** Uvicorn runs lifespan startup before it binds the
+  port, so the startup probe must cover the whole load.
 - **The `draining` flag lives in one process's memory.** With several workers per pod, a preStop `POST`
   reaches only one of them, so use one worker per pod or a shared signal such as a file.
 
 ### Cached, time-boxed pool check for readiness
 Checks the database (for an agent, often the checkpoint store) through this instance's own pool at most
-once every 5 seconds, and never waits past the probe's 1 s timeout. Uses `asyncio.timeout` (Python 3.11+)
-and an SQLAlchemy async engine.
+once every 5 seconds, and never waits past the probe's 1 s timeout. Needs Python 3.11+ for
+`asyncio.timeout`.
 
 ```python
 import asyncio, time
@@ -450,8 +378,7 @@ from sqlalchemy import text
 _cache = {"at": 0.0, "ok": False}
 
 async def pool_ok(engine, ttl_s=5.0, budget_s=0.3) -> bool:
-    now = time.monotonic()
-    if now - _cache["at"] < ttl_s:
+    if time.monotonic() - _cache["at"] < ttl_s:
         return _cache["ok"]                       # probes read the cached answer
     try:
         async with asyncio.timeout(budget_s):     # stay well inside timeoutSeconds
@@ -460,16 +387,12 @@ async def pool_ok(engine, ttl_s=5.0, budget_s=0.3) -> bool:
         ok = True
     except Exception:
         ok = False
-    _cache.update(at=now, ok=ok)
+    _cache.update(at=time.monotonic(), ok=ok)
     return ok
 ```
 
-- **What the cache and budget buy:** at most one `SELECT 1` per process per 5 s, however often the kubelet,
-  an external balancer and dashboards call it, and a slow database fails the check in 0.3 s instead of
-  hanging the probe past its timeout.
-- **What it does not buy:** `SELECT 1` still travels to the shared database, so a database-wide outage
-  fails it on every replica at once. Gate readiness on it only when no route can serve anything without
-  the database; if cached or fallback routes exist, keep it out, as in the incident below.
+- **What it does not buy:** `SELECT 1` still reaches the shared database, so a database-wide outage fails
+  it on every replica at once. Gate readiness on it only when no route can serve without the database.
 
 ### Worked incident: one `/health` vs separate probes
 Illustrative: 12 replicas, a 40-second shared-database blip, the 60-90 s model load from above.
@@ -507,6 +430,10 @@ service the restart column also kills every in-flight run on all 12 pods at t≈
   status and latency for on-call, behind auth, with no probe pointed at it; one worker per pod (or a shared
   drain signal) keeps liveness and the drain flag meaningful for the whole pod. Monitor: dependency latency
   trends there, and readiness still returning 200 during termination.
+- **Tool health in the background, time-boxed.** Poll each tool backend from a lifespan task (for example
+  every 15 s with a 2 s timeout per ping) and filter the agent's tool list on the result, never on a probe
+  path. Under Gunicorn or `uvicorn --workers` a probe during model load times out instead of being
+  refused, which counts the same.
 
 ## Trade-offs
 - **Dependency checks in readiness vs coupling.** They remove instances that genuinely cannot serve, but

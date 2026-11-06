@@ -218,45 +218,29 @@ from qdrant_client import QdrantClient, models          # checked against qdrant
 
 client = QdrantClient(":memory:")                         # local mode; use QdrantClient("http://localhost:6333") in prod
 client.create_collection("docs", vectors_config=models.VectorParams(size=2, distance=models.Distance.COSINE))
-client.upsert("docs", points=[                             # ingestion stores principals on every chunk
-    models.PointStruct(id=1, vector=[1, 0], payload={"doc_id": "d17", "allowed": ["group:finance"], "denied": []}),
-    models.PointStruct(id=2, vector=[1, .1], payload={"doc_id": "d18", "allowed": ["public"], "denied": ["user:bo@acme.com"]}),
-    models.PointStruct(id=3, vector=[.9, 0], payload={"doc_id": "d19", "allowed": ["public"], "denied": []}),
-    models.PointStruct(id=4, vector=[.8, .3], payload={"doc_id": "d20", "allowed": ["group:sales"], "denied": []})])
-client.create_payload_index("docs", field_name="allowed", field_schema="keyword")   # no-op in local mode
-client.create_payload_index("docs", field_name="denied", field_schema="keyword")
+client.upsert("docs", points=[models.PointStruct(id=i, vector=[1, i / 10], payload=p) for i, p in enumerate([
+    {"doc_id": "d17", "allowed": ["group:finance"], "denied": []},
+    {"doc_id": "d18", "allowed": ["public"], "denied": ["user:bo@acme.com"]},
+    {"doc_id": "d19", "allowed": ["public"], "denied": []},
+    {"doc_id": "d20", "allowed": ["group:sales"], "denied": []}], start=1)])
 
-SEARCH_TOOL = {"name": "search_docs", "input_schema": {      # no user, group or principal fields
-    "type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}
-
-def principals_for(user, directory):
-    """Authenticated identity -> transitive groups. Cache for a few minutes; never trust the client."""
-    groups = directory.transitive_groups(user.id)                 # e.g. 60 group ids, nested included
-    return [f"user:{user.email}", f"domain:{user.domain}", "public", *[f"group:{g}" for g in groups]]
+def principals_for(user, directory):                      # transitive groups, expanded server-side
+    return [f"user:{user.email}", "public", *[f"group:{g}" for g in directory.transitive_groups(user.id)]]
 
 def handle_search_docs(args, session, embed, directory, source, k=8):
-    user = session.user                                           # from the authenticated session only
-    try:
-        who = principals_for(user, directory)
-    except Exception:                                             # directory down: fail closed, never open
-        return {"error": "search unavailable; do not conclude documents are missing"}
-    flt = models.Filter(
-        must=[models.FieldCondition(key="allowed", match=models.MatchAny(any=who))],
-        must_not=[models.FieldCondition(key="denied", match=models.MatchAny(any=who))],
-    )
-    # Fetch a little extra: the late-bound check below may drop a few stale grants.
+    user = session.user                                   # from the authenticated session, never the model
+    who = principals_for(user, directory)
+    flt = models.Filter(must=[models.FieldCondition(key="allowed", match=models.MatchAny(any=who))],
+                        must_not=[models.FieldCondition(key="denied", match=models.MatchAny(any=who))])
     hits = client.query_points("docs", query=embed(args["query"]), query_filter=flt, limit=2 * k).points
-    # Late binding on the few survivors closes the window between ACL syncs for direct shares.
-    doc_ids = {h.payload["doc_id"] for h in hits}
-    readable = source.can_read(user.id, doc_ids)                  # one batched permission check
-    return {"results": [h.payload for h in hits if h.payload["doc_id"] in readable][:k]}
+    readable = source.can_read(user.id, {h.payload["doc_id"] for h in hits})   # late-bound, batched
+    return [h.payload["doc_id"] for h in hits if h.payload["doc_id"] in readable][:k]
 
-# Fakes for the customer's directory and source system: Bo is in sales; d19 was unshared since the last sync.
-directory = NS(transitive_groups=lambda uid: ["sales"])
-source = NS(can_read=lambda uid, ids: ids - {"d19"})
-bo = NS(session=NS(user=NS(id="bo", email="bo@acme.com", domain="acme.com")))
-print(handle_search_docs({"query": "q3"}, bo.session, lambda q: [1, 0], directory, source))
-# only d20: d17 needs finance, d18 denies Bo, d19 is dropped by the late-bound check
+directory = NS(transitive_groups=lambda uid: ["sales"])   # Bo is in sales
+source = NS(can_read=lambda uid, ids: ids - {"d19"})      # d19 was unshared since the last ACL sync
+session = NS(user=NS(id="bo", email="bo@acme.com"))
+print(handle_search_docs({"query": "q3"}, session, lambda q: [1, 0], directory, source))
+# ['d20']: d17 needs finance, d18 denies Bo, d19 is dropped by the late-bound check
 ```
 
 ### Worked numbers: predicate cost and revocation window
@@ -320,6 +304,9 @@ print(visible_derived([finance, legal], only_fin))  # False: Bo cannot read the 
   them with the same predicate. Monitor cross-user cache hits in an audit log.
 - **On-behalf-of identity for tools.** Agents and MCP servers pass the end user's token; the retrieval
   service rejects service-account calls. Monitor calls with no user identity.
+- **Index the ACL fields and fail closed.** Create keyword payload indexes on `allowed` and `denied`, fetch
+  about 2k candidates so the late-bound check can drop stale grants and still fill top-k, and if the
+  directory lookup fails return an error telling the agent not to conclude the documents are missing.
 
 ## Trade-offs
 - **Early binding: speed vs freshness.** Fast, scales to millions of chunks, but freshness is bounded by

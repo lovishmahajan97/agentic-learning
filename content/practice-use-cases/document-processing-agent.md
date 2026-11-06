@@ -163,20 +163,15 @@ flowchart TD
 Requires `pydantic` v2. The extraction call is stubbed with the JSON a model would return.
 
 ```python
-from datetime import date
 from decimal import Decimal
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 class LineItem(BaseModel):
-    description: str
     quantity: Decimal = Field(gt=0)
     unit_price: Decimal = Field(ge=0)
 
 class Invoice(BaseModel):
     vendor_name: str
-    invoice_number: str
-    invoice_date: date
-    currency: str = Field(pattern=r"^[A-Z]{3}$")
     line_items: list[LineItem]
     total: Decimal
 
@@ -187,23 +182,17 @@ class Invoice(BaseModel):
             raise ValueError(f"line items sum to {s}, total says {self.total}")
         return self
 
-VENDORS = {"Acme Ltd"}                       # stand-in for a vendor-master lookup tool
-
 def route(raw_json):
     try:
-        inv = Invoice.model_validate_json(raw_json)
+        Invoice.model_validate_json(raw_json)
+        return "straight_through", []
     except ValidationError as e:
         return "repair_or_review", [err["msg"] for err in e.errors()]
-    if inv.vendor_name not in VENDORS:
-        return "review", ["unknown vendor"]
-    return "straight_through", []
 
-good = ('{"vendor_name":"Acme Ltd","invoice_number":"INV-7","invoice_date":"2026-09-30",'
-        '"currency":"EUR","line_items":[{"description":"Bolts","quantity":10,"unit_price":2.5}],'
-        '"total":25}')
-bad = good.replace('"total":25', '"total":52')   # a misread digit
-print(route(good))   # ('straight_through', [])
-print(route(bad))    # ('repair_or_review', ['Value error, line items sum to 25.0, total says 52'])
+good = '{"vendor_name":"Acme Ltd","line_items":[{"quantity":10,"unit_price":2.5}],"total":25}'
+print(route(good))                                # ('straight_through', [])
+print(route(good.replace('"total":25', '"total":52')))   # a misread digit
+# -> ('repair_or_review', ['Value error, line items sum to 25.0, total says 52'])
 ```
 
 The error messages double as repair feedback: send them back with the page and ask for a corrected
@@ -239,6 +228,9 @@ Illustrative orders of magnitude; agree the real thresholds with the finance tea
   prompt, model or schema change (see `customer-data-evaluation/customer-specific-regression-suites`).
 - **Durable batch jobs.** Process documents through a queue with retries and idempotent writes keyed by
   a document hash, so reprocessing never creates duplicate records.
+- **Field rules and cross-checks before straight-through.** Validate formats in the schema (for example
+  a 3-letter ISO currency code and a real invoice date) and check the vendor against the vendor master;
+  unknown vendors go to review.
 
 ## Trade-offs
 - **Straight-through rate vs escaped errors.** Looser rules automate more but let more wrong records

@@ -215,15 +215,14 @@ flowchart TD
 ```
 
 ## Examples
-### The same call, prototype vs productionized
-The provider call is abstracted; the hardening around it is the point.
+### A hardened model call
+The provider call is a stand-in that rate-limits once and then answers; the hardening around it is the
+point: a timeout, retries on transient errors only, backoff with jitter, a schema check and a fallback.
 
 ```python
-import json, logging, random, time, uuid
+import random, time
 from pydantic import BaseModel, ValidationError
 
-log = logging.getLogger("triage")
-PROMPT_VERSION = "triage-v7"      # versioned, reviewed, covered by the regression suite
 MODEL = "provider-model-2025-xx"  # pinned snapshot, not a floating alias (placeholder name)
 
 class Triage(BaseModel):
@@ -232,36 +231,29 @@ class Triage(BaseModel):
 
 class TransientError(Exception): ...   # map provider timeouts / 429 / 5xx onto this
 
-def call_llm(model, prompt_version, text, timeout_s=None, with_usage=False):
-    raise NotImplementedError("wrap your provider SDK here")
+REPLIES = iter([TransientError("429"), '{"category": "billing", "priority": 2}'])
+def call_llm(model, text, timeout_s):  # stand-in: wrap your provider SDK here
+    r = next(REPLIES)
+    if isinstance(r, Exception):
+        raise r
+    return r
 
-def prototype(ticket: str) -> dict:
-    return json.loads(call_llm(MODEL, PROMPT_VERSION, ticket))   # happy path only
-
-def production(ticket: str, user_id: str, max_attempts: int = 3) -> Triage | None:
-    req_id = str(uuid.uuid4())
-    ticket = ticket[:20_000]                                     # bound input size and cost
+def triage(ticket: str, max_attempts: int = 3):
     for attempt in range(1, max_attempts + 1):
-        t0 = time.monotonic()
         try:
-            raw, usage = call_llm(MODEL, PROMPT_VERSION, ticket, timeout_s=15, with_usage=True)
-            result = Triage.model_validate_json(raw)             # schema check, not blind json.loads
-            log.info("ok", extra={"req": req_id, "user": user_id, "prompt": PROMPT_VERSION,
-                                  "attempt": attempt, "ms": int((time.monotonic() - t0) * 1000),
-                                  "tokens_in": usage["in"], "tokens_out": usage["out"]})
-            return result
-        except TransientError:
-            log.warning("transient", extra={"req": req_id, "attempt": attempt})
-            if attempt < max_attempts:                            # no pointless sleep before giving up
+            return Triage.model_validate_json(call_llm(MODEL, ticket, timeout_s=15))  # schema check
+        except TransientError:                                # retry only what can succeed
+            if attempt < max_attempts:                        # no pointless sleep before giving up
                 time.sleep(min(8, 2 ** attempt) * random.uniform(0.5, 1.0))  # backoff with jitter
-        except ValidationError:                                   # re-sample once more, counted separately
-            log.warning("bad_schema", extra={"req": req_id, "attempt": attempt})
-    log.error("fallback_to_human", extra={"req": req_id})
-    return None                                                   # caller routes to manual queue
+        except ValidationError:                               # re-sample once more, counted separately
+            pass
+    return None                                               # caller routes to the human queue
+
+print(triage("I was charged twice"))   # category='billing' priority=2
 ```
 
-- **Each added line answers a production question** the prototype ignored: what if it hangs, rate-limits,
-  returns broken output, or costs too much, and how will we debug it next week?
+- **Each added line answers a production question** the happy-path prototype ignored: what if it hangs,
+  rate-limits or returns broken output?
 - **Worst case it implies:** three 15-second timeouts plus up to 2 and 4 seconds of backoff is about 51
   seconds before the human fallback.
 - **Fit to the path:** acceptable for a background triage queue, far too long for a chat reply, where you
@@ -270,39 +262,39 @@ def production(ticket: str, user_id: str, max_attempts: int = 3) -> Triage | Non
   call site.
 
 ### A bounded agent loop with safe tool calls
-The model and tools are abstracted. The point is the budget checks around each step and the idempotency
+The model and tools are passed in. The point is the budget checks around each step and the idempotency
 key that makes a retried write safe.
 
 ```python
 import hashlib, time
 
 MAX_STEPS, MAX_COST_USD, DEADLINE_S = 12, 0.50, 60
-WRITE_TOOLS = {"issue_refund", "send_email"}             # side-effecting: need keys and approval
+WRITE_TOOLS = {"issue_refund", "send_email"}              # side-effecting: need an idempotency key
 
-def run_agent(task_id, messages, call_model, tools, approve, log):
+def run_agent(task_id, messages, call_model, tools):
     cost, t_end = 0.0, time.monotonic() + DEADLINE_S
-    for step in range(1, MAX_STEPS + 1):
+    for step in range(MAX_STEPS):
         if cost > MAX_COST_USD or time.monotonic() > t_end:
-            return log("budget_exhausted", task_id, step, cost) or None   # hand off to a human
+            return None                                    # budget exhausted: hand off to a human
         reply, step_cost = call_model(messages, timeout_s=max(1, t_end - time.monotonic()))
         cost += step_cost
-        if reply.tool is None:
-            log("done", task_id, step, cost)
-            return reply.text
-        args = reply.args                                 # already schema-validated by the wrapper
-        if reply.tool in WRITE_TOOLS:
-            if not approve(task_id, reply.tool, args):
-                messages.append({"role": "tool", "content": "rejected by reviewer"})
-                continue
-            key = hashlib.sha256(f"{task_id}:{reply.tool}:{sorted(args.items())}".encode()).hexdigest()
-            args = {**args, "idempotency_key": key}       # same action on retry -> same key
+        if reply["tool"] is None:
+            return reply["text"]
+        args = reply["args"]                               # already schema-validated by the wrapper
+        if reply["tool"] in WRITE_TOOLS:                   # same action on retry -> same key
+            key = hashlib.sha256(f"{task_id}:{reply['tool']}:{sorted(args.items())}".encode()).hexdigest()
+            args = {**args, "idempotency_key": key}
         try:
-            result = tools[reply.tool](**args)            # runs with the end user's permissions
-        except Exception as e:                            # tool errors go back to the model, not up the stack
+            result = tools[reply["tool"]](**args)          # runs with the end user's permissions
+        except Exception as e:                             # tool errors go back to the model
             result = f"tool error: {type(e).__name__}: {e}"
         messages.append({"role": "tool", "content": str(result)})   # untrusted text from here on
-        log("step", task_id, step, cost, tool=reply.tool)
-    return log("step_limit", task_id, MAX_STEPS, cost) or None
+    return None                                            # step limit hit: hand off to a human
+
+steps = iter([({"tool": "issue_refund", "args": {"order": "A-1"}}, 0.01),   # scripted model replies
+              ({"tool": None, "text": "Refunded."}, 0.01)])
+print(run_agent("t1", [], lambda m, timeout_s: next(steps), {"issue_refund": lambda **a: "ok"}))
+# Refunded.
 ```
 
 - **The limits are illustrative;** set them from the step and cost distribution in your eval traces.
@@ -312,35 +304,17 @@ def run_agent(task_id, messages, call_model, tools, approve, log):
 - **The key is derived from task, tool and arguments,** so a task that legitimately needs two identical writes
   must add a sequence number to the key.
 
-### Capacity, cost and retry-budget calculator
-Run this before launch with your own volumes and your provider's current prices and quota tier.
+### Worked scenario: capacity, cost and retry budget before launch
+Run these numbers with your own volumes and your provider's current prices and quota tier. Prices here are
+illustrative ($3 in and $15 out per million tokens), not any provider's list price.
 
-```python
-def capacity(rps, latency_s, tokens_in, tokens_out, price_in_per_m, price_out_per_m,
-             retry_rate=0.0, days=30):
-    in_flight = rps * latency_s                                   # Little's law
-    tpm = rps * 60 * (tokens_in + tokens_out)                     # check against the quota tier
-    per_req = (tokens_in * price_in_per_m + tokens_out * price_out_per_m) / 1e6
-    monthly = rps * 86_400 * days * per_req * (1 + retry_rate)
-    return in_flight, tpm, monthly
-
-def worst_case_latency(attempts, timeout_s, backoffs_s):
-    return attempts * timeout_s + sum(backoffs_s)
-
-def retry_amplification(attempts_per_layer):
-    calls = 1
-    for a in attempts_per_layer:
-        calls *= a
-    return calls
-
-# Illustrative prices in dollars per million tokens, not any provider's list price.
-inflight, tpm, monthly = capacity(rps=20, latency_s=6, tokens_in=3_000, tokens_out=500,
-                                  price_in_per_m=3, price_out_per_m=15, retry_rate=0.05)
-print(f"in flight {inflight:.0f}, tokens/min {tpm / 1e6:.1f}M, monthly ${monthly:,.0f}")
-# in flight 120, tokens/min 4.2M, monthly $898,128  (if 20 rps were sustained around the clock)
-print("worst case before fallback:", worst_case_latency(3, 15, [2, 4]), "s")   # 51 s
-print("app x gateway x SDK retries:", retry_amplification([3, 3, 3]), "calls")  # 27
-```
+| Check | Arithmetic | Result |
+|---|---|---|
+| Calls in flight (Little's law) | 20 per second × 6 s latency | 120 |
+| Tokens per minute | 20 × 60 × (3,000 in + 500 out) | 4.2 million, compare with the quota tier |
+| Monthly cost, 5% retries | 20 × 86,400 × 30 × $0.0165 × 1.05 | about $898,000 if 20 per second were sustained around the clock |
+| Worst case before fallback | 3 × 15 s timeout + 2 s + 4 s backoff | 51 s |
+| Retry amplification | 3 app × 3 gateway × 3 SDK attempts | 27 provider calls |
 
 | Lever | Effect on the numbers above |
 |---|---|
@@ -373,6 +347,12 @@ print("app x gateway x SDK retries:", retry_amplification([3, 3, 3]), "calls")  
 - **Per-task step and spend budgets** — for every agent. How: enforce a maximum step count, token or dollar
   budget and overall deadline in the loop, ending in a human hand-off. Monitor: share of tasks hitting a
   limit and the p95 steps per task, which rise when a tool or prompt regresses.
+- **Approval gate on consequential write tools** — before a refund or email runs. How: pause the call for a
+  human decision and, when declined, return "rejected by reviewer" to the model as the tool result so the
+  loop continues. Monitor: approval rate and time waiting for a reviewer.
+- **Bounded input and a log line per attempt** — on every model call. How: truncate input before the call
+  (for example 20,000 characters per ticket) and log request ID, user, prompt version, attempt number,
+  latency and token counts on each attempt, plus the hand-off to a human. Monitor: attempts per request.
 
 ## Trade-offs
 - **Retries vs latency and load.** They improve success rates during transient faults, but add latency and

@@ -193,47 +193,34 @@ flowchart TD
 ### Cost-aware token bucket with reserve and settle
 Capacity is ten seconds of refill so short bursts are absorbed, the refill rate is 80% of an
 illustrative provider limit, and unused reservations are refunded once the real output length is known.
-In production the bucket lives in Redis with `try_reserve` as an atomic script.
+In production the bucket lives in Redis with the reserve as an atomic script (next example).
 
 ```python
-import time, threading
+import time
 
 class TokenBucket:
-    """Cost-aware limiter: `capacity` units, refilled continuously at `rate` units/second."""
-    def __init__(self, capacity: float, rate: float):
+    def __init__(self, capacity, rate):            # `capacity` units, refilled at `rate` units/s
         self.capacity, self.rate = capacity, rate
         self.level, self.updated = capacity, time.monotonic()
-        self.lock = threading.Lock()
-    def _refill(self):
+    def try_reserve(self, cost):                   # 0 if admitted, else seconds until it fits
+        if cost > self.capacity:                   # can never fit: reject, do not say "retry later"
+            raise ValueError("request larger than bucket capacity")
         now = time.monotonic()
         self.level = min(self.capacity, self.level + (now - self.updated) * self.rate)
         self.updated = now
-    def try_reserve(self, cost: float) -> float:
-        """Reserve `cost` now. Returns 0 if admitted, else seconds until it would fit."""
-        if cost > self.capacity:              # would never fit: reject outright, do not say "retry later"
-            raise ValueError("request larger than bucket capacity")
-        with self.lock:
-            self._refill()
-            if self.level >= cost:
-                self.level -= cost
-                return 0.0
-            return (cost - self.level) / self.rate
-    def settle(self, reserved: float, actual: float):
-        with self.lock:                       # refund unused quota, or debit an overshoot (level may go
-            self.level = min(self.capacity, self.level + reserved - actual)   # negative = a debt)
+        if self.level >= cost:
+            self.level -= cost
+            return 0.0
+        return (cost - self.level) / self.rate
+    def settle(self, reserved, actual):            # refund unused quota, or debit an overshoot
+        self.level = min(self.capacity, self.level + reserved - actual)
 
-# Illustrative provider limit of 400k tokens/minute; run at 80% to leave headroom for retries.
-TPM = 400_000 * 0.8
-tpm_bucket = TokenBucket(capacity=TPM / 6, rate=TPM / 60)     # 10 s of burst, ~5,333 tokens/s
-
-def call_llm(prompt_tokens: int, max_tokens: int):
-    reserved = prompt_tokens + max_tokens                  # safe estimate; expected output is the alternative
-    wait = tpm_bucket.try_reserve(reserved)
-    if wait > 0:
-        raise RateLimited(retry_after=round(wait, 1))      # inbound: 429 + Retry-After; outbound: sleep
-    resp = provider.generate(max_tokens=max_tokens)
-    tpm_bucket.settle(reserved, prompt_tokens + resp.usage.output_tokens)
-    return resp
+TPM = 400_000 * 0.8                                # run at 80% of the provider limit
+bucket = TokenBucket(capacity=TPM / 6, rate=TPM / 60)     # 10 s of burst, ~5,333 tokens/s
+for i in range(3):                                 # 20k prompt + 4k max_tokens each
+    print(i, round(bucket.try_reserve(24_000), 1))  # 0 0.0, 1 0.0, 2 3.5 (seconds to wait)
+bucket.settle(24_000, 20_600)                      # request 0 actually used 600 output tokens
+print(round(bucket.try_reserve(24_000), 1))        # 2.9: the 3,400 refund cut the wait
 ```
 
 ### The same bucket shared across replicas in Redis
@@ -256,51 +243,11 @@ redis.call('HSET', KEYS[1], 'level', level, 'updated', now)
 redis.call('EXPIRE', KEYS[1], 3600)
 return tostring(wait)
 """
-
 r = redis.Redis()
 reserve = r.register_script(RESERVE)
-
-def try_reserve(key, capacity, rate, cost):
-    if cost > capacity:                    # can never fit: non-retryable error, not an endless Retry-After
-        raise ValueError("request larger than bucket capacity")
-    return float(reserve(keys=[key], args=[capacity, rate, cost]))   # 0.0 means admitted
-
-def settle(key, reserved, actual):
-    # Refund or debit; the next reserve clamps the level back to capacity.
-    r.hincrbyfloat(key, "level", reserved - actual)
-
-wait = try_reserve("rl:model:tpm", 53_333, 5_333, 24_000)
-```
-
-### Agent loop with a run budget on top of the bucket
-Each step reserves from the shared bucket, and the run carries its own step and token budget so a tool
-cycle ends cleanly instead of draining the tenant. `llm.step` stands in for one model call of your loop.
-
-```python
-class RunBudget:
-    def __init__(self, max_steps=20, max_tokens=200_000):
-        self.max_steps, self.max_tokens = max_steps, max_tokens
-        self.steps = self.tokens = 0
-    def charge(self, used: int):
-        self.steps += 1; self.tokens += used
-    def exhausted(self) -> bool:
-        return self.steps >= self.max_steps or self.tokens >= self.max_tokens
-
-def run_agent(messages, budget: RunBudget, max_tokens=1_000):
-    while not budget.exhausted():
-        prompt_tokens = count_tokens(messages)              # same tokenizer as the model
-        reserved = prompt_tokens + max_tokens
-        wait = tpm_bucket.try_reserve(reserved)
-        if wait > 0:
-            return {"status": "busy", "retry_after": round(wait, 1)}   # surface it, do not spin
-        resp = llm.step(messages, max_tokens=max_tokens)
-        used = prompt_tokens + resp.usage.output_tokens
-        tpm_bucket.settle(reserved, used)
-        budget.charge(used)
-        if resp.final:
-            return {"status": "done", "answer": resp.text}
-        messages += resp.tool_messages()                    # transcript grows every step
-    return {"status": "budget_exhausted", "steps": budget.steps, "tokens": budget.tokens}
+wait = float(reserve(keys=["rl:model:tpm"], args=[53_333, 5_333, 24_000]))   # 0.0 means admitted
+if wait == 0:                  # after the call: settle the 3,400 unused; next reserve clamps to capacity
+    r.hincrbyfloat("rl:model:tpm", "level", 24_000 - 20_600)
 ```
 
 ### Worked scenario: one runaway agent against a shared quota
@@ -341,6 +288,11 @@ same failing tool starts with a 6k-token prefix and adds ~1.5k tokens per step.
   reservation-to-actual ratio.
 - **Separate keys for heavy workloads.** Give a nightly batch job or a dominant tenant its own provider key
   or workspace, so it cannot starve interactive traffic. Monitor per-key utilisation.
+- **Count prompt tokens with the model's own tokenizer.** A reservation built from a different
+  tokenizer drifts from the provider's reported usage, so settlement corrects more and the limiter
+  admits the wrong amount in the meantime.
+- **Lock an in-process bucket.** When threads share one bucket object, hold a lock around refill,
+  reserve and settle, or two threads can both admit the last unit; across processes use the Redis script.
 
 ## Trade-offs
 - **Bursts vs upstream windowing.** Token buckets admit bursts, which users like, but a burst that fits

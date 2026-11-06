@@ -213,7 +213,6 @@ REQS = {   # from the SOW: id -> (statement, acceptance threshold on its slice)
 }
 CASES = [  # eval cases tagged with the requirements they verify, plus latest result
     {"id": "c001", "reqs": ["R1", "R3"], "passed": True},
-    {"id": "c002", "reqs": ["R1"],       "passed": True},
     {"id": "c003", "reqs": ["R2"],       "passed": False},
     {"id": "c004", "reqs": ["R1", "R3"], "passed": False},
     {"id": "c005", "reqs": ["R9"],       "passed": True},   # tag points at no requirement
@@ -221,23 +220,18 @@ CASES = [  # eval cases tagged with the requirements they verify, plus latest re
 ]
 MIN_CASES = 30   # below this, a slice result is too noisy to accept on
 
-by_req, orphans = defaultdict(list), []
+by_req = defaultdict(list)
 for c in CASES:
-    known = [r for r in c["reqs"] if r in REQS]
-    if not known:
-        orphans.append(c["id"])
-    for r in known:
+    for r in c["reqs"]:
         by_req[r].append(c["passed"])
+orphans = [c["id"] for c in CASES if not set(c["reqs"]) & REQS.keys()]
 
 for rid, (text, threshold) in REQS.items():
-    res = by_req.get(rid, [])
-    if not res:
-        print(f"{rid} UNTESTED  {text}")
-        continue
-    rate = sum(res) / len(res)
-    note = "  (too few cases)" if len(res) < MIN_CASES else ""
-    print(f"{rid} {'PASS' if rate >= threshold else 'FAIL'}  {rate:.0%} of {len(res)} "
-          f"(needs {threshold:.0%}){note}  {text}")
+    res = by_req[rid]
+    rate = sum(res) / len(res) if res else 0
+    verdict = "UNTESTED" if not res else "PASS" if rate >= threshold else "FAIL"
+    note = "  (too few cases)" if res and len(res) < MIN_CASES else ""
+    print(f"{rid} {verdict}  {rate:.0%} of {len(res)} (needs {threshold:.0%}){note}  {text}")  # R2 FAIL, R4 UNTESTED
 print("orphans:", orphans)   # -> ['c005', 'c006']
 ```
 

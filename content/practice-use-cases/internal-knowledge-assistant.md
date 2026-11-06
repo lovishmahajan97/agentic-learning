@@ -167,43 +167,35 @@ flowchart TD
 
 ## Examples
 ### ACL-filtered retrieval with citations
-Runnable with the standard library: a tiny keyword scorer stands in for hybrid search, and the ACL
+Runnable with the standard library: a keyword-overlap scorer stands in for hybrid search, and the ACL
 filter runs before ranking. Swap in your vector store's metadata filter in production.
 
 ```python
-import math, re
-from collections import Counter
+import re
 
 DOCS = [
     {"id": "hr-12", "url": "wiki/hr/expenses", "groups": {"all-staff"},
      "text": "Home office equipment such as a monitor can be reimbursed up to 300 per year."},
     {"id": "fin-7", "url": "drive/finance/salary-bands", "groups": {"hr-admins"},
      "text": "Salary bands for 2026: engineer level 3 ranges from 90k to 120k."},
-    {"id": "it-3", "url": "wiki/it/laptops", "groups": {"all-staff"},
-     "text": "Laptops are refreshed every 3 years; request a monitor through the IT portal."},
 ]
-tok = lambda s: re.findall(r"[a-z0-9]{2,}", s.lower())     # crude tokenizer, drops 1-char tokens
-df = Counter(t for d in DOCS for t in set(tok(d["text"])))
+tok = lambda s: set(re.findall(r"[a-z0-9]{2,}", s.lower()))
 
-def search(query, user_groups, k=2):
-    visible = [d for d in DOCS if d["groups"] & user_groups]          # ACL filter BEFORE ranking
-    def score(d):
-        tf = Counter(tok(d["text"]))
-        return sum(tf[t] * math.log(1 + len(DOCS) / df[t]) for t in tok(query) if t in tf)
-    hits = sorted(visible, key=score, reverse=True)[:k]
-    return [h for h in hits if score(h) > 0]
+def search(query, user_groups):
+    visible = [d for d in DOCS if d["groups"] & user_groups]      # ACL filter BEFORE ranking
+    hits = sorted(visible, key=lambda d: len(tok(query) & tok(d["text"])), reverse=True)
+    return [h for h in hits if tok(query) & tok(h["text"])]
 
 def answer(query, user_groups):
     hits = search(query, user_groups)
     if not hits:
         return "I could not find this in documents you can access."
-    context = "\n".join(f"[{h['id']}] {h['text']}" for h in hits)
-    # In production: send `context` to the model with "answer only from these sources, cite [id]".
-    return f"{hits[0]['text']} [{hits[0]['id']}]({hits[0]['url']})\n--- context sent:\n{context}"
+    # In production: send the hits to the model with "answer only from these sources, cite [id]".
+    return f"{hits[0]['text']} [{hits[0]['id']}]({hits[0]['url']})"
 
-print(answer("can I expense a monitor", {"all-staff"}))
-print(answer("salary bands engineer level 3", {"all-staff"}))           # forbidden: no leak
-print(answer("salary bands engineer level 3", {"all-staff", "hr-admins"}))
+print(answer("can I expense a monitor", {"all-staff"}))                   # cites [hr-12]
+print(answer("salary bands engineer level 3", {"all-staff"}))             # not found: no leak
+print(answer("salary bands engineer level 3", {"all-staff", "hr-admins"}))  # cites [fin-7]
 ```
 
 ### Cost, latency and accuracy targets

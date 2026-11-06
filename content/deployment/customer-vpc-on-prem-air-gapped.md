@@ -269,33 +269,17 @@ import os, sys
 from urllib.parse import urlparse
 
 ALLOWED = set(os.environ["AGENT_ALLOWED_HOSTS"].split(","))  # from the Helm values file
-
-AGENT_CONFIG = {
-    "model": {"base_url": os.environ["MODEL_BASE_URL"]},          # e.g. in-cluster vLLM service
-    "tools": {
-        "search_tickets": "https://tickets.internal.example/api",
-        "lookup_customer": "https://crm.internal.example/v2",
-        "web_search": os.environ.get("WEB_SEARCH_URL", ""),       # must be empty inside an air gap
-    },
+ENDPOINTS = {
+    "model": os.environ["MODEL_BASE_URL"],                    # e.g. in-cluster vLLM service
+    "search_tickets": "https://tickets.internal.example/api",
+    "web_search": os.environ.get("WEB_SEARCH_URL", ""),      # must be empty inside an air gap
 }
 
-def check():
-    problems = []
-    host = urlparse(AGENT_CONFIG["model"]["base_url"]).hostname
-    if host not in ALLOWED:
-        problems.append(f"model host {host!r} not allowed")
-    for name, url in AGENT_CONFIG["tools"].items():
-        if not url:
-            continue                                             # tool disabled for this site
-        h = urlparse(url).hostname
-        if h not in ALLOWED:
-            problems.append(f"tool {name}: host {h!r} not allowed")
-    for p in problems:
-        print("PREFLIGHT FAIL", p)
-    return not problems
-
-if __name__ == "__main__":
-    sys.exit(0 if check() else 1)    # run as an init container; the agent never starts on failure
+bad = [n for n, url in ENDPOINTS.items() if url and urlparse(url).hostname not in ALLOWED]
+for name in bad:
+    print("PREFLIGHT FAIL", name, ENDPOINTS[name])
+sys.exit(1 if bad else 0)    # run as an init container; the agent never starts on failure
+# WEB_SEARCH_URL=https://api.search.example -> PREFLIGHT FAIL web_search https://api.search.example
 ```
 
 ### Bundle manifest tool: build and verify
@@ -307,55 +291,36 @@ if __name__ == "__main__":
 - **Three distinct rejections.** A file that is missing (truncated transfer); a file whose hash differs
   (corruption or tampering); a file present but not in the manifest (added after signing, which an
   installer that globs the directory would otherwise load).
-- **Streaming hash.** Hashing reads 1 MB blocks *because* a 140 GB weights file cannot be read into memory.
+- **Streaming hash.** `hashlib.file_digest` reads the file in blocks *because* a 140 GB weights file
+  cannot be read into memory.
 
 ```python
-"""Build and verify an offline install bundle: `build <dir> <version>` or `verify <dir>`."""
+"""Build and verify an offline install bundle: `build <dir>` or `verify <dir>` (Python 3.11+)."""
 import hashlib, json, sys, pathlib
-
-def sha256(path, chunk=1 << 20):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(chunk), b""):
-            h.update(block)
-    return h.hexdigest()
 
 SKIP = {"manifest.json", "manifest.json.sig"}   # the manifest and its cosign signature
 
-def payload(root):
-    return [p for p in root.rglob("*") if p.is_file() and str(p.relative_to(root)) not in SKIP]
+def hashes(root):   # file_digest streams in blocks, so a 140 GB weights file never sits in memory
+    return {str(p.relative_to(root)): hashlib.file_digest(p.open("rb"), "sha256").hexdigest()
+            for p in root.rglob("*") if p.is_file() and str(p.relative_to(root)) not in SKIP}
 
-def build(bundle_dir, version):
-    root = pathlib.Path(bundle_dir)
-    files = payload(root)
-    manifest = {"version": version, "artifacts": {
-        str(p.relative_to(root)): {"sha256": sha256(p), "bytes": p.stat().st_size} for p in files}}
-    (root / "manifest.json").write_text(json.dumps(manifest, indent=1))
-    total = sum(a["bytes"] for a in manifest["artifacts"].values())
-    print(f"{len(files)} artifacts, {total / 1e9:.1f} GB")
-
-def verify(bundle_dir):
-    root = pathlib.Path(bundle_dir)
-    manifest = json.loads((root / "manifest.json").read_text())
-    listed = manifest["artifacts"]
-    present = {str(p.relative_to(root)) for p in payload(root)}
+def verify(root):
+    listed = json.loads((root / "manifest.json").read_text())
+    present = hashes(root)
     missing = [r for r in listed if r not in present]
-    altered = [r for r in listed if r in present and sha256(root / r) != listed[r]["sha256"]]
-    extra = sorted(present - set(listed))
-    for label, items in (("MISSING", missing), ("ALTERED", altered), ("UNLISTED", extra)):
-        if items:
-            print(label, items)
-    ok = not (missing or altered or extra)
-    print("OK" if ok else "REJECT BUNDLE")
-    return ok
+    altered = [r for r in listed if r in present and present[r] != listed[r]]
+    extra = sorted(set(present) - set(listed))
+    print("MISSING", missing, "ALTERED", altered, "UNLISTED", extra)
+    return not (missing or altered or extra)
 
 if __name__ == "__main__":
-    cmd, path = sys.argv[1], sys.argv[2]
+    cmd, root = sys.argv[1], pathlib.Path(sys.argv[2])
     if cmd == "build":
-        build(path, sys.argv[3])
-    else:
-        sys.exit(0 if verify(path) else 1)
-# Typical layout: images/app-1.8.3.tar, charts/assistant-1.8.3.tgz, models/<name>/, wheels/, docs/
+        (root / "manifest.json").write_text(json.dumps(hashes(root), indent=1))
+    elif not verify(root):
+        sys.exit("REJECT BUNDLE")
+# verify after one flipped byte and one stray file:
+# MISSING [] ALTERED ['models/w.bin'] UNLISTED ['stray.py']   then REJECT BUNDLE, exit 1
 ```
 
 ### Worked scenario: sizing the weights in an air-gap agent delivery
@@ -396,9 +361,7 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: kube-system
-      ports:
-        - { protocol: UDP, port: 53 }
-        - { protocol: TCP, port: 53 }
+      ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]   # cluster DNS
 ```
 
 ## Production patterns
@@ -423,6 +386,9 @@ spec:
   support and require sites to upgrade into that window, so back-ports stay finite. Add columns and
   tables first, remove old ones a release later, so `helm rollback` to the previous chart still finds a
   schema it understands. Test rollback in CI.
+- **Version and sizes in the manifest.** Alongside each hash, record the bundle version and each
+  artifact's byte count, so a support bundle names the exact release and a truncated copy shows up
+  before hashing. Ship a layout such as `images/`, `charts/`, `models/<name>/`, `wheels/`, `docs/`.
 
 ## Trade-offs
 - **Data custody vs observability.** The customer keeps custody of data and uses their own cloud

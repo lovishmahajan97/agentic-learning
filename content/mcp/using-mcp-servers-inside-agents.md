@@ -276,18 +276,16 @@ sequenceDiagram
 
 ## Examples
 ### An OpenAI Agents SDK agent over a local stdio server
-`tickets_server.py` is a tiny server; the agent launches it, filters its tools and answers a question.
+`tickets_server.py` is a tiny server; the agent (`agent.py`) launches it, filters its tools and answers a question.
 An unknown id raises `ToolError`, which the client receives as an `isError` result the model can read.
 Needs `pip install openai-agents` and `OPENAI_API_KEY`.
 
 ```python
 # tickets_server.py
 try:
-    from mcp.server.mcpserver import MCPServer                     # mcp SDK 2.x
-    from mcp.server.mcpserver.exceptions import ToolError
+    from mcp.server.mcpserver import MCPServer, exceptions                      # mcp SDK 2.x
 except ImportError:
-    from mcp.server.fastmcp import FastMCP as MCPServer            # mcp SDK 1.x
-    from mcp.server.fastmcp.exceptions import ToolError
+    from mcp.server.fastmcp import FastMCP as MCPServer, exceptions             # mcp SDK 1.x
 
 mcp = MCPServer("tickets")
 TICKETS = {"T-1": {"id": "T-1", "status": "open", "title": "Refund not received"}}
@@ -296,34 +294,26 @@ TICKETS = {"T-1": {"id": "T-1", "status": "open", "title": "Refund not received"
 def get_ticket(ticket_id: str) -> dict:
     """Fetch one support ticket by id, for example 'T-1'."""
     if ticket_id not in TICKETS:
-        raise ToolError(f"no ticket {ticket_id}; ticket ids look like T-1")   # isError result
+        raise exceptions.ToolError(f"no ticket {ticket_id}; ticket ids look like T-1")   # isError result
     return TICKETS[ticket_id]
 
-if __name__ == "__main__":
-    mcp.run()        # stdio by default
+mcp.run()        # stdio by default
 ```
 
 ```python
-# agent.py
 import asyncio, sys
 from agents import Agent, Runner
 from agents.mcp import MCPServerStdio, create_static_tool_filter
 
 async def main():
     async with MCPServerStdio(
-        name="tickets",
         params={"command": sys.executable, "args": ["tickets_server.py"]},
         cache_tools_list=True,                                    # one tools/list per process
         tool_filter=create_static_tool_filter(allowed_tool_names=["get_ticket"]),
-        client_session_timeout_seconds=10,
     ) as tickets:
-        agent = Agent(
-            name="support",
-            instructions="Answer with the tickets tools. Quote the ticket id and status.",
-            mcp_servers=[tickets],
-        )
+        agent = Agent(name="support", instructions="Quote the ticket id and status.", mcp_servers=[tickets])
         result = await Runner.run(agent, "What is the status of ticket T-1?")
-        print(result.final_output)
+        print(result.final_output)                                # e.g. "Ticket T-1 is open."
 
 asyncio.run(main())
 ```
@@ -338,16 +328,12 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain.agents import create_agent        # LangChain 1.x; older code used langgraph.prebuilt.create_react_agent
 
 async def main():
-    client = MultiServerMCPClient(
-        {
-            "tickets": {"transport": "stdio", "command": sys.executable, "args": ["tickets_server.py"]},
-            "kb": {"transport": "streamable_http", "url": "http://localhost:8000/mcp",
-                   "headers": {"Authorization": f"Bearer {os.environ['KB_TOKEN']}"}},
-        },
-        tool_name_prefix=True,                   # tickets_get_ticket, kb_search: no collisions
-    )
-    tools = await client.get_tools()
-    agent = create_agent(os.environ["MODEL"], tools)   # e.g. a provider:model string your account supports
+    client = MultiServerMCPClient({
+        "tickets": {"transport": "stdio", "command": sys.executable, "args": ["tickets_server.py"]},
+        "kb": {"transport": "streamable_http", "url": "http://localhost:8000/mcp",
+               "headers": {"Authorization": f"Bearer {os.environ['KB_TOKEN']}"}},
+    }, tool_name_prefix=True)                    # tickets_get_ticket, kb_search: no collisions
+    agent = create_agent(os.environ["MODEL"], await client.get_tools())   # a provider:model string
     out = await agent.ainvoke({"messages": [{"role": "user", "content": "Summarise ticket T-1"}]})
     print(out["messages"][-1].content)
 
@@ -365,7 +351,6 @@ from claude_agent_sdk import query, ClaudeAgentOptions
 options = ClaudeAgentOptions(
     mcp_servers={"tickets": {"type": "stdio", "command": sys.executable, "args": ["tickets_server.py"]}},
     allowed_tools=["mcp__tickets__get_ticket"],    # anything else needs permission
-    max_turns=5,
 )
 
 async def main():
@@ -403,6 +388,10 @@ Accuracy usually improves too, because the model chooses among 8 relevant tools 
   "tool unavailable" message rather than crashing the run. Monitor runs completed with degraded tools.
 - **Pin server versions.** Launch local servers with a pinned package version or container digest, and
   record each remote server's version from `initialize`, so tool behaviour does not change under your evals.
+- **Set session timeouts and turn caps.** Raise `client_session_timeout_seconds` (default 5) to about 10
+  for slow-starting stdio servers, and cap runs with `max_turns` (for example 5 in `ClaudeAgentOptions`).
+- **Check adapter and SDK compatibility.** `langchain-mcp-adapters` 0.3.1 fails to import with `mcp` 2.3
+  (it imports `RequestContext` from `mcp.shared.context`); pin `mcp<2` for that stack until the adapter supports 2.x.
 
 ## Trade-offs
 - **MCP tools vs native function tools.** MCP gives reuse and vendor-maintained integrations; native

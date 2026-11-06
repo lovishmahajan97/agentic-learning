@@ -266,28 +266,23 @@ cfg = {"base": "meta-llama/Llama-3.1-8B-Instruct", "base_revision": "<hf commit 
        "train_set": "tickets-v3@9c1e04", "golden_set": "golden-v8@5c2e91"}
 cfg["git_sha"] = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
 
-# --- MLflow: self-hosted tracking server; runs grouped by experiment -------------------------
-mlflow.set_tracking_uri("http://mlflow.internal:5000")
+# --- MLflow: runs grouped by experiment ---
 mlflow.set_experiment("support-classifier")
-with mlflow.start_run(run_name="lora-r16-lr2e-4") as run:
+with mlflow.start_run(run_name="lora-r16-lr2e-4"):
     mlflow.log_params(cfg)                                            # immutable for the run's lifetime
     for step, (train_loss, eval_acc) in enumerate(train_and_eval(cfg)):
         mlflow.log_metrics({"train_loss": train_loss, "eval_acc": eval_acc}, step=step)
-    mlflow.log_artifact("outputs/eval_items.jsonl")                   # per-item outputs for error analysis
     mlflow.log_artifacts("outputs/adapter", artifact_path="model")    # raw files; use a flavour's log_model for pyfunc loading
-    print("register with run id:", run.info.run_id)
-
-# Comparison is the point: params are strings (quote them); ordering uses each metric's LAST value
+# Params are strings (quote them); ordering uses each metric's LAST value
 best = mlflow.search_runs(experiment_names=["support-classifier"], filter_string="params.lora_r = '16'",
                           order_by=["metrics.eval_acc DESC"], max_results=5)
 
-# --- W&B: SaaS or self-hosted server; config + log + a versioned Artifact with lineage --------
+# --- W&B: config + log + a versioned Artifact with lineage ---
 run = wandb.init(project="support-classifier", name="lora-r16-lr2e-4", config=cfg)
 for step, (train_loss, eval_acc) in enumerate(train_and_eval(cfg)):
     wandb.log({"train_loss": train_loss, "eval_acc": eval_acc}, step=step)
 art = wandb.Artifact("support-classifier-adapter", type="model", metadata=cfg)
 art.add_dir("outputs/adapter")
-art.add_file("outputs/eval_items.jsonl")
 run.log_artifact(art)                                                 # becomes v0, v1, ... in the lineage graph
 run.finish()
 ```
@@ -353,6 +348,12 @@ for run, c in curves.items():      # log these as their own metrics so the track
 - **Artifact retention tied to the registry** — when per-item outputs, trajectories and checkpoints pile up.
   Apply bucket lifecycle rules to run artifacts, but exclude anything a registered model version
   references. Monitor storage growth and any registry version whose source URI no longer resolves.
+- **Per-item outputs as a run artifact.** Log `outputs/eval_items.jsonl` with `mlflow.log_artifact` (or
+  `art.add_file` in W&B) so error analysis starts from the run, and register the model with the run's
+  `run.info.run_id`.
+- **Point every client at the shared tracking server** with `MLFLOW_TRACKING_URI` or
+  `mlflow.set_tracking_uri("http://mlflow.internal:5000")`; without it, runs land in a local store on the
+  training node and nobody else can compare them.
 
 ## Trade-offs
 - **Self-hosted MLflow vs operations.** It keeps data in your network and costs nothing in licences, but you

@@ -296,9 +296,7 @@ def erlang_c(lam, mu, c):
         b = a * b / (k + a * b)
     return b / (1 - (a / c) * (1 - b))
 
-def wait_pct(lam, mu, c, p=0.99):
-    if lam / mu >= c:
-        return float("inf")
+def wait_pct(lam, mu, c, p=0.99):      # assumes a stable pool: lam / mu < c
     pw = erlang_c(lam, mu, c)
     return 0.0 if pw <= 1 - p else log(pw / (1 - p)) / (c * mu - lam)
 
@@ -315,8 +313,7 @@ def agent_slots(tasks_per_s, calls_per_task, retry_rate, call_s, target_s=1.0):
 print(round(wait_pct(3.8, 1 / 4, 16), 1))   # 21.8 s p99 wait at rho 0.95
 print(slots_for(3.8, 1 / 4, 1.0))           # 23 slots for p99 wait <= 1 s
 print(slots_for(50, 1 / 6, 1.0))            # 319 slots: Little's law floor is 300
-print(agent_slots(0.5, 8, 0.0, 4))          # 24 slots: 0.5 tasks/s x 8 calls = 4 calls/s
-print(agent_slots(0.5, 8, 0.1, 4))          # 26 slots once 10% of steps retry
+print(agent_slots(0.5, 8, 0.1, 4))          # 26 slots: 0.5 tasks/s x 8 calls x 1.1 (24 without retries)
 ```
 
 | Fleet | Little's law floor | Slots for p99 wait ≤ 1 s | Utilization at that size |

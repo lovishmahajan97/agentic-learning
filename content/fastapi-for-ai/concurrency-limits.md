@@ -375,93 +375,54 @@ A per-worker cap on calls to an LLM provider whose quota is 64 concurrent reques
 a bounded wait and a slot held for the full duration of a stream.
 
 ```python
+# pip install fastapi uvicorn   (asyncio.timeout needs Python 3.11+)
 import asyncio
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
 WORKERS, PROVIDER_LIMIT = 4, 64
+app = FastAPI()
+llm_slots = asyncio.BoundedSemaphore(PROVIDER_LIMIT // WORKERS)  # 16 per worker; lifespan in real code
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    app.state.llm_slots = asyncio.BoundedSemaphore(PROVIDER_LIMIT // WORKERS)  # 16 per worker
-    yield
+async def stream_llm(messages):                # stand-in for the provider stream
+    for token in ["Hello", " world"]:
+        await asyncio.sleep(0.1)
+        yield token
 
-app = FastAPI(lifespan=lifespan)
-
-async def take_slot(sem: asyncio.Semaphore, wait_s: float = 2.0) -> None:
+@app.post("/chat")
+async def chat(body: dict):
     try:
-        async with asyncio.timeout(wait_s):    # Python 3.11+
-            await sem.acquire()
+        async with asyncio.timeout(2.0):       # bounded wait, before headers are sent
+            await llm_slots.acquire()
     except TimeoutError:
         raise HTTPException(503, "LLM capacity full", headers={"Retry-After": "2"})
 
-@app.post("/chat")
-async def chat(body: dict, request: Request):
-    sem = request.app.state.llm_slots
-    await take_slot(sem)                       # reject before headers are sent
-
     async def gen():
         try:
-            async for token in stream_llm(body["messages"]):   # provider call
+            async for token in stream_llm(body["messages"]):
                 yield token
         finally:
-            sem.release()                      # held until the stream really ends
+            llm_slots.release()                # held until the stream really ends
     return StreamingResponse(gen(), media_type="text/plain")
 ```
 
-- **Ceiling:** with an average generation of 8 seconds, 16 slots per worker sustain about 16 / 8 = 2
-  requests per second per worker, 8 across the fleet.
-- **Above that,** requests wait up to 2 seconds and then get 503 instead of piling up.
+- **Above capacity,** requests wait up to 2 seconds and then get 503 instead of piling up.
 - **Not covered here:** the never-started generator edge case above. If the client leaves before the first
   chunk, `gen()` never runs its `finally` and the slot leaks, so production code adds the release-once
   guard and an alert on slots that never return.
 
-### Agent step with capped parallel tool calls
-The model asks for several tools at once. Each call takes the shared tool slot only for its own duration,
-and a per-run limit stops one run from taking all of them.
-- **A run's own extra calls queue** behind each other; only the wait for a shared slot is bounded.
-- **That timeout becomes a tool error** the model can see, not a failed run.
-
-```python
-import asyncio
-
-TOOL_SLOTS = asyncio.BoundedSemaphore(8)        # per worker, created in the lifespan in real code
-PER_RUN_FANOUT = 3
-
-async def call_tool_capped(name, args, impl, run_sem, wait_s=1.0):
-    async with run_sem:                                   # queue behind this run's own calls
-        try:
-            async with asyncio.timeout(wait_s):           # Python 3.11+
-                await TOOL_SLOTS.acquire()                # bounded wait for a shared slot
-        except TimeoutError:
-            return {"tool": name, "error": "busy, retry later"}   # the model sees this as a result
-        try:
-            return {"tool": name, "result": await impl(**args)}
-        finally:
-            TOOL_SLOTS.release()
-
-async def run_tool_batch(tool_calls, registry):
-    run_sem = asyncio.Semaphore(PER_RUN_FANOUT)            # one per agent run
-    return await asyncio.gather(*(call_tool_capped(c["name"], c["args"], registry[c["name"]], run_sem)
-                                  for c in tool_calls))
-```
-
-- **Why per call, not per run:** a run that holds an LLM slot while its tools execute starves other runs of
-  provider capacity it is not using.
-
 ### Runnable: a burst against a bounded semaphore
 Twelve requests arrive at once against 4 slots; each call takes 1 second and waiters give up after 0.5
-seconds. Runs on Python 3.11+ with no dependencies.
+seconds. At most 4 are ever in flight. Python 3.11+, no dependencies.
 
 ```python
 import asyncio
 
 async def main(n=4, requests=12, work_s=1.0, wait_s=0.5):
-    sem, inflight, peak, rejected = asyncio.BoundedSemaphore(n), 0, 0, 0
+    sem, served, rejected = asyncio.BoundedSemaphore(n), 0, 0
 
     async def handle():
-        nonlocal inflight, peak, rejected
+        nonlocal served, rejected
         try:
             async with asyncio.timeout(wait_s):
                 await sem.acquire()
@@ -469,17 +430,15 @@ async def main(n=4, requests=12, work_s=1.0, wait_s=0.5):
             rejected += 1                      # in FastAPI: 503 with Retry-After
             return
         try:
-            inflight += 1
-            peak = max(peak, inflight)
             await asyncio.sleep(work_s)        # stands in for the provider call
+            served += 1
         finally:
-            inflight -= 1
             sem.release()
 
     await asyncio.gather(*(handle() for _ in range(requests)))
-    print(f"peak in flight={peak}, served={requests - rejected}, rejected={rejected}")
+    print(f"served={served}, rejected={rejected}")
 
-asyncio.run(main())   # peak in flight=4, served=4, rejected=8
+asyncio.run(main())   # served=4, rejected=8
 ```
 
 ### Worked sizing: quota, workers and throughput
@@ -514,6 +473,11 @@ asyncio.run(main())   # peak in flight=4, served=4, rejected=8
   slot. Monitor rejections by tenant and idle global capacity.
 - **Uvicorn `--limit-concurrency` as the outer net.** Set it above the sum of your dependency caps so it
   only fires when something else has failed. Monitor its 503s separately from your own.
+- **Cap agent tool calls per call, not per run.** Take a shared tool slot (for example 8 per worker) only
+  around each tool call, add a per-run fan-out semaphore (for example 3) so one run cannot take them all,
+  and turn a slot-wait timeout (about 1 s) into a tool error the model can see rather than a failed run.
+- **Release the LLM slot while tools run.** A run that holds an LLM slot while its tools execute starves
+  other runs of provider capacity it is not using.
 
 ## Trade-offs
 - **Tight cap vs absorbed load.** A tight cap protects the downstream and keeps latency predictable, but

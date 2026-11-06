@@ -212,47 +212,31 @@ reads the sandbox after the run and the trace for tool calls.
 
 ### Stratified sampling and a stable split
 Sample agent sessions from logs with per-intent quotas, split dev/held-out deterministically by id
-hash, and print the standard error to expect. Replace `fetch_logs` with your trace store.
+hash, and print the standard error to expect. The `logs` list stands in for your trace store.
 
 ```python
-import hashlib, json, math, random
-from collections import defaultdict
-from dataclasses import dataclass, asdict, field
+import hashlib, math, random
 
-@dataclass
-class Item:
-    id: str; input: dict; expected: dict; grader: str
-    slice: dict = field(default_factory=dict)      # {"intent": "billing", "lang": "en"}
-    provenance: dict = field(default_factory=dict) # {"source": "logs", "sampled": "2026-10-01"}
-
-def stratified(logs, quota: dict[str, int], seed=0) -> list[Item]:
-    by_intent = defaultdict(list)
-    for row in logs: by_intent[row["intent"]].append(row)
+def stratified(logs, quota, seed=0):            # a quota per slice, not a global random sample
     rng, out = random.Random(seed), []
-    for intent, n in quota.items():                 # a quota per slice, not a global random sample
-        for row in rng.sample(by_intent[intent], min(n, len(by_intent[intent]))):
-            out.append(Item(id=row["id"], input={"message": row["message"], "doc_ids": row["doc_ids"]},
-                            expected={}, grader="rubric_v1",      # expected filled by SMEs, not by a model
-                            slice={"intent": intent}, provenance={"source": "logs", "sampled": "2026-10-01"}))
-    return out
+    for intent, n in quota.items():
+        pool = [row for row in logs if row["intent"] == intent]
+        out += rng.sample(pool, min(n, len(pool)))
+    return out                                  # `expected` is filled by SMEs later, not by a model
 
-def split(item: Item) -> str:                       # stable: the same id always lands in the same split
-    h = int(hashlib.sha256(item.id.encode()).hexdigest(), 16) % 100
-    return "dev" if h < 70 else "heldout"
+def split(item_id):                             # stable: the same id always lands in the same split
+    return "dev" if int(hashlib.sha256(item_id.encode()).hexdigest(), 16) % 100 < 70 else "heldout"
 
-def stderr(p: float, n: int) -> float:
+def stderr(p, n):
     return math.sqrt(p * (1 - p) / n)
 
-def fetch_logs(days: int) -> list[dict]:           # stand-in for your trace store: skewed synthetic traffic
-    rng, mix = random.Random(1), ["billing"] * 50 + ["refund"] * 25 + ["shipping"] * 15 + ["cancel"] * 10
-    return [{"id": f"s{i}", "intent": rng.choice(mix), "message": f"msg {i}", "doc_ids": []}
-            for i in range(days * 40)]
-
-items = stratified(fetch_logs(days=30), {"billing": 60, "refund": 60, "shipping": 40, "cancel": 40})
-with open("golden_v3.jsonl", "w") as f:
-    for it in items: f.write(json.dumps({**asdict(it), "split": split(it)}) + "\n")
+rng = random.Random(1)                          # skewed traffic: half billing, a tenth cancel
+mix = ["billing"] * 50 + ["refund"] * 25 + ["shipping"] * 15 + ["cancel"] * 10
+logs = [{"id": f"s{i}", "intent": rng.choice(mix)} for i in range(1200)]
+items = stratified(logs, {"billing": 60, "refund": 60, "shipping": 40, "cancel": 40})
 print(len(items), "items;", f"SE at p=0.8 ≈ {stderr(0.8, len(items)):.3f}")   # 200 items -> 0.028
 print(f"per-slice SE for billing (n=60) ≈ {stderr(0.8, 60):.3f}")               # -> 0.052
+print(sum(split(r["id"]) == "dev" for r in items), "dev items")               # 151: about 70% by hash
 ```
 
 - **What the output says:** overall differences under about 6 points are inside the noise.

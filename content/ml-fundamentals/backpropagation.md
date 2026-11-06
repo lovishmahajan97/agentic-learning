@@ -209,16 +209,12 @@ def forward(W1, W2):
     return loss, (h_pre, h, p)
 
 loss, (h_pre, h, p) = forward(W1, W2)
-
 # backward: reverse order, each step = local derivative x upstream adjoint
 d_logits = p.copy(); d_logits[np.arange(8), y] -= 1; d_logits /= 8     # dL/dlogits = (p - onehot) / N
 dW2 = h.T @ d_logits                                                   # logits = h @ W2  -> needs h
-d_h = d_logits @ W2.T
-d_hpre = d_h * (h_pre > 0)                                             # ReLU gate     -> needs h_pre
+d_hpre = (d_logits @ W2.T) * (h_pre > 0)                               # ReLU gate     -> needs h_pre
 dW1 = X.T @ d_hpre                                                     # h_pre = X @ W1 -> needs X
-
-# finite-difference check on one weight
-i, j, eps = 1, 2, 1e-5
+i, j, eps = 1, 2, 1e-5                                                 # finite-difference check on one weight
 W1p, W1m = W1.copy(), W1.copy(); W1p[i, j] += eps; W1m[i, j] -= eps
 numeric = (forward(W1p, W2)[0] - forward(W1m, W2)[0]) / (2 * eps)
 print(dW1[i, j], numeric)        # agree to ~1e-10; the saved h, h_pre, X are the "activation memory"
@@ -230,13 +226,11 @@ reward has no gradient, so the update weights the log-probability of the chosen 
 
 ```python
 import torch
-
 logits = torch.randn(4, requires_grad=True)     # router scores for 4 tools
 probs = logits.softmax(-1)
 tool = torch.multinomial(probs, 1).item()       # sampling: no gradient flows through this
 reward = 1.0 if tool == 2 else 0.0              # tool ran, task scored outside the graph
 # reward is a plain float: there is nothing to call .backward() on
-
 surrogate = -torch.log(probs[tool]) * reward    # REINFORCE: log-prob weighted by the outcome
 surrogate.backward()
 print(tool, reward, logits.grad)                # gradient is zero when the run earned no reward
@@ -271,7 +265,6 @@ a_bar = 0.0
 a_bar += b_bar * 2 * a                    # from b = a^2 -> +6
 a_bar += c_bar * 2                        # from c = 2a  -> +2
 print(L, a_bar)                           # 15.0 8.0, and dL/da = 2a + 2 = 8
-
 import torch
 t = torch.tensor(3.0, requires_grad=True)
 (t ** 2 + 2 * t).backward()
@@ -296,19 +289,13 @@ The first diagnostic when "the model is not learning": print the gradient norm o
 
 ```python
 import torch
-
-def grad_norms(model):
-    return {name: p.grad.norm().item()
-            for name, p in model.named_parameters()
-            if p.requires_grad and p.grad is not None}
-
 model = torch.nn.Sequential(*[torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.Sigmoid())
                               for _ in range(12)], torch.nn.Linear(64, 3))
 x, y = torch.randn(32, 64), torch.randint(0, 3, (32,))
 torch.nn.functional.cross_entropy(model(x), y).backward()
-for name, n in grad_norms(model).items():
+for name, p in model.named_parameters():
     if name.endswith("weight"):
-        print(f"{name:12s} {n:.2e}")       # norms shrink by orders of magnitude toward layer 0
+        print(f"{name:12s} {p.grad.norm().item():.2e}")   # norms shrink by orders of magnitude toward layer 0
 ```
 
 ## Production patterns

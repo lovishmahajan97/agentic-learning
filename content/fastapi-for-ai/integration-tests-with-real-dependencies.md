@@ -335,9 +335,7 @@ dependency.
 
 ```python
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import make_url
+from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from testcontainers.postgres import PostgresContainer
 from alembic import command
@@ -346,14 +344,11 @@ from app.main import app, get_session                     # the app's real sessi
 
 @pytest.fixture(scope="session")
 def engine():
-    with PostgresContainer("pgvector/pgvector:pg16") as pg:   # match prod image and major version
-        url = make_url(pg.get_connection_url()).set(drivername="postgresql+psycopg")
+    with PostgresContainer("pgvector/pgvector:pg16", driver="psycopg") as pg:  # match prod image
         cfg = Config("alembic.ini")
-        cfg.set_main_option("sqlalchemy.url", url.render_as_string(hide_password=False))
+        cfg.set_main_option("sqlalchemy.url", pg.get_connection_url())
         command.upgrade(cfg, "head")                         # schema via real migrations
-        eng = create_engine(url)
-        yield eng
-        eng.dispose()
+        yield create_engine(pg.get_connection_url())
 
 @pytest.fixture
 def session(engine):
@@ -363,12 +358,17 @@ def session(engine):
         app.dependency_overrides[get_session] = lambda: s    # app's commits become savepoints
         yield s
         app.dependency_overrides.clear()
-        s.close()
         outer.rollback()                                     # next test sees an empty schema
+```
+
+Two tests on those fixtures:
+
+```python
+from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 def test_create_doc_commits_inside_rollback(session):
-    with TestClient(app) as client:
-        r = client.post("/docs", json={"title": "Refund policy"})  # handler calls commit()
+    r = TestClient(app).post("/docs", json={"title": "Refund policy"})   # handler calls commit()
     assert r.status_code == 201
     assert session.execute(text("SELECT count(*) FROM docs")).scalar_one() == 1
 
@@ -378,71 +378,35 @@ def test_vector_dimension_matches_model(session):
     assert dim == 1024      # fails the build if the migration and embedding model disagree
 ```
 
-Trace it:
 1. **First test:** the endpoint's `commit()` releases a savepoint, so the row is visible to the test's
-   assertion on the same connection.
-2. **Teardown:** `outer.rollback()` discards it, so the next test starts from the migrated, empty schema
-   without truncating anything.
-3. **Second test:** an assertion a fake can never make. It reads the schema the real migration produced
+   assertion on the same connection; `outer.rollback()` then discards it, with no truncation.
+2. **Second test:** an assertion a fake can never make. It reads the schema the real migration produced
    (for pgvector, `atttypmod` holds the declared dimension).
-- **Async apps:** use the same structure with `AsyncEngine`, `AsyncConnection` and `AsyncSession`, driven
-  through `ASGITransport` so the app and the fixtures share one event loop.
-
-### The agent's retrieval tool against real pgvector
-Reuses the `session` fixture above. The test seeds chunks for two tenants and asserts the RAG tool returns
-the nearest chunk for the caller's tenant only. `search_chunks` stands for the tool function the agent
-calls; the table columns are this app's own.
-
-```python
-from sqlalchemy import text
-from app.tools import search_chunks          # the agent's retrieval tool (code under test)
-
-def vec(hot: int, dim: int = 1024) -> str:   # one-hot test vector in pgvector text form
-    v = [0.0] * dim; v[hot] = 1.0
-    return "[" + ",".join(map(str, v)) + "]"
-
-def test_search_is_nearest_and_tenant_scoped(session):
-    rows = [("t1", "refunds take 5 days", 0), ("t1", "shipping is free", 1),
-            ("t2", "t2 secret refund rule", 0)]
-    for tenant, body, hot in rows:
-        session.execute(text("INSERT INTO chunks (tenant_id, body, embedding) "
-                             "VALUES (:t, :b, CAST(:e AS vector))"),
-                        {"t": tenant, "b": body, "e": vec(hot)})
-    hits = search_chunks(session, tenant="t1", query_vec=vec(0), k=2)
-    assert hits[0]["body"] == "refunds take 5 days"            # real distance operator ordering
-    assert all("t2" not in h["body"] for h in hits)            # no cross-tenant leak into the agent
-```
-
-- **What a fake would miss:** the wrong distance operator, a forgotten `tenant_id` filter, or a cast that
-  only fails on a real `vector` column.
 
 ### Redis container: real TTL and `SET NX` semantics
-A Redis container fixture has the same shape: point the app at it by overriding settings, and flush its
-database between tests. These tests catch the "TTL set on the wrong call" bug and a broken lock, both of
-which an agent's tool cache depends on.
+These catch the "TTL set on the wrong call" bug and a broken lock, both of which an agent's tool cache
+depends on.
 
 ```python
-import pytest, redis
+import pytest
 from testcontainers.redis import RedisContainer
 
 @pytest.fixture(scope="session")
-def redis_url():
+def r():
     with RedisContainer("redis:7") as rc:                  # match the production major version
-        yield f"redis://{rc.get_container_host_ip()}:{rc.get_exposed_port(6379)}/0"
+        yield rc.get_client()
 
-@pytest.fixture
-def r(redis_url):
-    client = redis.Redis.from_url(redis_url)
-    yield client
-    client.flushdb()                                        # isolate tests
-    client.close()
+@pytest.fixture(autouse=True)
+def _flush(r):
+    yield
+    r.flushdb()                                            # isolate tests
 
 def cache_put(r, key, value, ttl):                          # code under test (normally imported)
     r.set(key, value, ex=ttl)
 
 def test_cache_put_sets_expiry(r):
     cache_put(r, "llm:v1:t1:abc", b"answer", ttl=60)
-    assert 0 < r.ttl("llm:v1:t1:abc") <= 60                 # -1 would mean "never expires"
+    assert 0 < r.ttl("llm:v1:t1:abc") <= 60                # -1 would mean "never expires"
 
 def test_lock_is_exclusive(r):
     assert r.set("lock:k", "a", nx=True, px=30000)
@@ -480,6 +444,11 @@ def test_lock_is_exclusive(r):
 - **Per-worker databases under xdist.** When parallelising, read the worker id pytest-xdist exposes
   (the `worker_id` fixture) and create one database per worker on a shared container. Monitor suite
   runtime and cross-test flakes.
+- **Test retrieval tools for ordering and tenant scope.** Seed chunks for two tenants with one-hot
+  vectors (exact, known nearest neighbours) and assert the tool returns the nearest chunk for the
+  caller's tenant only; this catches a wrong distance operator, a missing `tenant_id` filter, or a
+  `CAST(... AS vector)` that only fails on a real column. For async apps, use the same fixtures with
+  `AsyncEngine`/`AsyncSession` driven through `ASGITransport` so app and fixtures share one event loop.
 
 ## Trade-offs
 - **Realism vs speed.** Real dependencies catch dialect, migration and semantic bugs that fakes cannot, at

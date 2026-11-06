@@ -208,7 +208,7 @@ A small closed-loop load generator against any OpenAI-compatible streaming serve
 send a request, wait for it to finish, and send the next, so concurrency stays near *c* for the
 whole run.
 - **It reports** aggregate output tokens/s (total tokens over wall time, not an average of
-  per-request rates), median per-stream rate and TTFT percentiles at several concurrency levels.
+  per-request rates), median per-stream rate and median TTFT at several concurrency levels.
 - **That is the curve** you need before setting a per-replica concurrency limit.
 
 ```python
@@ -216,42 +216,32 @@ import asyncio, statistics, time
 from openai import AsyncOpenAI
 
 client = AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="unused")
-MODEL, PROMPT = "my-model", "Explain how a KV cache works in detail."
-
 async def one(max_tokens=256):
-    t0 = time.perf_counter(); t_first = None; n = 0
+    t0, t_first, n = time.perf_counter(), None, 0
     stream = await client.chat.completions.create(
-        model=MODEL, messages=[{"role": "user", "content": PROMPT}], max_tokens=max_tokens,
-        stream=True, stream_options={"include_usage": True})
+        model="my-model", messages=[{"role": "user", "content": "Explain how a KV cache works."}],
+        max_tokens=max_tokens, stream=True, stream_options={"include_usage": True})
     async for ch in stream:
         if ch.usage:                      # authoritative count, sent in the final chunk
             n = ch.usage.completion_tokens
         if ch.choices and ch.choices[0].delta.content and t_first is None:
             t_first = time.perf_counter()
-    return t_first - t0, n, time.perf_counter() - t0
+    return t_first - t0, n, time.perf_counter() - t_first
 
-async def level(c: int, per_worker: int = 4):
+async def level(c, per_worker=4):
     res = []
-    async def worker():                    # closed loop: send the next request when one finishes
+    async def worker():                   # closed loop: send the next request when one finishes
         for _ in range(per_worker):
             res.append(await one())
     t0 = time.perf_counter()
     await asyncio.gather(*(worker() for _ in range(c)))
-    wall = time.perf_counter() - t0
-    out = sum(n for _, n, _ in res)                                   # total output tokens / wall time
-    per_stream = [n / (total - ttft) for ttft, n, total in res if n > 1]
-    ttfts = sorted(ttft for ttft, _, _ in res)
-    print(f"c={c:3d}  aggregate={out / wall:7.0f} tok/s  per-stream p50={statistics.median(per_stream):5.0f} tok/s"
-          f"  TTFT p50={ttfts[len(ttfts)//2]*1e3:5.0f} ms  p95={ttfts[int(len(ttfts)*.95)]*1e3:5.0f} ms")
-
+    agg = sum(n for _, n, _ in res) / (time.perf_counter() - t0)   # total tokens / wall time
+    per_stream = statistics.median((n - 1) / d for _, n, d in res)  # one reader's decode rate
+    ttft = statistics.median(t for t, _, _ in res)
+    print(f"c={c:3d} aggregate={agg:6.0f} per-stream={per_stream:4.0f} tok/s TTFT p50={ttft*1e3:4.0f} ms")
 async def main():
-    await one()                                                       # warm-up
-    for c in (1, 4, 16, 64):
-        await level(c)
-asyncio.run(main())
-# Typical shape: aggregate climbs steeply then flattens; per-stream falls gently then faster;
-# TTFT p95 jumps when the engine starts queueing. Pick the largest c that still meets your SLOs.
-# A closed loop never offers more than c requests, so rerun open-loop before trusting the limit.
+    for c in (1, 4, 16, 64): await level(c)
+asyncio.run(main())   # aggregate climbs then flattens, per-stream falls; TTFT jumps once the engine queues
 ```
 
 ### From a benchmark result to replicas and price
@@ -261,20 +251,17 @@ illustrative; replace them with your measured TTFT, TPOT and traffic.
 ```python
 import math
 
-def aggregate_tok_s(concurrency, n_out, ttft_s, tpot_s):
+def aggregate_tok_s(concurrency, n_out, ttft_s, tpot_s):   # Little's law
     return concurrency * n_out / (ttft_s + (n_out - 1) * tpot_s)
 
 def cost_per_million(gpu_hourly, agg_tok_s):
     return gpu_hourly / (agg_tok_s * 3600) * 1e6
 
 agg = aggregate_tok_s(64, 1000, 0.5, 0.025)        # ~2,512 output tok/s per replica
-peak_demand = 20_000                                # output tok/s needed at peak (assumed)
-print(f"aggregate {agg:,.0f} tok/s, replicas {math.ceil(peak_demand / agg)}")
-print(f"${cost_per_million(3.0, agg):.2f} per million at c=64")
-print(f"${cost_per_million(3.0, 200):.2f} per million at c=1 (200 tok/s)")
-# aggregate 2,512 tok/s, replicas 8
-# $0.33 per million at c=64
-# $4.17 per million at c=1 (200 tok/s)
+print(f"aggregate {agg:,.0f} tok/s, replicas {math.ceil(20_000 / agg)} for a 20,000 tok/s peak")
+print(f"${cost_per_million(3.0, agg):.2f} vs ${cost_per_million(3.0, 200):.2f} per million at c=64 vs c=1")
+# aggregate 2,512 tok/s, replicas 8 for a 20,000 tok/s peak
+# $0.33 vs $4.17 per million at c=64 vs c=1
 ```
 
 ## Production patterns
@@ -298,6 +285,9 @@ print(f"${cost_per_million(3.0, 200):.2f} per million at c=1 (200 tok/s)")
   output tokens weekly.
 - **Compare models by task time, not tokens/s.** For model selection, measure characters per second or
   seconds to complete a fixed task set, because tokenizers differ. Monitor end-to-end task latency.
+- **Warm up, then read the full curve.** Send one warm-up request before measuring, and record per-stream
+  tokens/s and TTFT p95 per concurrency level as well; pick the largest concurrency that still meets
+  both SLOs, then confirm it open-loop, because a closed loop never offers more than *c* requests.
 
 ## Trade-offs
 - **Aggregate vs per-stream.** Raising concurrency raises aggregate tokens/s and lowers cost per token,

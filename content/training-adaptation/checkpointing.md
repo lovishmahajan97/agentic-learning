@@ -191,11 +191,9 @@ sequenceDiagram
 ### Picking the checkpoint to put behind the agent
 Every saved checkpoint of a LoRA fine-tune is scored by the agent eval harness on a frozen suite. The
 release takes the best task success among checkpoints that do not regress tool-call validity or refusals
-beyond 2 points versus the base, and registers it with the metadata a rollback needs.
+beyond 2 points versus the base.
 
 ```python
-import json
-
 base = {"task_success": 0.70, "tool_call_validity": 0.95, "refusal_rate": 0.96}
 results = {  # checkpoint -> scores from the agent eval harness on the frozen suite
     "ckpt-200": {"task_success": 0.74, "tool_call_validity": 0.95, "refusal_rate": 0.96},
@@ -203,15 +201,12 @@ results = {  # checkpoint -> scores from the agent eval harness on the frozen su
     "ckpt-600": {"task_success": 0.81, "tool_call_validity": 0.89, "refusal_rate": 0.90},
 }
 
-def passes_gate(r, max_drop=0.02, guarded=("tool_call_validity", "refusal_rate")):
-    return all(r[k] >= base[k] - max_drop for k in guarded)
+def passes_gate(r, max_drop=0.02):
+    return all(r[k] >= base[k] - max_drop for k in ("tool_call_validity", "refusal_rate"))
 
 eligible = {c: r for c, r in results.items() if passes_gate(r)}
 best = max(eligible, key=lambda c: eligible[c]["task_success"])
-record = {"checkpoint": best, "scores": eligible[best],
-          "base_model": "org/base-8b-instruct", "base_sha256": "<hash of base weights>",
-          "data_version": "agent-traces-v7", "format": "safetensors (adapter only)"}
-print(json.dumps(record, indent=1))      # ckpt-400: the final step is not the one to ship
+print(best)   # ckpt-400: the final step is not the one to ship
 ```
 
 - **Reading it.** `ckpt-600` has the best task success but tool-call validity fell 6 points, so the
@@ -219,48 +214,36 @@ print(json.dumps(record, indent=1))      # ckpt-400: the final step is not the o
   protect the best gate-passing checkpoint until the release decision is made.
 
 ### Save and load the full state in PyTorch
-A compact pair for a single-process loop: full state, atomic rename, keep-last-*k* retention, and RNG
-restoration. The Hugging Face `Trainer` does the same through `save_steps`, `save_total_limit`,
-`load_best_model_at_end`, `metric_for_best_model` and `resume_from_checkpoint`.
+Resuming needs more than weights: optimizer, scheduler, step and RNG state, written atomically. The
+Hugging Face `Trainer` does the same through `save_steps`, `save_total_limit` and
+`resume_from_checkpoint`.
 
 ```python
-import os, random, numpy as np, torch
+import os, torch
 
-def save_checkpoint(dirpath, step, model, opt, sched, scaler, sampler_state, keep_last=3):
+def save_checkpoint(path, step, model, opt, sched):
     state = {"step": step, "model": model.state_dict(), "optimizer": opt.state_dict(),
-             "scheduler": sched.state_dict(), "scaler": scaler.state_dict() if scaler else None,
-             "sampler": sampler_state,                                   # epoch, batches consumed, seed
-             "rng": {"torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all(),
-                     "python": random.getstate(), "numpy": np.random.get_state()}}
-    tmp, final = f"{dirpath}/ckpt-{step}.pt.tmp", f"{dirpath}/ckpt-{step}.pt"
-    torch.save(state, tmp)
-    os.replace(tmp, final)             # atomic rename: a crash mid-write never leaves a half file
-    saved = sorted((int(f.split("-")[1].split(".")[0]), f) for f in os.listdir(dirpath) if f.endswith(".pt"))
-    for _, old in saved[:-keep_last]:  # retention: keep the newest k; keep "best" elsewhere
-        os.remove(f"{dirpath}/{old}")
+             "scheduler": sched.state_dict(), "rng": torch.get_rng_state()}
+    torch.save(state, path + ".tmp")
+    os.replace(path + ".tmp", path)    # atomic rename: a crash mid-write never leaves a half file
 
-def load_checkpoint(path, model, opt, sched, scaler):
-    state = torch.load(path, map_location="cpu", weights_only=False)  # trusted file only: it is a pickle
+def load_checkpoint(path, model, opt, sched):
+    state = torch.load(path, weights_only=False)   # trusted file only: it is a pickle
     model.load_state_dict(state["model"]); opt.load_state_dict(state["optimizer"])
-    sched.load_state_dict(state["scheduler"])
-    if scaler and state["scaler"]:
-        scaler.load_state_dict(state["scaler"])
-    torch.set_rng_state(state["rng"]["torch"]); torch.cuda.set_rng_state_all(state["rng"]["cuda"])
-    random.setstate(state["rng"]["python"]); np.random.set_state(state["rng"]["numpy"])
-    return state["step"], state["sampler"]          # caller fast-forwards the data loader from these
+    sched.load_state_dict(state["scheduler"]); torch.set_rng_state(state["rng"])
+    return state["step"]
 
-# In the loop:  if step % SAVE_EVERY == 0: save_checkpoint(CKPT_DIR, step, model, opt, sched, scaler,
-#                   {"epoch": epoch, "consumed": batches_this_epoch, "seed": 1234 + epoch})
-# On startup:   step, sampler = load_checkpoint(latest, model, opt, sched, scaler); skip `consumed` batches.
+model = torch.nn.Linear(4, 1); opt = torch.optim.AdamW(model.parameters())
+sched = torch.optim.lr_scheduler.StepLR(opt, step_size=10)
+save_checkpoint("ckpt-100.pt", 100, model, opt, sched)
+print(load_checkpoint("ckpt-100.pt", model, opt, sched))   # 100
 ```
 
 - **The part most hand-written loops forget:** the caller restores data order by reseeding the sampler
-  with the saved epoch seed and skipping the consumed batches.
+  with the saved epoch seed and skipping the consumed batches, so save those in the state too.
 - **What the sketch leaves out: the flush.** `os.replace` makes the rename atomic but not durable against
   power loss. On a local or network disk, save through an open file and call `f.flush()` and
   `os.fsync(f.fileno())` before the rename.
-- **Retention here is keep-last-*k* only.** A best-on-validation checkpoint must be copied to a separate
-  name, or this loop will eventually delete it.
 
 ### Choosing the save interval
 A runnable Young–Daly calculator. The third scenario is a spot-GPU fine-tune with a three-minute
@@ -274,17 +257,14 @@ def young_daly(save_stall_s, mtbf_s):
     overhead = save_stall_s / t + t / (2 * mtbf_s)        # saving + expected recomputation
     return t, overhead
 
-scenarios = {                                             # (stall per save, mean time between failures)
-    "sync save, failure every 3 h": (100, 10_800),
-    "async snapshot, failure every 3 h": (5, 10_800),
-    "spot GPUs: 3-min sync save, preempted every 4 h": (180, 14_400),
-}
-for name, (c, m) in scenarios.items():
+for name, (c, m) in {"sync save, failure every 3 h": (100, 10_800),
+                     "async snapshot, failure every 3 h": (5, 10_800),
+                     "spot: 3-min sync save, preempted every 4 h": (180, 14_400)}.items():
     t, ov = young_daly(c, m)
-    print(f"{name:48s} save every {t / 60:5.1f} min  overhead ~{ov:.0%}")
-# sync save, failure every 3 h          save every  24.5 min  overhead ~14%
-# async snapshot, failure every 3 h     save every   5.5 min  overhead ~3%
-# spot GPUs: 3-min sync save, ...       save every  37.9 min  overhead ~16%
+    print(f"{name:42s} save every {t / 60:5.1f} min  overhead ~{ov:.0%}")
+# sync save, failure every 3 h               save every  24.5 min  overhead ~14%
+# async snapshot, failure every 3 h          save every   5.5 min  overhead ~3%
+# spot: 3-min sync save, preempted every 4 h save every  37.9 min  overhead ~16%
 ```
 
 - **Reading it.** Saving once per three-hour epoch on the spot fleet would lose about 1.5 hours per
@@ -310,6 +290,9 @@ for name, (c, m) in scenarios.items():
   resumed loss curve overlays the uninterrupted one. For FSDP or ZeRO jobs, also check asynchronous
   sharded saves through PyTorch Distributed Checkpoint or DeepSpeed. Monitor recovery time after the
   simulated preemption.
+- **Restore every RNG and the AMP scaler on resume.** Save and restore Python, NumPy, torch and per-GPU
+  CUDA RNG states plus the gradient scaler, and keep a best-on-validation checkpoint under a separate name
+  so keep-last-*k* retention cannot delete it.
 
 ## Trade-offs
 - **Frequent saves vs write time and storage.** They bound the work lost to a failure; the balance moves

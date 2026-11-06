@@ -241,28 +241,6 @@ print(first_loss("c7", trace, store))
 # ranking: candidate ranks {'dense': 3, 'bm25': 1}, cut by final_k=3
 ```
 
-### Counting buckets and resolving span-based gold labels
-Runnable as is. The tally decides the work; the resolver keeps gold labels valid across re-chunking.
-
-```python
-from collections import Counter
-
-first_losses = (["ranking"] * 25 + ["parsing"] * 15 + ["generation"] * 10
-                + ["content gap"] * 6 + ["filtering"] * 4)        # 60 labelled failures
-
-tally = Counter(first_losses)
-for stage, n in tally.most_common():
-    print(f"{stage:<12} {n:>3}  {n / len(first_losses):.0%}")
-
-def resolve_gold(doc_id, span, chunks):
-    """Map a gold answer span to whichever current chunks contain it."""
-    return [c["id"] for c in chunks if c["doc_id"] == doc_id and span in c["text"]]
-
-chunks = [{"id": "c1", "doc_id": "refund-policy", "text": "Refunds are accepted within 30 days."},
-          {"id": "c2", "doc_id": "refund-faq", "text": "Old FAQ: refunds within 14 days."}]
-print(resolve_gold("refund-policy", "within 30 days", chunks))   # ['c1']
-```
-
 ### Worked scenario: what the buckets say
 Running attribution across, illustratively, 60 labelled failures of a RAG pipeline:
 

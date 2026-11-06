@@ -309,118 +309,63 @@ flowchart TD
 ```
 
 ## Examples
-### Run-ID middleware that tags every LLM and tool call in an agent run
-A pure ASGI layer outermost sets a contextvar, so code deep inside the agent loop (tool wrappers, LLM
-client hooks, loggers) can tag every line with the run ID without passing it through every function. It
-wraps `send` without buffering, so SSE step events still stream.
+### Run-ID middleware that tags every tool call in an agent run
+A pure ASGI layer outermost sets a contextvar, so code deep inside the agent loop can read the run ID
+without passing it through every function. It never buffers `send`, so SSE steps still stream.
 
 ```python
-import contextvars, uuid, logging
+import contextvars, uuid
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
 from starlette.middleware import Middleware
 
 run_id_var = contextvars.ContextVar("run_id", default="-")
-log = logging.getLogger("agent")
 
 class RunContext:                                  # pure ASGI: same task, contextvar visible inside
     def __init__(self, app): self.app = app
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            return await self.app(scope, receive, send)
-        rid = uuid.uuid4().hex[:12]
-        token = run_id_var.set(rid)
-        async def send_with_id(msg):
-            if msg["type"] == "http.response.start":
-                msg = {**msg, "headers": [*msg.get("headers", []), (b"x-run-id", rid.encode())]}
-            await send(msg)                        # every more_body chunk passes straight through
+        token = run_id_var.set(uuid.uuid4().hex[:12])
         try:
-            await self.app(scope, receive, send_with_id)
+            await self.app(scope, receive, send)   # every more_body chunk passes straight through
         finally:
             run_id_var.reset(token)
 
-async def call_tool(name: str, args: dict) -> dict:
-    log.info("tool=%s run_id=%s", name, run_id_var.get())   # tagged without plumbing
-    return {"ok": True}
-
-app = FastAPI(middleware=[Middleware(RunContext)])          # outermost: everything inside is tagged
+app = FastAPI(middleware=[Middleware(RunContext)])  # outermost: everything inside is tagged
 
 @app.post("/agent/run")
-async def run(body: dict):
+async def run():
     async def events():
-        for step in range(3):
-            await call_tool("search", {"q": body.get("task", "")})
-            yield f"data: step {step} run {run_id_var.get()}\n\n"
+        for step in range(2):
+            yield f"data: step {step} run {run_id_var.get()}\n\n"   # tool code reads it the same way
     return StreamingResponse(events(), media_type="text/event-stream")
+
+print(TestClient(app).post("/agent/run").text.split("\n")[0])  # data: step 0 run 3f9c2a7b1e0d (not "-")
 ```
 
-### Explicit order with the constructor list
-A pure ASGI request-ID layer sits outermost, CORS wraps everything else, and a timing layer uses
-`try/finally` so exceptions are timed too. The 401 raised in the endpoint is turned into a response by
-`ExceptionMiddleware`, then picks up CORS headers and the request ID on its way out.
+### Explicit order with the constructor list, pinned by a test
+CORS sits outside the endpoint, so the 401 that `ExceptionMiddleware` builds from `HTTPException` picks
+up CORS headers on its way out. CORS-order bugs show up only in a browser, so assert the header.
 
 ```python
-import time, uuid
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.testclient import TestClient
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 
-class RequestID:                                   # pure ASGI: no extra task, streaming-safe
-    def __init__(self, app): self.app = app
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            return await self.app(scope, receive, send)
-        rid = uuid.uuid4().hex[:12]
-        scope.setdefault("state", {})["request_id"] = rid
-        async def send_with_id(msg):
-            if msg["type"] == "http.response.start":
-                msg = {**msg, "headers": [*msg.get("headers", []), (b"x-request-id", rid.encode())]}
-            await send(msg)
-        await self.app(scope, receive, send_with_id)
-
-class Timing(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        t0 = time.perf_counter()
-        try:
-            return await call_next(request)        # 4xx from HTTPException arrive here as responses
-        finally:                                   # unhandled exceptions pass through as exceptions
-            ms = (time.perf_counter() - t0) * 1000
-            print(request.state.request_id, request.url.path, f"{ms:.1f}ms")
-
+ORIGIN = "https://app.example.com"
 app = FastAPI(middleware=[                         # list order: first is outermost
-    Middleware(RequestID),
-    Middleware(CORSMiddleware, allow_origins=["https://app.example.com"],
-               allow_methods=["POST"], allow_headers=["*"]),   # default allow_methods is GET only
-    Middleware(Timing),
+    Middleware(CORSMiddleware, allow_origins=[ORIGIN], allow_methods=["POST"], allow_headers=["*"]),
 ])
 
 @app.post("/chat")
-async def chat(request: Request, body: dict):
+async def chat(request: Request):
     if "x-api-key" not in request.headers:
         raise HTTPException(401, "missing key")    # still gets CORS headers: CORS is outside
-    return {"request_id": request.state.request_id, "reply": "..."}
-```
+    return {"reply": "..."}
 
-### Contract tests that pin the order
-CORS-order bugs show up only in a browser (curl ignores CORS headers), so encode the expectations as
-tests against the app above.
-
-```python
-from fastapi.testclient import TestClient
-
-client = TestClient(app)
-ORIGIN = {"Origin": "https://app.example.com"}
-
-def test_401_carries_cors_and_request_id():
-    r = client.post("/chat", json={}, headers=ORIGIN)          # no x-api-key
-    assert r.status_code == 401
-    assert r.headers["access-control-allow-origin"] == "https://app.example.com"
-    assert "x-request-id" in r.headers
-
-def test_preflight_is_answered_by_cors():
-    r = client.options("/chat", headers={**ORIGIN, "Access-Control-Request-Method": "POST"})
-    assert r.status_code == 200
+r = TestClient(app).post("/chat", headers={"Origin": ORIGIN})
+print(r.status_code, r.headers["access-control-allow-origin"])  # 401 https://app.example.com
 ```
 
 ### Worked scenario: three `add_middleware` calls, read top to bottom
@@ -459,6 +404,8 @@ expecting the request ID to exist before auth runs.
 - **Route-specific concerns as dependencies.** Use when only some routes need auth, quotas or a per-user
   token budget: attach `dependencies=[Depends(...)]` on the router, where `HTTPException` works and the
   scheme shows in OpenAPI. Keep middleware for things that must see raw ASGI events.
+- **Set CORS `allow_methods` explicitly.** Its default is GET only, so a POST agent route needs
+  `allow_methods=["POST"]` or preflights fail.
 
 ## Trade-offs
 - **Outer placement vs measuring handler time.** Outer layers see every request including ones later

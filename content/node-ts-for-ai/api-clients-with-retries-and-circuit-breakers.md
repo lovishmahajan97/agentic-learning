@@ -430,135 +430,71 @@ flowchart TD
 ```
 
 ## Examples
-### `fetchWithRetry` and a minimal breaker
-A per-attempt timeout (combined with the caller's own signal), classification that retries ambiguous
-failures (timeouts, resets) only for idempotent requests, full-jitter backoff and `Retry-After`, plus a
-consecutive-failure breaker that lets exactly one probe through when half-open.
-
-Production code uses the SDK's built-in retries and `opossum` or `cockatiel`, but the mechanics are
-these. After the last retryable status the response is returned, not thrown, so the breaker's wrapped
-function must turn 5xx and 429 into failures itself, as the usage line shows.
+### `fetchWithRetry`: per-attempt timeout, jitter and `Retry-After`
+Retries retryable statuses for any request, but network errors and timeouts only when the request is
+idempotent, because the server may already have acted on it.
 
 ```ts
 const RETRYABLE = new Set([408, 429, 500, 502, 503, 504, 529]);
-const NEVER_SENT = ["ECONNREFUSED", "UND_ERR_CONNECT_TIMEOUT"];           // safe for any method
-const MAYBE_SENT = ["ECONNRESET", "ETIMEDOUT", "UND_ERR_SOCKET"];         // idempotent requests only
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const jitter = (n: number, base: number, cap: number) => Math.random() * Math.min(cap, base * 2 ** n);
+const jitter = (n: number) => Math.random() * Math.min(8_000, 500 * 2 ** n);   // full jitter, 8 s cap
 
-export async function fetchWithRetry(url: string, init: RequestInit,
-                                     o = { attempts: 4, baseMs: 500, capMs: 8_000, attemptTimeoutMs: 20_000 }) {
+export async function fetchWithRetry(url: string, init: RequestInit = {}, attempts = 4) {
   const idempotent = ["GET", "HEAD", "PUT", "DELETE"].includes(init.method ?? "GET")
     || new Headers(init.headers).has("idempotency-key");
   for (let n = 0; ; n++) {
-    const timeout = AbortSignal.timeout(o.attemptTimeoutMs);
     try {
-      const res = await fetch(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
-      if (!RETRYABLE.has(res.status) || n + 1 >= o.attempts) return res;     // success, non-retryable, or out of attempts
-      await res.body?.cancel();                                               // free the socket before retrying
-      const retryAfter = Number(res.headers.get("retry-after"));             // seconds form; an HTTP date falls back to jitter
-      await sleep(retryAfter > 0 ? retryAfter * 1000 : jitter(n, o.baseMs, o.capMs));
-    } catch (err: any) {
-      const code = err?.cause?.code;                                          // undici wraps socket errors in err.cause
-      const transient = NEVER_SENT.includes(code) ||
-        (idempotent && (err?.name === "TimeoutError" || MAYBE_SENT.includes(code)));
-      if (!transient || n + 1 >= o.attempts) throw err;                       // caller aborts (AbortError) are never retried
-      await sleep(jitter(n, o.baseMs, o.capMs));
+      const res = await fetch(url, { ...init, signal: AbortSignal.timeout(20_000) });  // per attempt
+      if (!RETRYABLE.has(res.status) || n + 1 >= attempts) return res;  // returned, not thrown
+      await res.body?.cancel();                                          // free the socket first
+      const retryAfter = Number(res.headers.get("retry-after"));         // seconds form only
+      await sleep(retryAfter > 0 ? retryAfter * 1000 : jitter(n));
+    } catch (err) {
+      if (!idempotent || n + 1 >= attempts) throw err;                   // may have been sent
+      await sleep(jitter(n));
     }
   }
 }
+// const r = await fetchWithRetry("http://localhost:8080/flaky");   // stub: 503, 503, 200
+// console.log(r.status);                                           // 200 after 3 attempts
+```
 
+### A minimal `CircuitBreaker` and a tool wrapper that reports failures to the model
+The breaker opens after `threshold` consecutive failures, fails fast for `resetMs`, then lets one probe
+through. `callTool` gives each tool its own breaker and always returns a result the loop can hand back.
+
+```ts
 export class CircuitBreaker {
   private failures = 0; private openedAt = 0; private state: "closed" | "open" | "half" = "closed";
   constructor(private threshold = 5, private resetMs = 30_000) {}
   async call<T>(fn: () => Promise<T>, fallback: () => T): Promise<T> {
     if (this.state !== "closed") {
-      if (this.state === "half" || Date.now() - this.openedAt < this.resetMs) return fallback();  // fail fast; one probe at a time
-      this.state = "half";                                                      // this caller is the probe
+      if (this.state === "half" || Date.now() - this.openedAt < this.resetMs) return fallback();
+      this.state = "half";                                       // this caller is the probe
     }
-    try {
-      const out = await fn();
-      this.failures = 0; this.state = "closed"; return out;
-    } catch (e) {
+    try { const out = await fn(); this.failures = 0; this.state = "closed"; return out; }
+    catch (e) {
       if (++this.failures >= this.threshold || this.state === "half") { this.state = "open"; this.openedAt = Date.now(); }
       throw e;
     }
   }
 }
-// await breaker.call(async () => { const r = await fetchWithRetry(url, init);
-//   if (r.status >= 500 || r.status === 429) throw new Error(`upstream ${r.status}`); return r; }, () => degraded());
-```
 
-### Production snippet: SDK as the single retry owner, `opossum` above it
-The SDK owns retries and per-attempt timeouts; the breaker counts one outcome per logical call and
-ignores 400s, which reflect our bug rather than provider health.
-
-```ts
-import Anthropic from "@anthropic-ai/sdk";
-import CircuitBreaker from "opossum";
-
-const anthropic = new Anthropic({ maxRetries: 2, timeout: 20_000 });   // worst case ~60 s plus backoff
-
-async function complete(prompt: string) {
-  const msg = await anthropic.messages.create({
-    model: process.env.MODEL!, max_tokens: 512,
-    messages: [{ role: "user", content: prompt }],
-  });
-  return msg.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
-}
-
-const breaker = new CircuitBreaker(complete, {
-  timeout: false,                     // the SDK already bounds each attempt
-  errorThresholdPercentage: 50,       // open when over half of calls fail...
-  volumeThreshold: 20,                // ...once at least 20 calls were seen...
-  rollingCountTimeout: 10_000,        // ...in a 10 s rolling window
-  resetTimeout: 30_000,               // then allow a probe after 30 s
-  errorFilter: (e: unknown) => e instanceof Anthropic.BadRequestError,   // 400s do not count
-});
-breaker.fallback(() => "The assistant is busy right now. Please try again in a minute.");
-breaker.on("open", () => console.warn("breaker open: anthropic"));
-
-export const answer = (prompt: string) => breaker.fire(prompt);
-```
-
-### Agent scenario: a tool wrapper that reports failures to the model
-Each tool gets its own breaker (the `CircuitBreaker` class above) and its own retry policy; side-effecting
-tools retry only with an idempotency key. Whatever happens, the loop receives a tool result it can hand
-back to the model.
-
-```ts
 type ToolResult = { content: string; isError: boolean };
-type ToolSpec = { name: string; idempotent: boolean; run: (args: unknown, signal: AbortSignal, key: string) => Promise<string> };
-
+type ToolSpec = { name: string; run: (args: unknown) => Promise<string> };
 const breakers = new Map<string, CircuitBreaker>();
 
-export async function callTool(spec: ToolSpec, args: unknown, idemKey: string, deadline: number): Promise<ToolResult> {
-  const breaker = breakers.get(spec.name) ?? breakers.set(spec.name, new CircuitBreaker(3, 30_000)).get(spec.name)!;
-  const attempts = spec.idempotent ? 3 : 1;                          // never blindly retry a tool that sends or charges
+export async function callTool(spec: ToolSpec, args: unknown): Promise<ToolResult> {
+  if (!breakers.has(spec.name)) breakers.set(spec.name, new CircuitBreaker(3, 30_000));
   try {
-    const content = await breaker.call(async () => {
-      for (let n = 0; ; n++) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) throw new Error("run deadline reached");
-        try {
-          return await spec.run(args, AbortSignal.timeout(Math.min(remaining, 15_000)), idemKey);
-        } catch (e: any) {
-          const status = e?.status as number | undefined;
-          const transient = status === undefined || status === 429 || status >= 500;
-          if (!transient || n + 1 >= attempts) throw e;
-          await sleep(jitter(n, 500, 4_000));
-        }
-      }
-    }, () => { throw new Error(`${spec.name} is temporarily unavailable`); });
+    const content = await breakers.get(spec.name)!.call(() => spec.run(args),
+      () => { throw new Error(`${spec.name} is temporarily unavailable`); });
     return { content, isError: false };
-  } catch (e: any) {
-    return { content: `Tool ${spec.name} failed: ${e.message}. Try another approach or answer without it.`, isError: true };
+  } catch (e) {
+    return { content: `Tool ${spec.name} failed: ${(e as Error).message}. Try another approach.`, isError: true };
   }
 }
 ```
-
-- **Caveat on classification.** Treating a missing `.status` as transient is a simplification; for tools
-  that are not idempotent, `attempts` is 1, so an ambiguous timeout is reported instead of repeated.
 
 ### Worked scenario: a 12-step agent run during a search-API incident
 The search tool is called on 6 of the 12 steps and is failing slowly (every attempt hits a 15 s timeout).
@@ -571,8 +507,6 @@ The search tool is called on 6 of the 12 steps and is failing slowly (every atte
 
 - **The breaker counts logical calls.** It wraps the whole retry sequence, so 3 exhausted sequences (9
   attempts) trip it. The table assumes the last 3 search calls land inside the 30 s reset window.
-- **Probes are full sequences.** A search call after the reset is the half-open probe, and because the
-  breaker wraps the retry loop it runs all 3 attempts (~45 s) before re-opening the breaker.
 
 ### Worked scenario: how nested retries amplify an outage
 One user action during a provider incident, where every attempt fails slowly.
@@ -584,7 +518,7 @@ One user action during a provider incident, where every attempt fails slowly.
 | Same, plus a queue that re-runs the job 3 times | 36 | ~12 minutes, much of it billed if attempts completed server-side |
 | SDK only, under an open breaker | 0 after the trip | about a millisecond, served by the fallback |
 
-Full-jitter sleeps for `fetchWithRetry` defaults (`baseMs: 500`, `capMs: 8_000`, 4 attempts) are drawn
+Full-jitter sleeps for the `fetchWithRetry` defaults (500 ms base, 8 s cap, 4 attempts) are drawn
 from 0-500 ms, 0-1,000 ms and 0-2,000 ms before attempts 2, 3 and 4.
 
 ## Production patterns
@@ -609,6 +543,19 @@ from 0-500 ms, 0-1,000 ms and 0-2,000 ms before attempts 2, 3 and 4.
 - **Fault-injection tests.** Point the client at a stub server, or undici's `MockAgent`, that returns 429
   with `Retry-After`, 529, connection resets and stalls, and assert attempt counts, waits and fallbacks
   in CI. Monitor that the suite runs on every change to client code.
+- **Split network errors by whether the request was sent.** `ECONNREFUSED` and `UND_ERR_CONNECT_TIMEOUT`
+  are safe to retry for any method; `ECONNRESET`, `ETIMEDOUT` and `UND_ERR_SOCKET` only for idempotent
+  requests. undici wraps socket errors, so read the code from `err.cause.code`.
+- **Honour the caller's signal.** Combine it with the per-attempt timeout via `AbortSignal.any`, and never
+  retry a caller `AbortError`.
+- **Breakers see failures, not responses.** A retry helper returns the final 5xx or 429 response, so the
+  function the breaker wraps must throw on those statuses itself.
+- **SDK plus `opossum` settings.** With the SDK owning retries (`maxRetries: 2`, `timeout: 20_000`, worst
+  case ~60 s plus backoff), set `opossum` `timeout: false` and an `errorFilter` for
+  `Anthropic.BadRequestError`, since 400s reflect our bug, not provider health.
+- **Per-tool retry policy.** Retry a tool only if it is idempotent or carries an idempotency key, cap each
+  attempt at the smaller of the remaining run deadline and 15 s, and remember that a half-open probe runs
+  the whole retry sequence (3 attempts, ~45 s) before re-opening.
 
 ## Trade-offs
 - **Success rate vs outage load.** Retries raise success during blips but multiply load during outages;

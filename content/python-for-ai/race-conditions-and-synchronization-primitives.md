@@ -321,126 +321,80 @@ the lock all four pass the check before any deduction lands. Costs are illustrat
 import asyncio
 
 class RunBudget:
-    def __init__(self, dollars: float) -> None:
+    def __init__(self, dollars):
         self.left = dollars
         self._lock = asyncio.Lock()
 
-    async def spend_racy(self, cost: float) -> bool:
+    async def spend_racy(self, cost):
         if self.left < cost:                 # read
             return False
         await asyncio.sleep(0.1)             # model sub-call: other tools run here
         self.left -= cost                    # write based on a stale read
         return True
 
-    async def spend_safe(self, cost: float) -> bool:
-        async with self._lock:               # reserve before awaiting
+    async def spend_safe(self, cost):
+        async with self._lock:               # reserve before awaiting, no await inside
             if self.left < cost:
                 return False
             self.left -= cost
-        try:
-            await asyncio.sleep(0.1)         # model sub-call outside the lock
-            return True
-        except BaseException:
-            async with self._lock:
-                self.left += cost            # refund if the call failed or was cancelled
-            raise
+        await asyncio.sleep(0.1)             # model sub-call outside the lock
+        return True
 
-async def main() -> None:
+async def main():
     for name in ("spend_racy", "spend_safe"):
         b = RunBudget(1.00)
         ok = await asyncio.gather(*(getattr(b, name)(0.40) for _ in range(4)))
         print(f"{name}: approved={sum(ok)} left=${b.left:.2f}")
 
-asyncio.run(main())
-# spend_racy: approved=4 left=$-0.60    spend_safe: approved=2 left=$0.20
+asyncio.run(main())   # spend_racy: approved=4 left=$-0.60 / spend_safe: approved=2 left=$0.20
 ```
 
 - **Reserve, then await.** The safe version decides and deducts with no `await` inside the lock, so the
   lock is held for microseconds rather than the whole model call.
-- **Refund on failure** keeps the budget honest when a tool errors or the turn is cancelled.
+- **Refund on failure** (catch `BaseException`, refund, re-raise) is the Lab's next step; it keeps the
+  budget honest when a tool errors or the turn is cancelled.
 
 ### Token cache plus concurrency cap
 ```python
-import asyncio, time
+import asyncio
 
 class TokenCache:
-    def __init__(self) -> None:
-        self._token: str | None = None
-        self._expires = 0.0
+    def __init__(self):
+        self._token = None                    # a real cache also stores an expiry time
         self._lock = asyncio.Lock()
         self.refreshes = 0
 
-    def _valid(self) -> bool:
-        return self._token is not None and time.monotonic() < self._expires
-
-    async def get(self) -> str:
-        if self._valid():
-            return self._token            # fast path, no lock
+    async def get(self):
+        if self._token is not None:
+            return self._token                # fast path, no lock
         async with self._lock:
-            if not self._valid():         # re-check: someone may have refreshed
+            if self._token is None:           # re-check: someone may have refreshed
                 self.refreshes += 1
-                await asyncio.sleep(0.1)  # stands in for the auth call
-                self._token, self._expires = "tok", time.monotonic() + 300
+                await asyncio.sleep(0.1)      # stands in for the auth call
+                self._token = "tok"
             return self._token
 
-async def call_llm(cache: TokenCache, sem: asyncio.Semaphore, i: int) -> int:
-    async with sem:                       # at most 8 requests in flight
+async def call_llm(cache, sem):
+    async with sem:                           # at most 8 requests in flight
         await cache.get()
-        await asyncio.sleep(0.05)         # stands in for the model call
-        return i
+        await asyncio.sleep(0.05)             # stands in for the model call
 
-async def main() -> None:
+async def main():
     cache, sem = TokenCache(), asyncio.Semaphore(8)
-    results = await asyncio.gather(*(call_llm(cache, sem, i) for i in range(100)))
-    print(len(results), "calls,", cache.refreshes, "token refresh")
+    await asyncio.gather(*(call_llm(cache, sem) for _ in range(100)))
+    print(cache.refreshes, "token refresh")   # 1 token refresh
 
 asyncio.run(main())
 ```
 
 | Variant | Refreshes |
 |---|---|
-| As written | 1 (prints `100 calls, 1 token refresh`) |
+| As written | 1 (prints `1 token refresh`) |
 | Lock removed, `Semaphore(8)` | 8: the first eight through the semaphore all see no token and all await the auth call |
 | Lock removed, semaphore raised to 100 | 100 |
 
-The bug scales with your concurrency setting, which is why it often appears only under load.
-
-### Single-flight loader
-Fifty agent sessions, one index load. The shield keeps one caller's cancellation from killing the shared
-work, and the callback clears a failed task so the next caller retries.
-
-```python
-import asyncio
-
-class SingleFlight:
-    def __init__(self, fetch):
-        self._fetch = fetch
-        self._task: asyncio.Task | None = None
-
-    async def get(self):
-        if self._task is None:                        # first caller on a miss starts the work
-            self._task = asyncio.create_task(self._fetch())
-            self._task.add_done_callback(self._clear_on_error)
-        return await asyncio.shield(self._task)       # a cancelled caller must not cancel the shared fetch
-
-    def _clear_on_error(self, t: asyncio.Task) -> None:
-        if t.cancelled() or t.exception() is not None:
-            self._task = None                         # next caller retries instead of re-reading the error
-
-calls = 0
-async def load_index():
-    global calls
-    calls += 1
-    await asyncio.sleep(0.2)                          # stands in for loading a model or index
-    return "index"
-
-async def main():
-    sf = SingleFlight(load_index)
-    results = await asyncio.gather(*(sf.get() for _ in range(50)))
-    print(len(results), "callers,", calls, "load")    # 50 callers, 1 load
-
-asyncio.run(main())
-```
+The bug scales with your concurrency setting, which is why it often appears only under load. The same
+"compute once, many waiters" need is what single-flight (How it works) solves for index and model loads.
 
 ### Worked numbers: sizing with Little's law
 | Setting | Latency | Result |
@@ -466,6 +420,11 @@ asyncio.run(main())
 - **Create primitives inside the running loop.** Build locks and semaphores in app startup (FastAPI
   lifespan) or per test, not at import time, so each belongs to the loop that uses it. Watch for
   "bound to a different event loop" errors in CI.
+- **Single-flight details.** Await the shared task through `asyncio.shield` so one caller's cancellation
+  does not cancel the load, and clear the stored task in a done-callback when it fails or is cancelled,
+  so the next caller retries instead of re-reading the error.
+- **Refund with `BaseException`.** Refund a reserved budget in `except BaseException:` and re-raise,
+  because `CancelledError` is not an `Exception` and a cancelled turn would otherwise keep its reservation.
 
 ## Trade-offs
 - **Correctness vs serialisation.** A lock makes a critical section correct but serialises it; with a slow

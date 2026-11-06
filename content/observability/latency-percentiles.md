@@ -317,8 +317,7 @@ how often a fan-out request meets a per-call p99. Numbers are illustrative of th
 import numpy as np
 rng = np.random.default_rng(0)
 
-def service(n, slow_frac, slow_ms):
-    """Mostly fast (log-normal around 300 ms) with a slow mode: retries, cold starts, long prompts."""
+def service(n, slow_frac, slow_ms):   # mostly ~300 ms, plus a slow mode (retries, cold starts)
     fast = rng.lognormal(mean=np.log(300), sigma=0.3, size=n)
     slow = rng.random(n) < slow_frac
     return np.where(slow, slow_ms + rng.exponential(1000, size=n), fast)
@@ -364,7 +363,6 @@ def quantile(q, edges, cum):
                 return lo_edge                       # cannot interpolate into +Inf
             return lo_edge + (edge - lo_edge) * (target - lo_count) / (count - lo_count)
         lo_edge, lo_count = edge, count
-    return lo_edge
 
 merged = [a + b for a, b in zip(host_a, host_b)]    # merge = sum counts per bucket
 print(f"A p99      {quantile(0.99, edges, host_a):.2f} s")
@@ -413,16 +411,12 @@ def timed_step(step, tool, fn, *args, **kwargs):
     t0, status = time.perf_counter(), "ok"
     try:
         return fn(*args, **kwargs)
-    except TimeoutError:
-        status = "timeout"; raise
-    except Exception:
-        status = "error"; raise
+    except Exception as e:
+        status = "timeout" if isinstance(e, TimeoutError) else "error"; raise
     finally:   # failures are timed too, so an incident cannot improve the tail
         STEP.labels(step, tool, status).observe(time.perf_counter() - t0)
 
-# In the agent loop:
-# result = timed_step("tool", "crm_lookup", crm.lookup, customer_id)
-# reply  = timed_step("model", "none", client.chat, messages)
+print(timed_step("tool", "crm_lookup", lambda cid: {"tier": "gold"}, "c-17"))   # {'tier': 'gold'}
 ```
 
 ### Worked incident: a p99 that improved during an outage

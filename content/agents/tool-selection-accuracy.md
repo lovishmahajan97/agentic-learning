@@ -168,11 +168,9 @@ from collections import Counter
 
 client = anthropic.Anthropic()
 CASES = [  # (user message, expected tool or None, expected key arguments)
-    ("Where is order ORD-104233?",                  "get_order",     {"order_id": "ORD-104233"}),
-    ("Show me all open orders for customer C-9",    "search_orders", {"customer_id": "C-9", "status": "open"}),
-    ("What is your returns policy?",                None,            {}),
-    ("Refund ORD-104233, it arrived broken",        "issue_refund",  {"order_id": "ORD-104233"}),
-    ("Has C-9 ordered anything that shipped?",      "search_orders", {"customer_id": "C-9", "status": "shipped"}),
+    ("Where is order ORD-104233?",               "get_order",     {"order_id": "ORD-104233"}),
+    ("Show me all open orders for customer C-9", "search_orders", {"customer_id": "C-9", "status": "open"}),
+    ("What is your returns policy?",             None,            {}),
 ]
 
 def first_call(user_msg: str):
@@ -191,11 +189,9 @@ for msg, want, want_args in CASES:
         t["args_ok"] += got == want and all(args.get(k) == v for k, v in want_args.items())
     if got != want:
         confusion[(want, got)] += 1        # includes (tool, None) misses and (None, tool) over-calls
-
 d = lambda a, b: t[a] / max(t[b], 1)
 print(f"recall {d('both', 'needed'):.0%}  precision {d('both', 'called'):.0%}  "
-      f"name {d('name_ok', 'both'):.0%}  args {d('args_ok', 'name_ok'):.0%}")
-print("confusions (expected -> chosen):", dict(confusion))
+      f"name {d('name_ok', 'both'):.0%}  args {d('args_ok', 'name_ok'):.0%}", dict(confusion))
 ```
 
 ### Worked numbers: reading the output

@@ -209,14 +209,12 @@ docs = [
     "Wireless setup: hold the Wi-Fi button for five seconds until the light blinks.",
     "Replacing the toner cartridge on PX-series printers.",
 ]
-queries = ["E4012 PX-200", "how do I stop being billed"]
-
 tok = lambda s: s.lower().replace("-", " ").split()   # the analyzer, shared by index and query
 bm25 = BM25Okapi([tok(d) for d in docs])
 model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 D = model.encode(docs, normalize_embeddings=True)
 
-for q in queries:
+for q in ["E4012 PX-200", "how do I stop being billed"]:
     sparse = bm25.get_scores(tok(q))
     dense = D @ model.encode(q, normalize_embeddings=True)
     print(f"\nQ: {q}")
@@ -233,25 +231,20 @@ for q in queries:
 
 ### One fused search tool vs two tools for the agent
 Two ways to expose retrieval. Separate tools let the model pick, but it will misroute some queries
-(an id sent to semantic search); a single tool that runs both arms and fuses is the safer default. The routing regex mirrors the
-identifier detector below.
+(an id sent to semantic search); a single tool that runs both arms and fuses is the safer default. The `ID` regex is a
+crude identifier detector; tune it to your SKU and ticket formats.
 
 ```python
 import re
 
 ID = re.compile(r"\b(?:[A-Za-z]{1,5}-?\d{2,}|\d{4,})\b")   # identifier-style tokens
 
-# Option A: two tools, the model chooses (descriptions carry the routing rule)
-TOOLS = [
-    {"name": "keyword_search",
-     "description": "Exact-term search. Use for error codes, ticket ids, SKUs, names.",
-     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
-                      "required": ["query"]}},
-    {"name": "semantic_search",
-     "description": "Meaning-based search. Use for natural-language questions.",
-     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
-                      "required": ["query"]}},
-]
+# Option A: two tools, the model chooses; the descriptions carry the routing rule
+schema = {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+TOOLS = [{"name": "keyword_search", "input_schema": schema,
+          "description": "Exact-term search. Use for error codes, ticket ids, SKUs, names."},
+         {"name": "semantic_search", "input_schema": schema,
+          "description": "Meaning-based search. Use for natural-language questions."}]
 
 # Option B: one tool, both arms always run, fused by reciprocal rank
 def search(query, bm25_search, dense_search, k=5, rrf_k=60):
@@ -262,6 +255,8 @@ def search(query, bm25_search, dense_search, k=5, rrf_k=60):
         for rank, doc in enumerate(ranked, start=1):
             scores[doc] = scores.get(doc, 0.0) + w / (rrf_k + rank)
     return sorted(scores, key=scores.get, reverse=True)[:k]
+
+print(search("E4012 PX-200", lambda q, n: ["d1", "d5"], lambda q, n: ["d2", "d1"]))   # ['d1', 'd5', 'd2']
 ```
 
 - **Log which arm contributed** each returned chunk; the trace is how you later see that a wrong answer
@@ -273,7 +268,6 @@ queries the agent actually issued, pulled from traces), then compare the sets ea
 data; plug in your own runs).
 
 ```python
-import re
 # For each labeled query: the gold chunk id and each retriever's top-k ids.
 runs = {
     "E4012 PX-200":            {"gold": "d1", "bm25": ["d1", "d5"], "dense": ["d2", "d1"]},
@@ -281,7 +275,6 @@ runs = {
     "how do I stop being billed": {"gold": "d3", "bm25": ["d1", "d2"], "dense": ["d3", "d4"]},
     "printer will not join wifi": {"gold": "d4", "bm25": ["d4", "d1"], "dense": ["d4", "d3"]},
 }
-ID = re.compile(r"\b(?:[A-Za-z]{1,5}-?\d{2,}|\d{4,})\b")   # crude "identifier-style" detector
 
 def hits(arm, k=1):
     return {q for q, r in runs.items() if r["gold"] in r[arm][:k]}
@@ -290,9 +283,7 @@ for k in (1, 2):
     b, d = hits("bm25", k), hits("dense", k)
     n = len(runs)
     print(f"k={k} recall bm25={len(b)/n:.2f} dense={len(d)/n:.2f} union={len(b | d)/n:.2f}")
-    print("   only bm25 :", sorted(b - d))
-    print("   only dense:", sorted(d - b))
-print("identifier-style:", [q for q in runs if ID.search(q)])
+    print("   only bm25:", sorted(b - d), " only dense:", sorted(d - b))
 ```
 
 | k | BM25 recall | Dense recall | Union (hybrid ceiling) |

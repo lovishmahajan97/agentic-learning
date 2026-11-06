@@ -193,27 +193,19 @@ vision-capable model's computer-use tool and returns one structured action. Test
 `pyautogui` (pruning, scaling, gating); the real-desktop path was not run.
 
 ```python
-import io, base64, time
-import pyautogui                      # drives the real mouse and keyboard: run this only inside a VM
-
+import io, base64, time, pyautogui    # drives the real mouse and keyboard: run this only inside a VM
 TARGET_W, TARGET_H = 1280, 800        # fixed size the model sees, so tokens per step are predictable
 
 def screenshot_b64():
-    img = pyautogui.screenshot()
-    sw, sh = pyautogui.size()          # the coordinate space click() uses; differs from img size on HiDPI
-    sx, sy = sw / TARGET_W, sh / TARGET_H
+    img, (sw, sh) = pyautogui.screenshot(), pyautogui.size()   # size(): click() space, differs on HiDPI
     buf = io.BytesIO(); img.resize((TARGET_W, TARGET_H)).save(buf, "PNG")
-    return base64.b64encode(buf.getvalue()).decode(), sx, sy
+    return base64.b64encode(buf.getvalue()).decode(), sw / TARGET_W, sh / TARGET_H
 
-def act(a, sx, sy):
+def act(a, sx, sy):                                         # key and scroll follow the same pattern
     if a["type"] == "click":
         pyautogui.click(a["x"] * sx, a["y"] * sy)          # model coordinates back to screen coordinates
     elif a["type"] == "type":
         pyautogui.write(a["text"], interval=0.02)
-    elif a["type"] == "key":
-        pyautogui.press(a["key"])
-    elif a["type"] == "scroll":
-        pyautogui.scroll(a["amount"])
     time.sleep(0.8)                                         # let the UI settle before the next look
 
 def run(task, ask_model, is_consequential, max_steps=40, keep_shots=3):
@@ -221,8 +213,7 @@ def run(task, ask_model, is_consequential, max_steps=40, keep_shots=3):
     for step in range(max_steps):
         shot, sx, sy = screenshot_b64()
         history.append({"step": step, "image": shot})
-        shots = [h for h in history if "image" in h]
-        for h in shots[:-keep_shots]:
+        for h in [h for h in history if "image" in h][:-keep_shots]:
             del h["image"]                                  # old screenshots are dead weight in context
         a = ask_model(task, history)                        # one structured action, or {"type": "done"}
         if a["type"] == "done":
@@ -234,9 +225,9 @@ def run(task, ask_model, is_consequential, max_steps=40, keep_shots=3):
     raise RuntimeError("step budget exhausted")
 ```
 
-### Hit-test gating and a run planner
+### Hit-test gating
 Runs as-is. The gate identifies what a click lands on (innermost element wins) and treats unknown
-targets and Enter-in-a-form as consequential; the planner gives completion odds and image tokens.
+targets and Enter-in-a-form as consequential.
 
 ```python
 CONSEQUENTIAL = ("send", "pay", "confirm", "delete", "submit", "purchase")
@@ -258,15 +249,6 @@ tree = [{"label": "Compose dialog", "x": 600, "y": 300, "w": 500, "h": 400},
         {"label": "Send", "x": 880, "y": 620, "w": 80, "h": 36}]
 print(is_consequential({"type": "click", "x": 1070, "y": 320}, tree))   # Close -> False
 print(is_consequential({"type": "click", "x": 912, "y": 640}, tree))    # Send -> True
-
-def plan(per_step, steps, tokens_per_shot=1500, keep=3):
-    success = per_step ** steps
-    tokens_all = tokens_per_shot * steps * (steps + 1) // 2
-    tokens_kept = tokens_per_shot * sum(min(s, keep) for s in range(1, steps + 1))
-    return round(success, 2), tokens_all, tokens_kept
-
-print(plan(0.97, 30))   # (0.4, 697500, 130500)
-print(plan(0.97, 15))   # (0.63, 180000, 63000)
 ```
 
 ### Worked scenario: raising a 30-step task from 40%
@@ -299,6 +281,9 @@ and cost less than a model upgrade you do not control.
   retries per success.
 - **Settle detection over fixed sleeps.** Wait until two consecutive screenshots match (or a timeout
   elapses) before deciding. Monitor "nothing changed" flags and misclick rate.
+- **Budget image tokens per run.** At about 1,500 tokens per screenshot, a 30-step run that resends every
+  screenshot costs about 700k image tokens (15 steps: 180k); keeping the last 3 cuts that to about 130k
+  (15 steps: 63k).
 
 ## Trade-offs
 - **Generality vs efficiency.** Computer use reaches any application, but a task an API does in one call

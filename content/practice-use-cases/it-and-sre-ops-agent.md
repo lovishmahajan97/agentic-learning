@@ -169,31 +169,27 @@ flowchart TD
 
 ## Examples
 ### The policy gate and core loop
-A runnable skeleton: the model only proposes; code decides. Replace `fake_llm` with your provider call
-and the tool lambdas with real Prometheus and Kubernetes clients.
+A runnable skeleton: the model only proposes; code decides. `plan` stands in for the model's tool call,
+and the tool lambdas for real Kubernetes and deploy clients.
 
 ```python
-import time, uuid
+import time
 
 TOOLS = {   # name -> (tier, function)
-    "get_error_rate": (0, lambda svc: {"svc": svc, "5xx_rate": 0.18}),
-    "recent_deploys": (0, lambda svc: [{"svc": svc, "version": "v42", "mins_ago": 12}]),
-    "search_runbooks": (0, lambda q: ["checkout-5xx: if a deploy <30m ago, roll back"]),
-    "restart_pod":     (1, lambda svc, pod: f"restarted {pod}"),
-    "rollback_release":(2, lambda svc, to: f"rolled {svc} back to {to}"),
+    "restart_pod":      (1, lambda svc, pod: f"restarted {pod}"),
+    "rollback_release": (2, lambda svc, to: f"rolled {svc} back to {to}"),
 }
 RATE = {"restart_pod": 3}          # max Tier 1 runs per hour
-done = {}                          # idempotency key -> result
-history = []                       # (timestamp, tool) for rate limits
+done, history = {}, []             # idempotency key -> result; (timestamp, tool)
 
 def gate(tool, args, env, approve, incident):
     tier, fn = TOOLS[tool]
     key = f"{incident}:{tool}:{sorted(args.items())}"   # scoped to this incident
     if key in done:
-        return f"already done: {done[key]}"    # re-fired alert: do not act twice
+        return f"already done: {done[key]}"            # re-fired alert: do not act twice
     recent = [t for t, n in history if n == tool and time.time() - t < 3600]
     if tool in RATE and len(recent) >= RATE[tool]:
-        return "refused: rate limit"           # checked before paging a human
+        return "refused: rate limit"
     if (tier == 1 and env == "prod") or tier == 2:
         if not approve(tool, args):
             return "refused: needs human approval"
@@ -201,25 +197,11 @@ def gate(tool, args, env, approve, incident):
     done[key] = fn(**args)
     return done[key]
 
-def fake_llm(alert, evidence):     # stands in for a tool-calling model
-    if evidence.get("recent_deploys"):
-        return {"tool": "rollback_release", "args": {"svc": alert["svc"], "to": "v41"},
-                "why": "5xx rose after v42 deployed 12 minutes ago; runbook says roll back"}
-    return None
-
-def handle_alert(alert, env="prod", approve=lambda t, a: False):
-    run_id, svc = uuid.uuid4().hex[:8], alert["svc"]
-    incident = alert.get("group_key", f"{svc}:{alert['name']}")   # Alertmanager groupKey
-    evidence = {n: TOOLS[n][1](svc) for n in ("get_error_rate", "recent_deploys")}
-    evidence["runbooks"] = TOOLS["search_runbooks"][1](f"{svc} 5xx")
-    plan = fake_llm(alert, evidence)
-    result = gate(plan["tool"], plan["args"], env, approve, incident) if plan else "no action"
-    return {"run": run_id, "evidence": evidence, "plan": plan, "result": result}
-
-alert, yes = {"svc": "checkout", "name": "High5xx"}, (lambda t, a: True)
-print(handle_alert(alert)["result"])                 # refused: needs human approval
-print(handle_alert(alert, approve=yes)["result"])    # rolled checkout back to v41
-print(handle_alert(alert, approve=yes)["result"])    # re-fire: already done, no second rollback
+plan = ("rollback_release", {"svc": "checkout", "to": "v41"})   # proposed by the model
+no, yes = (lambda t, a: False), (lambda t, a: True)
+print(gate(*plan, "prod", no, "checkout:High5xx"))    # refused: needs human approval
+print(gate(*plan, "prod", yes, "checkout:High5xx"))   # rolled checkout back to v41
+print(gate(*plan, "prod", yes, "checkout:High5xx"))   # already done: no second rollback
 ```
 
 ### Targets for a first production slice

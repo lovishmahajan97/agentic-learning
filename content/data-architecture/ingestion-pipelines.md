@@ -247,33 +247,29 @@ only after the batch is durable.
 import hashlib, datetime as dt
 
 OVERLAP = dt.timedelta(minutes=5)          # tolerate clock skew / late commits at the source
-EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
 
 def sync_once(source, landing, state):
-    wm = state.get("watermark")                              # tz-aware datetime, or None on first run
-    since = wm - OVERLAP if wm else EPOCH
-    seen, newest = set(), wm or EPOCH
-    for item in source.list_changes(since=since):          # yields {id, updated_at, deleted, acl, fetch}
+    since = state["watermark"] - OVERLAP                       # watermark starts at the epoch
+    newest, seen = state["watermark"], set()
+    for item in source.list_changes(since=since):            # yields {id, updated_at, deleted, acl, fetch}
         if item["id"] in seen:
-            continue                                         # same id twice in one listing (paged API)
+            continue                                           # same id twice in one paged listing
         seen.add(item["id"])
         newest = max(newest, item["updated_at"])
         key = (source.name, item["id"])
         if item["deleted"]:
-            landing.write_tombstone(key, at=item["updated_at"])   # idempotent if re-delivered
+            landing.write_tombstone(key)                       # idempotent if re-delivered
             continue
-        raw = item["fetch"]()                                # bytes; respects source rate limits
+        raw = item["fetch"]()
         digest = hashlib.sha256(raw).hexdigest()
-        if landing.latest_hash(key) == digest:               # overlap re-delivery or metadata-only bump
-            if landing.latest_acl(key) != item.get("acl"):
-                landing.update_acl(key, item.get("acl"))     # permissions changed: no re-embed needed
-                landing.emit_event("document.acl_changed", key=key)
+        if landing.latest_hash(key) == digest:                 # overlap re-delivery: no re-embed,
+            landing.update_acl(key, item["acl"])               # but permissions may have changed
             continue
-        landing.write_version(key, raw, hash=digest, acl=item.get("acl"),
+        landing.write_version(key, raw, hash=digest, acl=item["acl"],
                               fetched_at=dt.datetime.now(dt.timezone.utc))
         landing.emit_event("document.changed", key=key, hash=digest)
-    landing.flush()                                          # make writes durable first ...
-    state["watermark"] = newest                              # ... then advance the cursor
+    landing.flush()                                            # make writes durable first ...
+    state["watermark"] = newest                                # ... then advance the cursor
     return len(seen)
 ```
 
@@ -281,33 +277,25 @@ A nightly snapshot-diff job runs alongside this loop to catch deletes the source
 the standard pairing for sources that only expose `updated_at`.
 
 ### The nightly snapshot diff that catches deletes
-Runnable as-is. It compares tonight's `{id: content_hash}` listing with last night's and reports the change
-ratio you would alarm on.
+Runnable as-is. It compares tonight's `{id: content_hash}` listing with last night's; the ids that vanished
+become tombstones.
 
 ```python
 import hashlib
 
 def snapshot_diff(previous, current):
     """previous/current: {source_id: content_hash}. Returns (created, updated, deleted)."""
-    prev_ids, cur_ids = set(previous), set(current)
-    created = sorted(cur_ids - prev_ids)
-    deleted = sorted(prev_ids - cur_ids)                       # the only way a listing reveals deletes
-    updated = sorted(i for i in cur_ids & prev_ids if previous[i] != current[i])
+    created = sorted(current.keys() - previous.keys())
+    deleted = sorted(previous.keys() - current.keys())        # the only way a listing reveals deletes
+    updated = sorted(i for i in current.keys() & previous.keys() if previous[i] != current[i])
     return created, updated, deleted
 
-def h(text):
-    return hashlib.sha256(text.encode()).hexdigest()
+h = lambda text: hashlib.sha256(text.encode()).hexdigest()
+last_night = {"page-1": h("Leave policy v1"), "page-2": h("Expenses"), "page-3": h("Old VPN guide")}
+tonight    = {"page-1": h("Leave policy v2"), "page-2": h("Expenses"), "page-4": h("New VPN guide")}
 
-unchanged  = {f"page-{i}": h(f"doc {i}") for i in range(5, 15)}          # 10 pages nobody touched
-last_night = {**unchanged, "page-1": h("Leave policy v1"), "page-2": h("Expenses"), "page-3": h("Old VPN guide")}
-tonight    = {**unchanged, "page-1": h("Leave policy v2"), "page-2": h("Expenses"), "page-4": h("New VPN guide")}
-
-created, updated, deleted = snapshot_diff(last_night, tonight)
-print("created:", created)    # ['page-4']
-print("updated:", updated)    # ['page-1']
-print("deleted:", deleted)    # ['page-3'] -> write a tombstone for it
-ratio = (len(created) + len(updated) + len(deleted)) / max(len(last_night), 1)
-print(f"change ratio: {ratio:.0%}")   # 23%; alarm if 0% for days or near 100%
+print(snapshot_diff(last_night, tonight))
+# (['page-4'], ['page-1'], ['page-3'])  -> write a tombstone for page-3
 ```
 
 ### Worked scenario: full re-crawl vs incremental at 200,000 documents
@@ -337,24 +325,18 @@ import datetime as dt
 FRESHNESS_SLA = {"orders-db": dt.timedelta(minutes=5), "wiki": dt.timedelta(hours=24)}
 
 def search_docs(query, user_groups, index, landing, state, k=5):
-    """Tool exposed to the agent. Returns chunks plus provenance and a staleness flag per source."""
-    now = dt.datetime.now(dt.timezone.utc)
-    hits = index.search(query, k=k * 3)                       # over-fetch, then filter
-    out = []
-    for hit in hits:
-        key = (hit["source"], hit["source_id"])
-        if landing.is_tombstoned(key):                       # deleted at the source: never return it
-            continue
-        if not set(hit["acl"]) & set(user_groups):           # caller may not read it at the source
-            continue
-        lag = now - state[hit["source"]]["last_sync_ok"]       # last successful sync, not the watermark:
-                                                              # a quiet source has an old watermark but is fresh
+    """Tool exposed to the agent: chunks plus provenance and a staleness flag."""
+    now, out = dt.datetime.now(dt.timezone.utc), []
+    for hit in index.search(query, k=k * 3):                   # over-fetch, then filter
+        if landing.is_tombstoned((hit["source"], hit["source_id"])):
+            continue                                           # deleted at the source: never return it
+        if not set(hit["acl"]) & set(user_groups):
+            continue                                           # caller may not read it at the source
+        lag = now - state[hit["source"]]["last_sync_ok"]       # last good sync, not the watermark
         out.append({"text": hit["text"], "source_id": hit["source_id"],
                     "source_version": hit["source_version"], "fetched_at": hit["fetched_at"].isoformat(),
-                    "stale": lag > FRESHNESS_SLA.get(hit["source"], dt.timedelta(hours=24))})
-        if len(out) == k:
-            break
-    return out   # the system prompt tells the agent to cite source_version and warn when stale is true
+                    "stale": lag > FRESHNESS_SLA[hit["source"]]})
+    return out[:k]   # the system prompt tells the agent to cite source_version and warn when stale
 ```
 
 ### Worked scenario: what a missed delete costs an agent
@@ -390,6 +372,8 @@ The agent itself behaved correctly in every row; the defect, and the fix, live i
   flag in every retrieval tool result, and instruct the agent to cite versions and to ask for confirmation
   before acting on stale data. Monitor the share of agent answers that used a stale source and the delete
   propagation lag from source to tool result.
+- **Propagate ACL-only changes.** When content is unchanged, compare the stored ACL and emit a
+  `document.acl_changed` event only if it differs, so permission edits reach the index without a re-embed.
 
 ## Trade-offs
 - **Snapshot diff: simplicity vs listing cost.** It catches deletes with no source cooperation, but listing

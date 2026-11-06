@@ -188,19 +188,15 @@ db = psycopg.connect("postgresql://app@db/agent")
 
 def retrieve(tenant_id: str, query_vec: list[float], k: int = 5) -> list[tuple]:
     with tracer.start_as_current_span("tool.retrieve") as span:
-        rows = db.execute(
-            "SELECT id, content FROM chunks WHERE tenant_id = %s "
-            "ORDER BY embedding <=> %s::vector LIMIT %s",
-            (tenant_id, str(query_vec), k),
-        ).fetchall()
+        rows = db.execute("SELECT id, content FROM chunks WHERE tenant_id = %s "
+                          "ORDER BY embedding <=> %s::vector LIMIT %s", (tenant_id, str(query_vec), k)).fetchall()
         span.set_attribute("retrieval.doc_ids", [str(r[0]) for r in rows])  # OTel takes str/int lists only
         return rows
 
 def answer(session_id: str, tenant_id: str, question: str, query_vec: list[float]) -> str:
     with tracer.start_as_current_span("agent.step") as span:
         span.set_attribute("session.id", session_id)
-        docs = retrieve(tenant_id, query_vec)
-        context = "\n".join(f"[{d[0]}] {d[1]}" for d in docs)
+        context = "\n".join(f"[{d[0]}] {d[1]}" for d in retrieve(tenant_id, query_vec))
         resp = llm.chat.completions.create(
             model="support-default",                       # alias defined in the gateway config
             messages=[{"role": "system", "content": f"Answer only from:\n{context}"},
@@ -210,8 +206,6 @@ def answer(session_id: str, tenant_id: str, question: str, query_vec: list[float
         span.set_attribute("gen_ai.usage.input_tokens", resp.usage.prompt_tokens)   # GenAI semconv
         span.set_attribute("gen_ai.usage.output_tokens", resp.usage.completion_tokens)
         return resp.choices[0].message.content
-# Configure an OTLP exporter to Langfuse or another backend at startup; check each tool's current docs
-# for the exact metadata fields the gateway records.
 ```
 
 ### Worked scenario: picking the stack for a support agent
@@ -243,6 +237,8 @@ A B2B SaaS team of 4 engineers, Python backend, 30 tenants, about 20k agent conv
   take a max budget). Alert on runs that hit the step cap.
 - **Checkpoint state outside the process.** Store sessions and checkpoints in Postgres (or the framework's
   durable store) so deploys, crashes and human approvals resume safely. Monitor resumed-run success.
+- **Export traces at startup.** Configure an OTLP exporter to Langfuse or another backend when the
+  process starts, and check each tool's current docs for the exact metadata fields the gateway records.
 
 ## Trade-offs
 - **Best-of-breed vs integrated platform.** Separate tools for each layer give flexibility and avoid

@@ -190,14 +190,11 @@ change.
 ```python
 import anthropic, json, collections
 client = anthropic.Anthropic()
-MODEL = "claude-opus-5-5"
 
 LABELS = ["billing", "bug", "feature_request", "other"]
 EVAL = [  # (ticket, expected): in practice 50-200 cases sampled from real traffic
-    ("I was charged twice this month", "billing"),
-    ("Export button does nothing on Safari", "bug"),
-    ("Would love dark mode", "feature_request"),
-    ("Thanks, all sorted now!", "other"),
+    ("I was charged twice this month", "billing"), ("Export button does nothing on Safari", "bug"),
+    ("Would love dark mode", "feature_request"), ("Thanks, all sorted now!", "other"),
 ]
 V1 = "Classify this support ticket."
 V2 = f"""Classify the support ticket into exactly one label from {LABELS}.
@@ -206,24 +203,20 @@ work but does not; feature_request = asking for new behavior; other = anything e
 Reply with JSON: {{"label": "<one of the labels>"}} and nothing else."""
 
 def classify(instruction, ticket):
-    r = client.messages.create(
-        model=MODEL, max_tokens=1024, system=instruction,  # headroom: any thinking counts
-        messages=[{"role": "user", "content": f"<ticket>{ticket}</ticket>"}])
-    text = next((b.text for b in r.content if b.type == "text"), "")  # no text block -> miss
+    r = client.messages.create(model="claude-opus-5-5", max_tokens=1024, system=instruction,  # thinking counts
+                               messages=[{"role": "user", "content": f"<ticket>{ticket}</ticket>"}])
     try:
-        return json.loads(text)["label"]
-    except (json.JSONDecodeError, KeyError, TypeError):
+        return json.loads(next(b.text for b in r.content if b.type == "text"))["label"]
+    except (StopIteration, json.JSONDecodeError, KeyError, TypeError):
         return None                       # unparseable: a format failure, not a wrong label
 
-RUNS = 3                                  # sampled outputs: score a distribution, not one draw
 for name, prompt in (("v1", V1), ("v2", V2)):
     outcome = collections.Counter()
-    for ticket, expected in EVAL:
-        for _ in range(RUNS):
-            got = classify(prompt, ticket)
-            outcome["format" if got is None else "invented" if got not in LABELS
-                    else "correct" if got == expected else "wrong"] += 1
-    print(name, dict(outcome))            # each failure bucket points to a different fix
+    for ticket, expected in EVAL * 3:     # 3 samples each: score a distribution, not one draw
+        got = classify(prompt, ticket)
+        outcome["format" if got is None else "invented" if got not in LABELS
+                else "correct" if got == expected else "wrong"] += 1
+    print(name, dict(outcome))            # e.g. v1 {'format': 9, 'invented': 3}, v2 {'correct': 12}
 ```
 
 - **The breakdown is the point, not the total.** V1 lands almost entirely in `format` (it answers in

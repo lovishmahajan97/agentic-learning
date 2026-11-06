@@ -428,14 +428,11 @@ while True:
     if resp.stop_reason != "tool_use":
         break
     messages.append({"role": "assistant", "content": resp.content})   # echo every block back
-    results = []
-    for block in resp.content:
-        if block.type == "tool_use":
-            out = get_order(**block.input) if block.name == "get_order" else "unknown tool"
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": out})
-    messages.append({"role": "user", "content": results})               # all results, one message
+    messages.append({"role": "user", "content": [                     # all results, one message
+        {"type": "tool_result", "tool_use_id": b.id, "content": get_order(**b.input)}
+        for b in resp.content if b.type == "tool_use"]})
 
-if resp.stop_reason == "refusal" or resp.stop_reason == "max_tokens":
+if resp.stop_reason in ("refusal", "max_tokens"):
     print("did not finish normally:", resp.stop_reason)
 print("".join(b.text for b in resp.content if b.type == "text"))
 ```

@@ -271,39 +271,31 @@ log a hash instead of content unless the tenant's policy allows content. An agen
 
 ```python
 """Per-tenant compliance policy enforced at the model gateway (the chokepoint)."""
-import hashlib, json, time, uuid
+import hashlib
 
-POLICIES = {
-    "eu-insurer": {"providers": {"provider-a"}, "regions": {"eu-west-1", "eu-central-1"},
-                   "log_content": False},
-    "us-hospital": {"providers": {"provider-b"}, "regions": {"us-east-1"},      # BAA-covered only
-                    "log_content": False},
-}
+POLICIES = {"eu-insurer": {"providers": {"provider-a"}, "regions": {"eu-west-1", "eu-central-1"},
+                           "log_content": False}}
 
 class PolicyViolation(Exception):
     pass
 
 def route(tenant, provider, region, prompt):
-    policy = POLICIES.get(tenant)
-    if policy is None:
-        raise PolicyViolation(f"no policy for tenant {tenant}: deny by default")
-    if provider not in policy["providers"] or region not in policy["regions"]:
+    policy = POLICIES.get(tenant)                    # unknown tenant: deny by default
+    if policy is None or provider not in policy["providers"] or region not in policy["regions"]:
         raise PolicyViolation(f"{tenant}: {provider}/{region} not allowed")
-    trace = {"request_id": str(uuid.uuid4()), "tenant": tenant, "provider": provider,
-             "region": region, "ts": int(time.time()),
+    trace = {"tenant": tenant, "region": region,
              "input_sha256": hashlib.sha256(prompt.encode()).hexdigest()[:16]}
     if policy["log_content"]:
         trace["prompt"] = prompt
     return trace          # the call to the provider would happen here
 
-print(json.dumps(route("eu-insurer", "provider-a", "eu-west-1", "Claim 4411 for J. Doe"))[:120])
-for args in (("eu-insurer", "provider-a", "us-east-1"), ("unknown", "provider-a", "eu-west-1")):
-    try:
-        route(*args, prompt="x")
-    except PolicyViolation as e:
-        print("REFUSED:", e)          # refusal logs are compliance evidence
+print(route("eu-insurer", "provider-a", "eu-west-1", "Claim 4411 for J. Doe"))
+# {'tenant': 'eu-insurer', 'region': 'eu-west-1', 'input_sha256': '...'}  (no prompt text)
+try:
+    route("eu-insurer", "provider-a", "us-east-1", "Claim 4411 for J. Doe")
+except PolicyViolation as e:
+    print("REFUSED:", e)          # refusal logs are compliance evidence
 # REFUSED: eu-insurer: provider-a/us-east-1 not allowed
-# REFUSED: no policy for tenant unknown: deny by default
 ```
 
 - **Hash caveat.** A plain hash of a short, guessable input can be reversed by guessing; in production

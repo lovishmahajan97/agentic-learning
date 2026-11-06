@@ -150,39 +150,34 @@ provider. Pydantic validation is the escalation signal.
 
 ```python
 # pip install openai pydantic   (checked against openai 3.37.0, pydantic 2.14.1 with stub endpoints)
-import json, os
+from typing import Literal
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 small = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")   # Ollama OpenAI-compatible API
 large = OpenAI()                                                       # hosted, uses OPENAI_API_KEY
-SMALL_MODEL, LARGE_MODEL = "qwen2.5:3b", os.environ["LARGE_MODEL"]     # check current model ids
+PROMPT = 'Pick get_order, refund_order or handoff_human. Reply with JSON only: {"tool": ..., "order_id": ...}'
 
 class Route(BaseModel):
-    tool: str
+    tool: Literal["get_order", "refund_order", "handoff_human"]
     order_id: str | None = None
 
-TOOLS = {"get_order", "refund_order", "handoff_human"}
-PROMPT = ("Pick one tool from get_order, refund_order, handoff_human for the request. "
-          'Reply with JSON only: {"tool": ..., "order_id": ...}')
-
 def ask(client, model, text):
-    r = client.chat.completions.create(model=model, temperature=0,
-        response_format={"type": "json_object"},
+    r = client.chat.completions.create(model=model, temperature=0, response_format={"type": "json_object"},
         messages=[{"role": "system", "content": PROMPT}, {"role": "user", "content": text}])
-    return r.choices[0].message.content
+    return Route.model_validate_json(r.choices[0].message.content or "")   # bad JSON raises too
 
 def route(text):
     try:
-        out = Route.model_validate(json.loads(ask(small, SMALL_MODEL, text)))
-        if out.tool in TOOLS and (out.tool == "handoff_human" or out.order_id):
+        out = ask(small, "qwen2.5:3b", text)                 # check current model ids
+        if out.tool == "handoff_human" or out.order_id:      # valid but incomplete also escalates
             return out, "slm"
-    except (json.JSONDecodeError, TypeError, ValidationError):   # TypeError: empty content
-        pass                                        # invalid output is the escalation signal
-    return Route.model_validate(json.loads(ask(large, LARGE_MODEL, text))), "llm"
+    except ValidationError:                                  # invalid output is the escalation signal
+        pass
+    return ask(large, "YOUR_LARGE_MODEL", text), "llm"     # your hosted model id
 
 for q in ["Where is order A17?", "I want my money back for B22", "Your app is awful, get me a person"]:
-    print(route(q))
+    print(route(q))   # e.g. (Route(tool='get_order', order_id='A17'), 'slm')
 ```
 
 ## Production patterns

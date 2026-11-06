@@ -305,49 +305,74 @@ sequenceDiagram
 ```
 
 ## Examples
-### Agent server: clients, tool registry check and a clean close
-Every resource registers its close on the exit stack. A tool with a duplicate name or an empty
-description fails startup, so the deploy stops before any user's run reaches it.
+### Agent server: shared client, tool registry check and a clean close
+The client registers its close on the exit stack. A tool with a duplicate name or an empty description
+fails startup, so the deploy stops before any user's run reaches it. Requires `fastapi` and `httpx`.
 
 ```python
-import os
 from contextlib import AsyncExitStack, asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request
-from pydantic import BaseModel
+from fastapi.testclient import TestClient
 
-class SearchArgs(BaseModel):
-    query: str
+TOOLS = [("search_docs", "Search internal docs by keyword."), ("search_web", "Search the public web.")]
 
-TOOLS = [  # name, description, argument model
-    ("search_docs", "Search internal docs by keyword.", SearchArgs),
-    ("search_web", "Search the public web.", SearchArgs),
-]
-
-def check_tools(tools) -> list[dict]:
-    names = [n for n, _, _ in tools]
-    if len(names) != len(set(names)):
-        raise RuntimeError(f"duplicate tool names: {names}")       # -> lifespan.startup.failed
-    if any(not d.strip() for _, d, _ in tools):
-        raise RuntimeError("every tool needs a description the model can read")
-    return [{"name": n, "description": d, "parameters": m.model_json_schema()} for n, d, m in tools]
+def check_tools(tools) -> list[str]:
+    names = [n for n, _ in tools]
+    if len(names) != len(set(names)) or any(not d.strip() for _, d in tools):
+        raise RuntimeError("tool names must be unique, descriptions non-empty")  # startup fails
+    return names
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with AsyncExitStack() as stack:
-        llm_key = os.environ["LLM_API_KEY"]                         # missing key: deploy fails
-        app.state.llm_http = await stack.enter_async_context(
-            httpx.AsyncClient(base_url=os.environ["LLM_BASE_URL"],
-                              headers={"Authorization": f"Bearer {llm_key}"}, timeout=60.0))
-        app.state.tools_http = await stack.enter_async_context(httpx.AsyncClient(timeout=15.0))
-        app.state.tool_schemas = check_tools(TOOLS)                 # validated once per worker
-        yield                                                       # serve agent runs
-    # stack closed both clients, also when startup failed halfway
+        app.state.http = await stack.enter_async_context(httpx.AsyncClient(timeout=60.0))
+        app.state.tools = check_tools(TOOLS)            # validated once per worker
+        yield                                           # serve agent runs
+    print("client closed:", app.state.http.is_closed)   # stack closed it, also on failed startup
 
 app = FastAPI(lifespan=lifespan)
 
-def get_tool_schemas(request: Request) -> list[dict]:
-    return request.app.state.tool_schemas                           # override in tests
+@app.get("/tools")
+async def tools(request: Request):
+    return request.app.state.tools
+
+with TestClient(app) as c:                              # runs the real lifespan
+    print(c.get("/tools").json())   # ['search_docs', 'search_web'], then: client closed: True
+```
+
+### Runnable: an exit stack unwinds a half-finished startup
+Pure asyncio. Startup opens two resources and fails on the third; the stack closes what was opened, in
+reverse order, and the error propagates the way Starlette turns it into a failed startup.
+
+```python
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
+
+class Resource:                                   # stand-in for a client or engine
+    def __init__(self, name): self.name = name
+    async def __aenter__(self): print("open ", self.name); return self
+    async def __aexit__(self, *exc): print("close", self.name)
+
+async def load_model():
+    raise RuntimeError("corrupt weights file")    # third startup step fails
+
+@asynccontextmanager
+async def lifespan(app: dict):
+    async with AsyncExitStack() as stack:
+        app["http"] = await stack.enter_async_context(Resource("http client"))
+        app["db"] = await stack.enter_async_context(Resource("db engine"))
+        app["model"] = await load_model()         # raises: stack unwinds db, then http
+        yield
+
+async def main():
+    try:
+        async with lifespan({}):
+            print("serving")                      # never reached
+    except RuntimeError as e:
+        print("startup failed:", e)               # Starlette would send lifespan.startup.failed
+
+asyncio.run(main())  # open http client, open db engine, close db engine, close http client, startup failed
 ```
 
 ### Worked scenario: rolling deploy with long agent runs in flight
@@ -362,94 +387,6 @@ Runs take 8 steps of ~5 s (about 40 s). Kubernetes' default termination grace pe
 
 - **Lifespan's job here:** open the checkpoint store before `yield`, close it after. The checkpoint per
   step is what makes shutdown safe, because teardown is best-effort.
-
-### Embedding service: load once, warm up, close everything
-An embedding service that loads a sentence-transformer model once, builds one shared HTTP client for a
-reranking provider, warms the model, and closes everything at shutdown even if startup fails halfway.
-
-- **`RERANK_URL` and `RERANK_KEY` come from the environment**, so a missing key fails startup.
-- **Run with `uvicorn app:app --workers 2`** and the model is loaded twice, once per worker, before either
-  accepts a request.
-- **With `with TestClient(app) as c:`** the same lifespan runs in the test.
-
-```python
-import asyncio, os
-from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Annotated
-import httpx
-from fastapi import Depends, FastAPI, Request
-from pydantic import BaseModel, Field
-from sentence_transformers import SentenceTransformer
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    async with AsyncExitStack() as stack:
-        key = os.environ["RERANK_KEY"]              # KeyError here -> startup.failed, worker exits
-        app.state.http = await stack.enter_async_context(
-            httpx.AsyncClient(base_url=os.environ["RERANK_URL"],
-                              headers={"Authorization": f"Bearer {key}"}, timeout=10.0))
-        model = await asyncio.to_thread(SentenceTransformer, "all-MiniLM-L6-v2")
-        await asyncio.to_thread(model.encode, ["warm-up"])   # pay first-call costs now
-        app.state.model = model
-        yield                                        # serve traffic
-    # leaving the stack closed the client (also on a failed startup)
-
-app = FastAPI(lifespan=lifespan)
-
-def get_model(request: Request) -> SentenceTransformer:
-    return request.app.state.model                   # override this in tests
-
-class EmbedIn(BaseModel):
-    texts: list[str] = Field(min_length=1, max_length=256)   # empty list would break .shape[1]
-
-@app.post("/embed")
-async def embed(body: EmbedIn, model: Annotated[SentenceTransformer, Depends(get_model)]):
-    vectors = await asyncio.to_thread(model.encode, body.texts)   # CPU/GPU work off the loop
-    return {"dim": int(vectors.shape[1]), "count": len(body.texts)}
-```
-
-### Runnable: an exit stack unwinds a half-finished startup
-Pure asyncio, no server. Startup opens two resources and fails on the third; the stack closes what was
-opened, in reverse order, and the error propagates the way Starlette turns it into a failed startup.
-
-```python
-import asyncio
-from contextlib import AsyncExitStack, asynccontextmanager
-
-class Resource:                                   # stand-in for a client or engine
-    def __init__(self, name): self.name = name
-    async def __aenter__(self):
-        print("open ", self.name)
-        return self
-    async def __aexit__(self, *exc):
-        print("close", self.name)
-
-async def load_model():
-    raise RuntimeError("corrupt weights file")    # third startup step fails
-
-@asynccontextmanager
-async def lifespan(app: dict):
-    async with AsyncExitStack() as stack:
-        app["http"] = await stack.enter_async_context(Resource("http client"))
-        app["db"] = await stack.enter_async_context(Resource("db engine"))
-        app["model"] = await load_model()         # raises: stack unwinds db, then http
-        yield
-
-async def main():
-    app = {}
-    try:
-        async with lifespan(app):
-            print("serving")                      # never reached
-    except RuntimeError as e:
-        print("startup failed:", e)               # Starlette would send lifespan.startup.failed
-
-asyncio.run(main())
-# open  http client
-# open  db engine
-# close db engine
-# close http client
-# startup failed: corrupt weights file
-```
 
 ### Worked scenario: the import-time model from Check yourself, moved into lifespan
 A 3 GB model, four Uvicorn workers, provider calls from every endpoint.
@@ -489,6 +426,11 @@ A 3 GB model, four Uvicorn workers, provider calls from every endpoint.
   `dependency_overrides` for the expensive pieces.
 - **Write as you go, not at shutdown.** Use for usage records, audit rows and metrics buffers: flush per
   request or on a short timer, because a forced exit skips teardown.
+- **Load models off the event loop, clients with explicit timeouts.** In lifespan, load and warm a model
+  with `await asyncio.to_thread(...)`, and build one shared `httpx.AsyncClient` per upstream with its
+  own timeout (for example 60 s for the LLM, 15 s for tool backends, 10 s for a reranker). Store tool
+  schemas from `model_json_schema()` on `app.state` and read them through a dependency that tests can
+  override.
 
 ## Trade-offs
 - **Fast requests vs slow startup.** Loading in lifespan makes every request fast and predictable, but

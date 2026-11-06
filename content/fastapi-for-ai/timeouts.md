@@ -351,27 +351,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-def remaining(deadline: float) -> float:
-    return max(0.0, deadline - asyncio.get_running_loop().time())
-
 @app.post("/chat")
 async def chat(req: Request, body: dict):
-    loop = asyncio.get_running_loop()
+    loop, http = asyncio.get_running_loop(), req.app.state.http
     deadline = loop.time() + REQUEST_BUDGET
-    http: httpx.AsyncClient = req.app.state.http
     try:
-        async with asyncio.timeout(REQUEST_BUDGET):
-            docs = await http.post("http://search/q", json=body,
-                                   timeout=min(1.5, remaining(deadline)))
-            # generation gets whatever retrieval left over
+        async with asyncio.timeout(REQUEST_BUDGET):          # backstop for the whole request
+            docs = await http.post("http://search/q", json=body, timeout=1.5)
+            left = max(0.0, deadline - loop.time())          # generation gets what retrieval left
             r = await http.post("http://llm/v1/chat", json={"docs": docs.json(), **body},
-                                timeout=httpx.Timeout(remaining(deadline), connect=2.0))
-            r.raise_for_status()
+                                timeout=httpx.Timeout(left, connect=2.0))
             return r.json()
     except (TimeoutError, httpx.TimeoutException):
         raise HTTPException(504, "upstream model did not answer in time")
-    except httpx.ConnectError:
-        raise HTTPException(503, "model provider unreachable", headers={"Retry-After": "5"})
 ```
 
 | Moment | What happens |
@@ -391,88 +383,24 @@ total deadline stops it. Requires Python 3.11+.
 ```python
 import asyncio
 
-class StreamStalled(Exception):
-    pass
-
-async def fake_stream(gap: float, n: int):
-    for i in range(n):
-        await asyncio.sleep(gap)                  # provider sends one token every `gap` s
-        yield f"tok{i}"
-
-async def with_gap_limit(stream, gap_limit: float):
-    it = stream.__aiter__()
+async def fake_stream(gap: float):
     while True:
-        try:
-            yield await asyncio.wait_for(anext(it), gap_limit)   # per-chunk cap, like httpx read
-        except StopAsyncIteration:
-            return
-        except TimeoutError:
-            raise StreamStalled(f"no chunk for {gap_limit}s") from None
+        await asyncio.sleep(gap)                  # provider sends one token every `gap` s
+        yield "tok"
 
 async def consume(gap_limit: float, total: float) -> str:
-    got = 0
+    got, it = 0, fake_stream(gap=0.3)
     try:
-        async with asyncio.timeout(total):        # total cap: the application deadline
-            async for _ in with_gap_limit(fake_stream(gap=0.3, n=100), gap_limit):
+        async with asyncio.timeout(total) as deadline:        # total cap: the application deadline
+            while True:
+                await asyncio.wait_for(anext(it), gap_limit)  # per-chunk cap, like httpx read
                 got += 1
-        return f"finished: {got} chunks"
-    except StreamStalled as e:
-        return f"stalled after {got} chunks ({e})"
     except TimeoutError:
-        return f"deadline hit after {got} chunks"
+        return f"{'deadline hit' if deadline.expired() else 'stalled'} after {got} chunks"
 
 print(asyncio.run(consume(gap_limit=1.0, total=2.0)))  # deadline hit after 6 chunks
-print(asyncio.run(consume(gap_limit=0.1, total=2.0)))  # stalled after 0 chunks (no chunk for 0.1s)
+print(asyncio.run(consume(gap_limit=0.1, total=2.0)))  # stalled after 0 chunks
 ```
-
-### Agent loop with a run budget, a step cap and per-tool timeouts
-`llm` and `tools` are your own async callables; the point is where the limits sit. Requires Python 3.11+.
-
-```python
-import asyncio, json
-
-RUN_BUDGET = 25.0      # proxy read timeout is 30 s
-TOOL_TIMEOUT = 5.0
-FINAL_TURN_RESERVE = 4.0
-MAX_STEPS = 8
-
-async def run_agent(llm, tools: dict, messages: list) -> str:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + RUN_BUDGET
-    left = lambda: max(0.0, deadline - loop.time())
-    async with asyncio.timeout(RUN_BUDGET):              # backstop for the whole run
-        for step in range(MAX_STEPS):
-            reply = await llm(messages, timeout=left())   # model turn capped by budget left
-            messages.append(reply)
-            if not reply.get("tool_calls"):
-                return reply["content"]
-            for call in reply["tool_calls"]:
-                if left() < FINAL_TURN_RESERVE:            # keep time for the answer
-                    result = {"error": "budget exhausted, answer with what you have"}
-                else:
-                    limit = min(TOOL_TIMEOUT, left() - FINAL_TURN_RESERVE)
-                    try:
-                        async with asyncio.timeout(limit):
-                            result = await tools[call["name"]](**call["args"])
-                    except TimeoutError:                   # tool timeout becomes data for the model
-                        result = {"error": f"{call['name']} timed out after {limit:.1f}s"}
-                messages.append({"role": "tool", "tool_call_id": call["id"],
-                                 "content": json.dumps(result)})
-    return "stopped: step limit reached"
-# The route maps a TimeoutError escaping run_agent to its own 504 (or a partial answer) and logs the step.
-```
-
-Illustrative timeline for one run:
-
-| Elapsed | Event | Budget left |
-|---|---|---|
-| 2.1 s | model turn 1 asks for `search` | 22.9 s |
-| 7.1 s | `search` hits its 5 s limit, error result appended | 17.9 s |
-| 9.0 s | model turn 2 asks for `fetch_doc` instead | 16.0 s |
-| 10.2 s | `fetch_doc` returns | 14.8 s |
-| 13.5 s | model turn 3 answers | 11.5 s spare, user got an answer |
-
-Without the tool limit, the stalled `search` would have held the run until the proxy's 30 s 504.
 
 ### Worked scenario: the hidden retry multiplier
 Illustrative numbers for one call during a provider incident, using the worst-case formula above.
@@ -507,6 +435,11 @@ of the second.
 - **Budget propagation to tools and sub-agents** — for internal fan-out. Send remaining milliseconds in a
   request header of your choosing and have the tool service or sub-agent start its own deadline from it.
   Monitor downstream work started after the caller's deadline.
+- **Connect failures are a 503, not a 504.** Map `httpx.ConnectError` to 503 with a `Retry-After`
+  header (for example 5 s), since the provider was unreachable rather than slow.
+- **Reserve time for the final answer.** In an agent loop, give each tool `min(tool limit, budget left
+  - reserve)` and stop calling tools once the budget left drops below the reserve (for example 4 s of a
+  25 s run budget with a 5 s tool limit), appending an "answer with what you have" tool result instead.
 
 ## Trade-offs
 - **Short vs long timeouts.** Short ones free capacity quickly and surface outages early, but cut off

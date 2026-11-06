@@ -408,143 +408,76 @@ sequenceDiagram
 ```
 
 ## Examples
-### Stdio server plus a host that bridges to Claude
-- **Server:** one tool with a Zod-typed input, logging to stderr because stdout is the wire.
-- **Host:** discovers the tool, hands it to Claude, and routes the resulting `tool_use` back through `callTool`.
+### Stdio server with one typed tool
+- **Server:** one tool with a Zod-typed input, an `isError` result written for the model, and logging to
+  stderr because stdout is the wire.
 - **Versions:** written against the 1.x `registerTool` API; older minors used `tool()`, and the maintainers
   have been preparing a v2 line that splits client and server into separate packages, so import paths
   depend on which line you install.
-- **Content mapping:** MCP `text` items map directly onto Anthropic text blocks, while images would need
-  re-encoding into Anthropic's `source` shape.
 
 ```ts
 // server.ts — one tool over stdio. Nothing but JSON-RPC may touch stdout.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { db } from "./db";
 
+const ORDERS = new Map([["ord_42", { status: "shipped" }]]);
 const server = new McpServer({ name: "orders", version: "1.0.0" });
 server.registerTool(
   "lookup_order",
-  { description: "Fetch an order by id", inputSchema: { orderId: z.string().regex(/^ord_\w+$/) } },
+  { description: "Fetch an order by id, like ord_42", inputSchema: { orderId: z.string().regex(/^ord_\w+$/) } },
   async ({ orderId }) => {                                    // typed from the Zod shape, already validated
-    const order = await db.orders.find(orderId);
-    if (!order) return { isError: true, content: [{ type: "text", text: `no order ${orderId}` }] };
+    const order = ORDERS.get(orderId);
+    if (!order) return { isError: true, content: [{ type: "text", text: `No order ${orderId}. Ask the user to check the id.` }] };
     return { content: [{ type: "text", text: JSON.stringify(order) }] };
   },
 );
 console.error("orders server starting");                      // stderr, never console.log
 await server.connect(new StdioServerTransport());
-
-// host.ts — discover tools, give them to the model, route tool_use back to the server.
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import Anthropic from "@anthropic-ai/sdk";
-
-const mcp = new Client({ name: "host", version: "1.0.0" });
-await mcp.connect(new StdioClientTransport({ command: "node", args: ["dist/server.js"] }));
-const { tools } = await mcp.listTools();
-const claudeTools: Anthropic.Tool[] = tools.map((t) => ({
-  name: t.name, description: t.description ?? "", input_schema: t.inputSchema as Anthropic.Tool.InputSchema,
-}));
-const anthropic = new Anthropic();
-const ask = (messages: Anthropic.MessageParam[]) =>
-  anthropic.messages.create({ model: "claude-opus-5-5", max_tokens: 1024, tools: claudeTools, messages });
-const messages: Anthropic.MessageParam[] = [{ role: "user", content: "What is the status of ord_42?" }];
-const reply = await ask(messages);
-const results: Anthropic.ToolResultBlockParam[] = [];
-for (const block of reply.content) {
-  if (block.type !== "tool_use") continue;
-  const r = await mcp.callTool({ name: block.name, arguments: block.input as Record<string, unknown> });
-  const text = (r.content as { type: string; text?: string }[])        // keep text items only here
-    .flatMap((c) => (c.type === "text" ? [{ type: "text" as const, text: c.text ?? "" }] : []));
-  results.push({ type: "tool_result", tool_use_id: block.id, is_error: r.isError === true, content: text });
-}
-messages.push({ role: "assistant", content: reply.content }, { role: "user", content: results });
-const final = await ask(messages);                 // the model now answers from the tool result
 ```
 
 ### Agent loop over two MCP servers with a budget and an approval gate
-The host example above does one round. A production agent loops, talks to several servers and enforces
-policy the servers cannot see.
+A host that connects to several servers, hands their tools to Claude and routes each `tool_use` back
+through `callTool`, enforcing policy the servers cannot see.
 - **Prefixed tool table:** `orders_lookup_order` and `docs_search` route back to the right `Client` by the
   text before the first underscore, so prefixes must not contain one.
 - **Approval gate:** a write tool is forwarded only after `approve` resolves true; a denial goes back to the
   model as an error result it can explain to the user.
 - **Step budget:** the loop throws after `maxSteps` model calls instead of running until the bill stops it.
-- **Protocol errors still throw.** `callTool` rejects on a JSON-RPC error (an unknown tool name, a request
-  timeout), so wrap it in `try` / `catch` and return an `is_error` result if one bad call should not end
-  the run.
+- **Content mapping:** MCP `text` items map directly onto Anthropic text; images would need re-encoding
+  into Anthropic's `source` shape.
 
 ```ts
-// agent.ts — several MCP servers behind one tool table, a step budget and a human approval gate.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import Anthropic from "@anthropic-ai/sdk";
-
-const servers: Record<string, string[]> = { orders: ["dist/orders.js"], docs: ["dist/docs.js"] };
 const NEEDS_APPROVAL = new Set(["orders_refund_order"]);         // write tools the host gates
-const clients = new Map<string, Client>();
-const tools: Anthropic.Tool[] = [];
-for (const [prefix, args] of Object.entries(servers)) {
-  const c = new Client({ name: "support-agent", version: "1.0.0" });
-  await c.connect(new StdioClientTransport({ command: "node", args }));
-  clients.set(prefix, c);
+const DENIED = { isError: true, content: [{ text: "Denied by the user." }] };
+const clients = new Map<string, Client>(), tools: Anthropic.Tool[] = [];
+for (const prefix of ["orders", "docs"]) {
+  const c = new Client({ name: "support-agent", version: "1.0.0" }); clients.set(prefix, c);
+  await c.connect(new StdioClientTransport({ command: "node", args: [`dist/${prefix}.js`] }));
   for (const t of (await c.listTools()).tools)
-    tools.push({ name: `${prefix}_${t.name}`, description: t.description ?? "",
-                 input_schema: t.inputSchema as Anthropic.Tool.InputSchema });
+    tools.push({ name: `${prefix}_${t.name}`, description: t.description ?? "", input_schema: t.inputSchema as Anthropic.Tool.InputSchema });
 }
-
-type Approve = (tool: string, args: unknown) => Promise<boolean>;
-export async function runAgent(task: string, approve: Approve, maxSteps = 8) {
-  const anthropic = new Anthropic();
-  const messages: Anthropic.MessageParam[] = [{ role: "user", content: task }];
+export async function runAgent(task: string, approve: (tool: string) => Promise<boolean>, maxSteps = 8) {
+  const anthropic = new Anthropic(), messages: Anthropic.MessageParam[] = [{ role: "user", content: task }];
   for (let step = 0; step < maxSteps; step++) {
     const reply = await anthropic.messages.create({ model: "claude-opus-5-5", max_tokens: 1024, tools, messages });
     messages.push({ role: "assistant", content: reply.content });
     if (reply.stop_reason !== "tool_use") return reply;         // final answer, or a stop reason to handle
     const results: Anthropic.ToolResultBlockParam[] = [];
-    for (const b of reply.content) {
-      if (b.type !== "tool_use") continue;
-      const cut = b.name.indexOf("_");
-      if (NEEDS_APPROVAL.has(b.name) && !(await approve(b.name, b.input))) {
-        results.push({ type: "tool_result", tool_use_id: b.id, is_error: true, content: "Denied by the user." });
-        continue;
-      }
-      const r = await clients.get(b.name.slice(0, cut))!.callTool(
-        { name: b.name.slice(cut + 1), arguments: b.input as Record<string, unknown> });
-      const text = (r.content as { type: string; text?: string }[])
-        .filter((c) => c.type === "text").map((c) => c.text ?? "").join("\n");
-      results.push({ type: "tool_result", tool_use_id: b.id, is_error: r.isError === true, content: text });
+    for (const b of reply.content.filter((x) => x.type === "tool_use")) {
+      const cut = b.name.indexOf("_");                           // split at the FIRST underscore
+      const r = NEEDS_APPROVAL.has(b.name) && !(await approve(b.name)) ? DENIED
+        : await clients.get(b.name.slice(0, cut))!.callTool({ name: b.name.slice(cut + 1), arguments: b.input as Record<string, unknown> });
+      results.push({ type: "tool_result", tool_use_id: b.id, is_error: r.isError === true,
+                     content: (r.content as { text?: string }[]).map((c) => c.text ?? "").join("\n") });
     }
     messages.push({ role: "user", content: results });          // every result for this turn, one message
   }
   throw new Error(`step budget of ${maxSteps} exhausted`);
 }
-```
-
-### Stateless Streamable HTTP behind a load balancer
-The same server object served over HTTP, one fresh transport per request and no session id, so any replica
-can answer any request. `buildServer()` is assumed to create the `McpServer` and register its tools as above.
-
-```ts
-import express from "express";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { buildServer } from "./server";
-
-const app = express();
-app.use(express.json());
-
-app.post("/mcp", async (req, res) => {
-  const server = buildServer();
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });  // stateless
-  res.on("close", () => { transport.close(); server.close(); });                           // free per-request state
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
-});
-
-app.listen(3000, "127.0.0.1");   // put authentication (OAuth) and Origin checks in front before exposing it
 ```
 
 ### Worked scenario: the cost of forwarding every tool
@@ -581,6 +514,12 @@ orders of magnitude, not measurements; count your own with the provider's token 
 - **Host-side gates for write tools.** Keep a list of tools that change state (refunds, emails, deletes) in
   the agent host and require human approval or a policy check before forwarding the `callTool`; return a
   denial as an `isError` result. Monitor approvals requested, denied and timed out per tool.
+- **Catch rejected tool calls in the host.** `callTool` still rejects on a request timeout (and on JSON-RPC
+  errors), so wrap it in `try` / `catch` and return an `is_error` tool result if one bad call should not
+  end the run.
+- **Free per-request state on stateless HTTP.** With `StreamableHTTPServerTransport` in stateless mode,
+  build a fresh server and transport per `POST /mcp`, call `transport.close()` and `server.close()` on the
+  response's `close` event, and bind to `127.0.0.1` until OAuth and `Origin` checks sit in front.
 
 ## Trade-offs
 - **Shared protocol code vs release cadence.** The SDK handles handshake, schemas and transports so a

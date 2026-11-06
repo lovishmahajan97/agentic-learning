@@ -293,51 +293,34 @@ which graph emitted each update.
 
 ```python
 # pip install langgraph ; deterministic stand-ins for model calls
-from typing import Annotated, Literal, TypedDict
-from langgraph.graph.message import add_messages
+from typing import Literal
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.types import Command
 
-# --- a worker built as its own graph (a subgraph) with private state ---
-class ResearchState(TypedDict, total=False):
-    messages: Annotated[list, add_messages]   # same key and reducer as the parent
-    queries: list[str]          # private to the subgraph: never reaches the parent
-
-def plan_queries(s: ResearchState) -> dict:
-    return {"queries": ["eu vat rules 2025", "vat digital services"]}
-
-def run_queries(s: ResearchState) -> dict:
-    notes = f"research: found {len(s['queries'])} sources on EU VAT"
-    return {"messages": [("ai", notes)]}
+class ResearchState(MessagesState):           # same 'messages' key and reducer as the parent
+    queries: list[str]                         # private to the subgraph: never reaches the parent
 
 r = StateGraph(ResearchState)
-r.add_node("plan_queries", plan_queries); r.add_node("run_queries", run_queries)
-r.add_edge(START, "plan_queries"); r.add_edge("plan_queries", "run_queries"); r.add_edge("run_queries", END)
+r.add_node("plan_queries", lambda s: {"queries": ["eu vat rules", "vat digital services"]})
+r.add_node("run_queries", lambda s: {"messages": [("ai", f"research: {len(s['queries'])} sources")]})
+r.add_edge(START, "plan_queries"); r.add_edge("plan_queries", "run_queries")
 researcher = r.compile()
 
-# --- supervisor: decides the next worker and routes with Command ---
 def supervisor(s: MessagesState) -> Command[Literal["researcher", "writer", "__end__"]]:
-    said = " ".join(m.content for m in s["messages"] if m.type == "ai")
+    said = " ".join(m.content for m in s["messages"] if m.type == "ai")  # an LLM decides in practice
     if "research:" not in said:
-        return Command(goto="researcher")            # an LLM with structured output picks this in practice
-    if "draft:" not in said:
-        return Command(goto="writer")
-    return Command(goto=END)
+        return Command(goto="researcher")
+    return Command(goto="writer" if "draft:" not in said else END)
 
 def writer(s: MessagesState) -> Command[Literal["supervisor"]]:
     return Command(goto="supervisor", update={"messages": [("ai", "draft: VAT applies at the buyer's rate.")]})
 
 g = StateGraph(MessagesState)
-g.add_node("supervisor", supervisor)
-g.add_node("researcher", researcher)                  # compiled graph as a node: shares 'messages'
-g.add_node("writer", writer)
-g.add_edge(START, "supervisor")
-g.add_edge("researcher", "supervisor")                # workers always report back
-app = g.compile()
-
-for update in app.stream({"messages": [("user", "Write a note on EU VAT for SaaS")]},
-                         stream_mode="updates", subgraphs=True):
-    print(update[0] or "root", list(update[1]))         # namespace shows which graph emitted it
+g.add_node("supervisor", supervisor); g.add_node("writer", writer)
+g.add_node("researcher", researcher)           # compiled graph as a node: shares 'messages'
+g.add_edge(START, "supervisor"); g.add_edge("researcher", "supervisor")  # workers always report back
+for ns, update in g.compile().stream({"messages": [("user", "Note on EU VAT")]}, stream_mode="updates", subgraphs=True):
+    print(ns or "root", list(update))          # namespace shows which graph emitted it
 ```
 
 - **Output order:** `supervisor`, then `plan_queries` and `run_queries` under a `researcher:<id>`
@@ -358,7 +341,7 @@ from langgraph.graph import StateGraph, MessagesState, START
 from langgraph.types import Command
 from langgraph.prebuilt import InjectedState
 
-class ScriptedModel(GenericFakeChatModel):
+class ScriptedModel(GenericFakeChatModel):     # replays canned replies; ignores bound tools
     def bind_tools(self, tools, **kwargs):
         return self
 
@@ -369,20 +352,16 @@ def transfer_to_billing(reason: str, state: Annotated[dict, InjectedState],
     msg = ToolMessage(f"Transferred to billing: {reason}", tool_call_id=tool_call_id)
     return Command(goto="billing", graph=Command.PARENT, update={"messages": state["messages"] + [msg]})
 
-triage = create_agent(ScriptedModel(messages=iter([AIMessage("", tool_calls=[
-    {"name": "transfer_to_billing", "args": {"reason": "double charge"}, "id": "h1"}])])),
-    tools=[transfer_to_billing], name="triage")
-billing = create_agent(ScriptedModel(messages=iter([AIMessage("I've refunded the duplicate charge.")])),
-                       tools=[], name="billing")
+handoff = AIMessage("", tool_calls=[{"name": "transfer_to_billing", "args": {"reason": "double charge"}, "id": "h1"}])
+triage = create_agent(ScriptedModel(messages=iter([handoff])), tools=[transfer_to_billing], name="triage")
+billing = create_agent(ScriptedModel(messages=iter([AIMessage("Refunded the duplicate charge.")])), name="billing")
 
 g = StateGraph(MessagesState)
 g.add_node("triage", triage, destinations=("billing",))   # declares the handoff edge for rendering
-g.add_node("billing", billing)
-g.add_edge(START, "triage")
-app = g.compile()
-out = app.invoke({"messages": [("user", "I was charged twice")]})
-print([(m.type, m.content[:40]) for m in out["messages"]])
-# [('human', ...), ('ai', ''), ('tool', 'Transferred to billing: double charge'), ('ai', "I've refunded...")]
+g.add_node("billing", billing); g.add_edge(START, "triage")
+out = g.compile().invoke({"messages": [("user", "I was charged twice")]})
+print([(m.type, m.content) for m in out["messages"][1:]])  # the tool call and its result travel together
+# [('ai', ''), ('tool', 'Transferred to billing: double charge'), ('ai', 'Refunded the duplicate charge.')]
 ```
 
 ### Worked scenario: collapsing a three-agent crew

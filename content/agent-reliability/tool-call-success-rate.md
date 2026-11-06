@@ -316,47 +316,35 @@ per-step distinction. Running this over a day's events gives the table that iden
 which owner, is dragging completion down. The sample data is illustrative.
 
 ```python
-from collections import defaultdict
+from collections import Counter
 
 LAYER = {"invalid_arguments": "well_formed", "denied": "permitted",
          "upstream_timeout": "executed", "upstream_error": "executed", "rate_limited": "executed",
          "not_found": "effective", "empty_result": "effective"}
 
 def tool_rates(events: list[dict]) -> dict:
-    by_tool = defaultdict(lambda: defaultdict(int))
-    steps = defaultdict(lambda: defaultdict(set))                 # tool -> step_id -> {ok?}
-    for e in events:
-        if e["type"] != "tool.call.result":
-            continue
-        t, cls = e["tool"], e["error_class"]
-        by_tool[t]["attempts"] += 1
-        by_tool[t][cls] += 1
-        steps[t][e["step_id"]].add(cls == "ok")
     out = {}
-    for t, c in by_tool.items():
-        n = c["attempts"]
-        layers = defaultdict(int)
-        for cls, k in c.items():
-            if cls in LAYER:
-                layers[LAYER[cls]] += k
-        per_step = sum(True in s for s in steps[t].values()) / max(len(steps[t]), 1)
-        out[t] = {"attempts": n, "per_attempt": c["ok"] / n, "per_step": per_step,
-                  "model_fail": layers["well_formed"] / n, "policy_fail": layers["permitted"] / n,
-                  "infra_fail": layers["executed"] / n, "semantic_fail": layers["effective"] / n}
+    for t in dict.fromkeys(e["tool"] for e in events):                 # tools in first-seen order
+        evs = [e for e in events if e["tool"] == t]
+        fails = Counter(LAYER[e["error_class"]] for e in evs if e["error_class"] != "ok")
+        ok_steps = {e["step_id"] for e in evs if e["error_class"] == "ok"}
+        out[t] = {"per_attempt": 1 - sum(fails.values()) / len(evs),
+                  "per_step": len(ok_steps) / len({e["step_id"] for e in evs}),
+                  **{layer: k / len(evs) for layer, k in fails.items()}}   # failure share per layer
     return out
 
 def mk(tool, cls, ids):
-    return [{"type": "tool.call.result", "tool": tool, "step_id": f"{tool}{i}", "error_class": cls} for i in ids]
+    return [{"tool": tool, "step_id": f"{tool}{i}", "error_class": cls} for i in ids]
 
 events = (mk("search", "ok", range(95)) + mk("search", "empty_result", range(95, 100))
-        + mk("lookup", "invalid_arguments", range(12)) + mk("lookup", "ok", range(12, 100))
-        + mk("refund", "rate_limited", range(20)) + mk("refund", "ok", range(60)))   # refund0..19 retried after 429
+          + mk("lookup", "invalid_arguments", range(12)) + mk("lookup", "ok", range(12, 100))
+          + mk("refund", "rate_limited", range(20)) + mk("refund", "ok", range(60)))  # refund0..19 retried
 
 for tool, r in tool_rates(events).items():
-    print(tool, {k: round(v, 3) if isinstance(v, float) else v for k, v in r.items()})
-# search: per_attempt 0.95, semantic_fail 0.05           -> index or argument quality
-# lookup: per_attempt 0.88, model_fail 0.12              -> prompt or tool description
-# refund: per_attempt 0.75, per_step 1.0, infra_fail 0.25 -> vendor rate limit; retries are carrying it
+    print(tool, {k: round(v, 2) for k, v in r.items()})
+# search {'per_attempt': 0.95, 'per_step': 0.95, 'effective': 0.05}  -> index or argument quality
+# lookup {'per_attempt': 0.88, 'per_step': 0.88, 'well_formed': 0.12} -> prompt or tool description
+# refund {'per_attempt': 0.75, 'per_step': 1.0, 'executed': 0.25}   -> vendor rate limit; retries carry it
 ```
 
 ### Compounding calculator: from task target to per-step target (runnable)

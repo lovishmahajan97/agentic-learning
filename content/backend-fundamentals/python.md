@@ -347,109 +347,46 @@ flowchart TD
 
 ## Examples
 ### An agent step that runs tool calls concurrently
-The model asks for three tool calls in one turn. Arguments are validated with Pydantic (a bad one goes
-back to the model as an error), async tools are awaited, the sync-only tool goes to `asyncio.to_thread`,
-and a `Semaphore` caps parallel tool calls. `fake_model` stands in for a provider's async client.
+The model asked for three tool calls in one turn. Arguments are validated with Pydantic (a bad one goes
+back to the model as an error), the valid calls run together under `asyncio.gather`, and a `Semaphore`
+caps how many run at once.
 
 ```python
-import asyncio, json, time
+import asyncio, json, time   # pip install pydantic
 from pydantic import BaseModel, ValidationError
 
 class SearchArgs(BaseModel):
     query: str
     top_k: int = 5
 
-class WeatherArgs(BaseModel):
-    city: str
-
 async def search_docs(a: SearchArgs) -> str:
     await asyncio.sleep(0.8)                      # async I/O: vector store or HTTP API
     return f"{a.top_k} hits for {a.query!r}"
 
-def get_weather_sync(a: WeatherArgs) -> str:      # sync-only SDK: must not run on the loop
-    time.sleep(0.8)
-    return f"sunny in {a.city}"
-
-TOOLS = {"search_docs": (SearchArgs, search_docs, False),
-         "get_weather": (WeatherArgs, get_weather_sync, True)}
-SEM = asyncio.Semaphore(4)                        # cap parallel tool calls per agent step
-
-async def run_tool(call: dict) -> dict:
-    schema, fn, blocking = TOOLS[call["name"]]
+async def run_tool(call: dict, sem: asyncio.Semaphore) -> dict:
     try:
-        args = schema.model_validate_json(call["arguments"])     # model output is untrusted input
+        args = SearchArgs.model_validate_json(call["arguments"])   # model output is untrusted input
     except ValidationError as e:
-        return {"id": call["id"], "error": e.errors()[0]["msg"]}  # sent back so the model can repair
-    async with SEM:
-        out = await (asyncio.to_thread(fn, args) if blocking else fn(args))
-    return {"id": call["id"], "content": out}
+        return {"id": call["id"], "error": e.errors()[0]["msg"]}   # sent back so the model can repair
+    async with sem:                                                # caps parallel tool calls
+        return {"id": call["id"], "content": await search_docs(args)}
 
-async def fake_model(messages: list) -> dict:     # stand-in for a provider's async client
-    await asyncio.sleep(0.1)
-    if messages[-1]["role"] == "tool":
-        return {"content": "done", "tool_calls": []}
-    return {"content": None, "tool_calls": [
-        {"id": "1", "name": "search_docs", "arguments": json.dumps({"query": "refund policy"})},
-        {"id": "2", "name": "get_weather", "arguments": json.dumps({"city": "Pune"})},
-        {"id": "3", "name": "search_docs", "arguments": json.dumps({"top_k": "many"})}]}
+calls = [{"id": "1", "arguments": json.dumps({"query": "refund policy"})},
+         {"id": "2", "arguments": json.dumps({"query": "shipping", "top_k": 2})},
+         {"id": "3", "arguments": json.dumps({"top_k": "many"})}]
 
-async def agent(task: str, max_steps: int = 8) -> str:
-    messages = [{"role": "user", "content": task}]
-    for _ in range(max_steps):                    # hard step budget: agents can loop forever
-        reply = await fake_model(messages)
-        if not reply["tool_calls"]:
-            return reply["content"]
-        results = await asyncio.gather(*(run_tool(c) for c in reply["tool_calls"]))
-        messages += [{"role": "tool", **r} for r in results]
-    return "step budget exhausted"
+async def main() -> None:
+    sem, t = asyncio.Semaphore(4), time.perf_counter()   # create the Semaphore inside the running loop
+    print(*await asyncio.gather(*(run_tool(c, sem) for c in calls)), sep="\n")
+    print(f"{time.perf_counter() - t:.1f}s")
 
-t = time.perf_counter()
-print(asyncio.run(agent("Can I get a refund?")), f"{time.perf_counter() - t:.1f}s")
-# done 1.0s: the tool calls overlapped; run one after another they would take ~1.6s plus model time
-```
-
-### Fan-out with a concurrency cap and a GIL escape hatch
-A batch job (eval run or offline classification) fans out calls concurrently, validates each model answer
-at runtime, and pushes a CPU-bound step out of the GIL-bound main process. The `Semaphore` is the
-rate-limit guard; the `ProcessPoolExecutor` is the GIL escape hatch.
-
-```python
-import asyncio
-from concurrent.futures import ProcessPoolExecutor
-import httpx
-from pydantic import BaseModel, ValidationError
-
-class Verdict(BaseModel):
-    label: str
-    confidence: float
-
-SEM = asyncio.Semaphore(8)                      # at most 8 model calls in flight
-
-async def classify(client: httpx.AsyncClient, text: str) -> Verdict | None:
-    async with SEM:                             # waits without holding a thread
-        r = await client.post("http://localhost:8000/v1/classify", json={"text": text}, timeout=30)
-    try:
-        return Verdict.model_validate_json(r.content)  # runtime check; bad JSON is a ValidationError too
-    except ValidationError:
-        return None
-
-def count_words(text: str) -> int:              # stand-in for CPU-heavy pure-Python work
-    return sum(1 for _ in text.split())
-
-async def main(texts: list[str]):
-    async with httpx.AsyncClient() as client:   # one connection pool for the whole batch
-        verdicts = await asyncio.gather(*(classify(client, t) for t in texts))
-    loop = asyncio.get_running_loop()
-    with ProcessPoolExecutor() as pool:         # CPU-bound work runs in separate interpreters
-        counts = await asyncio.gather(*(loop.run_in_executor(pool, count_words, t) for t in texts))
-    return list(zip(verdicts, counts))
-
-if __name__ == "__main__":                      # required when workers are spawned, not forked
-    print(asyncio.run(main(["refund my order", "great product"] * 50)))
+asyncio.run(main())
+# ids 1 and 2 return hits, id 3 returns 'Field required'; then 0.8s, not 1.6s: the valid calls overlapped
 ```
 
 ### One blocking tool freezes every other agent
-Runnable with the standard library only. The ticker stands in for every other agent run on the loop.
+Runnable with the standard library only. The ticker stands in for every other agent run on the loop; the
+fix for a sync-only call is `asyncio.to_thread`.
 
 ```python
 import asyncio, time
@@ -463,9 +400,9 @@ async def ticker(stop: asyncio.Event) -> int:
 
 async def handler(blocking: bool) -> None:
     if blocking:
-        time.sleep(1)                  # sync call: the whole loop stops for 1 s
+        time.sleep(1)                             # sync call: the whole loop stops for 1 s
     else:
-        await asyncio.sleep(1)         # async wait: the loop keeps serving others
+        await asyncio.to_thread(time.sleep, 1)    # same sync call in a thread: the loop keeps serving
 
 async def main() -> None:
     for blocking in (True, False):
@@ -478,7 +415,7 @@ async def main() -> None:
 
 asyncio.run(main())
 # blocking=True:  5.0s, ticks=1    (five handlers ran one after another, nothing else ran)
-# blocking=False: 1.0s, ticks=~90  (five waits overlapped, the ticker kept running)
+# blocking=False: 1.0s, ticks=~90  (five threads slept in parallel, the ticker kept running)
 ```
 
 ### Worked scenario: is Python the bottleneck in an agent step?
@@ -513,6 +450,9 @@ A support agent handles one step in four stages. Figures are illustrative orders
 - **Frozen lockfiles in the image.** Build containers with `uv sync --frozen` (or an equivalent locked
   install), pin agent frameworks and provider SDKs, and pin the PyTorch/CUDA build explicitly. Re-run the
   agent eval set on every dependency bump and track score drift.
+- **Process pools need a main guard.** When CPU-bound work goes to a `ProcessPoolExecutor`, start it under
+  `if __name__ == "__main__":` (required when workers are spawned, not forked), and give each model HTTP
+  call an explicit timeout (for example 30 s) inside the semaphore.
 
 ## Trade-offs
 - **Ecosystem vs raw speed.** You get every agent framework, SDK and the fastest path from notebook to

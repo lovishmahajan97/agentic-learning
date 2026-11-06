@@ -336,27 +336,20 @@ flowchart TD
 ```
 
 ## Examples
-### Scoped, hierarchical check with permission-named guards
+### Scoped, hierarchical check
 Roles inherit downward, assignments carry a scope, and a role at any ancestor scope applies to the
-resource. `current_user` stands in for the authentication dependency from the OAuth lesson.
+resource. Runnable with the standard library.
 
-- **Handlers name *permissions*, never roles,** so adding a role touches one table instead of every
+- **Callers ask for *permissions*, never roles,** so adding a role touches one table instead of every
   endpoint.
-- **Scope comes from the resource's stored owner, never from the URL,** because checking `project:{id}`
-  from the path while deleting `doc_id` lets an editor of project 42 delete project 7's documents by
-  sending `/projects/42/documents/<a project-7 doc>` (an insecure direct object reference).
+- **Scope comes from the resource's stored owner (`DOC_SCOPE`), never from the URL,** because checking
+  `project:{id}` from the path while deleting `doc_id` lets an editor of project 42 delete project 7's
+  documents by sending `/projects/42/documents/<a project-7 doc>` (an insecure direct object reference).
 
 ```python
-from fastapi import Depends, FastAPI, HTTPException
-
-app = FastAPI()
-def current_user() -> str: return "alice"   # stub for the bearer-token auth dependency
-PERMS = {                                   # role -> permissions granted directly
-    "viewer": {"documents:read"},
-    "editor": {"documents:write"},
-    "admin":  {"documents:delete", "members:manage"},
-}
-INHERITS = {"admin": "editor", "editor": "viewer"}      # senior -> junior
+PERMS = {"viewer": {"documents:read"}, "editor": {"documents:write"},
+         "admin": {"documents:delete", "members:manage"}}    # role -> permissions granted directly
+INHERITS = {"admin": "editor", "editor": "viewer"}           # senior -> junior
 
 def permissions_of(role: str) -> set[str]:
     out: set[str] = set()
@@ -376,22 +369,10 @@ def allowed(subject: str, perm: str, scope: str) -> bool:
         scope = PARENT.get(scope, "")
     return False                            # deny by default
 
-def require_on_doc(perm: str):
-    def guard(doc_id: int, user: str = Depends(current_user)) -> str:
-        scope = DOC_SCOPE.get(doc_id)       # scope from the resource, not from the path
-        if scope is None or not allowed(user, perm, scope):
-            raise HTTPException(404)        # 404, not 403: do not confirm the doc exists
-        return user
-    return guard
-
-@app.delete("/documents/{doc_id}")
-def delete_doc(doc_id: int, user: str = Depends(require_on_doc("documents:delete"))):
-    return {"deleted_by": user}
-
-assert allowed("alice", "documents:write", "project:42")       # editor at the project
-assert allowed("alice", "documents:read", "project:7")         # viewer inherited from the org
-assert not allowed("alice", "documents:delete", "project:42")  # admin nowhere
-assert not allowed("alice", "documents:write", DOC_SCOPE[202]) # doc 202 lives in project 7
+print(allowed("alice", "documents:write", "project:42"))   # True: editor at the project
+print(allowed("alice", "documents:read", "project:7"))     # True: viewer inherited from the org
+print(allowed("alice", "documents:delete", "project:42"))  # False: admin nowhere
+print(allowed("alice", "documents:write", DOC_SCOPE[202])) # False: doc 202 lives in project 7
 ```
 
 ### Worked scenario: the assignment arithmetic
@@ -404,49 +385,13 @@ The same 2,000-person company before and after introducing roles.
 | Team move | revoke 40, add 35 | swap 1 role |
 | "Who can delete customers?" | scan every row | list roles with that permission, then their members |
 
-### Kubernetes: the same model in a manifest
-A namespaced `Role` plus `RoleBinding` gives a group read-only access to pods in one namespace only.
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  namespace: team-a
-  name: pod-reader
-rules:
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  namespace: team-a
-  name: team-a-devs-read-pods
-subjects:
-  - kind: Group
-    name: team-a-devs
-    apiGroup: rbac.authorization.k8s.io
-roleRef:
-  kind: Role
-  name: pod-reader
-  apiGroup: rbac.authorization.k8s.io
-```
-
-Verify a decision without guessing. The binding names a group, so impersonate the group too:
-`kubectl auth can-i list pods --as=alice --as-group=team-a-devs -n team-a` should print `yes`, and the
-same command with `-n team-b` should print `no`.
-
 ### Agent tool guard: user permissions intersected with the agent's allowlist
 Reuses `allowed` and `DOC_SCOPE` from the first example. The model only proposes the call; the runtime
 decides.
 
 ```python
-TOOLS = {   # tool -> (permission, needs human approval)
-    "read_doc":   ("documents:read",   False),
-    "edit_doc":   ("documents:write",  False),
-    "delete_doc": ("documents:delete", True),
-}
+TOOLS = {"read_doc": ("documents:read", False), "edit_doc": ("documents:write", False),
+         "delete_doc": ("documents:delete", True)}        # tool -> (permission, needs human approval)
 AGENT_ALLOWLIST = {"documents:read", "documents:write"}   # this agent never deletes
 
 def tools_for(user: str, scope: str) -> list[str]:        # step 1: what the model is offered
@@ -502,6 +447,13 @@ Running as the user stops the first case; the agent allowlist is what stops the 
 - **Authorization evals for agents.** Keep a test suite of personas (viewer, editor, guest) and adversarial
   prompts, and assert the agent never completes an action above the persona's role. Run it in CI on every
   prompt or tool change.
+- **404 for documents the caller cannot touch.** A FastAPI guard such as `require_on_doc(perm)` looks up
+  the document's stored scope and raises `HTTPException(404)` both when the document is missing and when
+  the check fails, so the response does not confirm the document exists.
+- **Kubernetes RBAC is the same model.** A namespaced `Role` (for example `pod-reader` with `get`, `list`,
+  `watch` on `pods`) plus a `RoleBinding` to a group grants access in one namespace only. Verify with
+  `kubectl auth can-i list pods --as=alice --as-group=team-a-devs -n team-a` (impersonate the group too,
+  since the binding names a group); the same command with `-n team-b` should print `no`.
 
 ## Trade-offs
 - **Indirection vs catalogue ownership.** Assignments shrink from users × permissions to user-role plus

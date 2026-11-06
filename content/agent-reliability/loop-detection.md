@@ -282,55 +282,64 @@ flowchart TD
 ## Examples
 ### A result-aware loop guard
 - **Escalates on *stale* repeats:** identical canonical (tool, args) whose result matched an earlier one.
-- **Changing results never escalate by count** (tests re-run after each edit); only the cycle check
-  catches repeating actions, such as two edits undoing each other.
-- **Pollable tools** get the same ladder with thresholds scaled up, as a stand-in for a time budget.
+- **Changing results never escalate** (tests re-run after each edit make progress).
 - **A refused call counts as stale,** because blocking made no progress either, so a model that keeps
   insisting climbs to abort.
 
 ```python
 import hashlib, json
-from collections import Counter, deque
+from collections import Counter
 
 def canon(*parts):     # strip volatile fields (timestamps, request ids) from results first
-    raw = json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha1(raw.encode()).hexdigest()
+    return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
 
 class LoopGuard:
-    def __init__(self, inform=1, block=2, abort=4, window=12, max_period=4,
-                 pollable=(), poll_factor=10):
-        self.calls, self.stale, self.seen = Counter(), Counter(), set()
-        self.seq, self.max_period = deque(maxlen=window), max_period
-        self.pollable, self.poll_factor = set(pollable), poll_factor
+    def __init__(self, inform=1, block=2, abort=4):
+        self.stale, self.seen = Counter(), set()
         self.inform, self.block, self.abort = inform, block, abort
-
-    def _cycle(self):
-        s = list(self.seq)
-        for p in range(2, self.max_period + 1):  # period 1 is the stale count's job
-            if len(s) >= 2 * p and s[-p:] == s[-2 * p:-p] and len(set(s[-p:])) > 1:
-                return p
-        return 0
 
     def before(self, name, args):                # call before dispatching the tool
         h = canon(name, args)
-        self.seq.append(h); self.calls[h] += 1
-        n, st = self.calls[h], self.stale[h]
-        f = self.poll_factor if name in self.pollable else 1
-        if st >= self.abort * f:
-            return "abort", f"{name}: {n} identical calls, result unchanged {st} times"
-        if st >= self.block * f:
+        st = self.stale[h]
+        if st >= self.abort:
+            return "abort"
+        if st >= self.block:
             self.stale[h] += 1                   # a refused call is no progress either
-            return "block", f"refused: identical to {n - 1} earlier calls; result never changed"
-        if st >= self.inform * f:
-            return "inform", f"call {n} of {name} with these exact args; last result was identical"
-        if p := self._cycle():
-            return "inform", f"your last {2 * p} actions repeat with period {p}; change approach"
-        return "ok", ""
+            return "block"
+        return "inform" if st >= self.inform else "ok"
 
     def after(self, name, args, result):         # call after the tool returns
-        if (k := canon(name, args, str(result))) in self.seen:
+        if (k := canon(name, args, result)) in self.seen:
             self.stale[canon(name, args)] += 1
         self.seen.add(k)
+```
+
+Drive it with a scripted failing test, no LLM needed:
+
+```python
+g = LoopGuard()
+for i in range(1, 7):                            # failing test, same output every time
+    verdict = g.before("run_tests", {"path": "tests/"})
+    print(i, verdict)                            # ok, ok, inform, block, block, abort
+    if verdict in ("ok", "inform"):
+        g.after("run_tests", {"path": "tests/"}, "FAILED test_x")
+```
+
+### Catching an A B A B cycle
+Two edits that undo each other produce different results every time, so the stale count never moves.
+Comparing the last *p* action hashes with the *p* before them catches it.
+
+```python
+def cycle(seq, max_period=4):                    # period 1 is the stale count's job
+    for p in range(2, max_period + 1):
+        if len(seq) >= 2 * p and seq[-p:] == seq[-2 * p:-p] and len(set(seq[-p:])) > 1:
+            return p
+    return 0
+
+seq = []
+for i, text in enumerate("ababab", 1):
+    seq.append(canon("edit", {"line": 3, "text": text}))
+    print(i, cycle(seq))                         # 0, 0, 0, 2, 2, 2: caught at call 4
 ```
 
 ### Worked traces through the guard
@@ -338,30 +347,7 @@ class LoopGuard:
 |---|---|
 | Failing `run_tests` printing the same 40-line failure each time | Call 1 runs; call 2 runs and matches call 1 (stale = 1); call 3 runs with an inform message; calls 4 and 5 are refused (stale was 2); call 6 aborts as `stuck`. Inform at three, block at four, abort at six |
 | Healthy edit-test cycle | Every `run_tests` output differs because the failing count drops, so stale stays at 0 and nothing fires |
-| Deploy poller declared pollable, returning "building" over and over | Informed on call 12 (ten results that repeated an earlier one) and refused from call 22, by which point a wall-clock budget should normally have taken over |
-
-### Runnable driver: exercise the guard without an LLM
-Paste below the class above and run with plain Python.
-- **First loop:** reproduces the failing-test trace.
-- **Second loop:** two edits undo each other (text "a", then "b"). Every result differs, so the stale
-  count never moves, but the A B A B cycle is caught at call 4. The second edit lists its keys in a
-  different order from the first; `canon()` sorts keys, so a reordered repeat of the same edit would
-  still hash identically.
-
-```python
-g = LoopGuard()
-for i in range(1, 7):                            # same call, same result every time
-    verdict, _ = g.before("run_tests", {"path": "tests/"})
-    print(i, verdict)                            # ok, ok, inform, block, block, abort
-    if verdict in ("ok", "inform"):
-        g.after("run_tests", {"path": "tests/"}, "FAILED test_x")
-
-g = LoopGuard()
-undo = [("edit", {"line": 3, "text": "a"}), ("edit", {"text": "b", "line": 3})]
-for i, (name, args) in enumerate([*undo, *undo, *undo], 1):
-    print(i, *g.before(name, args))             # inform from call 4: period 2
-    g.after(name, args, f"ok {i}")              # results differ, so only the cycle fires
-```
+| Two edits undoing each other | Results differ, stale stays at 0, the cycle check reports period 2 on call 4 |
 
 ## Production patterns
 - **Guard in the dispatch path, one per run.** Instantiate the guard per run in the harness (not per
@@ -378,6 +364,9 @@ for i, (name, args) in enumerate([*undo, *undo, *undo], 1):
   handoff-repeat detections per agent pair.
 - **Offline trace mining.** Run exact and semantic repeat detection as a batch job over budget-exhausted
   runs to find loops the online guard missed, then tune thresholds or tool error messages.
+- **Scale the ladder about 10x for pollable tools and keep the cycle window short.** A poll factor of 10
+  informs a repeating status poller around call 12 and refuses it from call 22; a window of about 12 recent
+  actions is enough for cycle periods up to 4.
 
 ## Trade-offs
 - **Exact match vs coverage.** Exact-match detection is cheap with near-zero false positives, but misses

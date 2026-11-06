@@ -371,11 +371,10 @@ messages are abridged and were produced with a recent mypy.
 
 ```python
 from dataclasses import dataclass
-from typing import assert_never
+from typing import assert_never      # Python 3.11+
 
 @dataclass
 class ToolCall:
-    id: str
     name: str
     arguments: str          # a JSON string, as providers send it
 
@@ -389,27 +388,13 @@ class Refusal:
 
 Step = ToolCall | Final | Refusal
 
-def run_tool(name: str, arguments: str) -> str:
-    return "ok"
-
-def handle(step: Step) -> str:
-    match step:
-        case ToolCall(name=name, arguments=args):
-            return run_tool(name, args)
-        case Final(text=text):
-            return text.strip()
-            # error: Item "None" of "str | None" has no attribute "strip"  [union-attr]
-        case Refusal():
-            return "refused"
-        case _:
-            assert_never(step)
-
-def handle_v2(step: Step) -> str:          # written before Refusal existed
+def handle(step: Step) -> str:          # written before Refusal existed
     match step:
         case ToolCall():
-            return run_tool(step.name, step.arguments)
+            return f"run {step.name}"
         case Final():
-            return step.text or ""
+            return step.text.strip()
+            # error: Item "None" of "str | None" has no attribute "strip"  [union-attr]
         case _:
             assert_never(step)
             # error: Argument 1 to "assert_never" has incompatible type "Refusal"; expected "Never"  [arg-type]
@@ -426,92 +411,34 @@ omitted).
 
 ```python
 import os
-from typing import Literal, TypedDict, assert_never   # assert_never: Python 3.11+
+from typing import TypedDict
 
-class ToolCall(TypedDict):
-    name: Literal["search", "fetch_url"]
-    arguments: dict[str, str]
+class SearchArgs(TypedDict):
+    query: str
 
-def run(model: str, prompt: str) -> str: ...
+def run(model: str, prompt: str) -> str:
+    return prompt
 
 def answer(prompt: str) -> str:
     model = os.environ.get("MODEL")          # str | None
     return run(model, prompt)
     # error: Argument 1 to "run" has incompatible type "str | None"; expected "str"  [arg-type]
 
-def first_text(content: str | None) -> str:
-    return content.strip()
-    # error: Item "None" of "str | None" has no attribute "strip"  [union-attr]
-
-def query_of(call: ToolCall) -> str:
-    return call["argumnets"]["query"]
-    # error: TypedDict "ToolCall" has no key "argumnets"  [typeddict-item]
-
-def route(call: ToolCall) -> str:
-    name = call["name"]
-    if name == "search":
-        return "search-service"
-    elif name == "fetch_url":
-        return "fetcher"
-    else:
-        assert_never(name)   # adding "run_sql" to the Literal makes this line an error
+def query_of(args: SearchArgs) -> str:
+    return args["qeury"]
+    # error: TypedDict "SearchArgs" has no key "qeury"  [typeddict-item]
 
 def helper(resp):                  # unannotated: mypy skips this body by default
-    return first_text(resp) + 1    # str + int: reported only with check_untyped_defs (or strict)
-    # resp.choises would pass even then: an unannotated parameter is Any until you annotate it
+    return resp.choises + 1        # resp is Any, so this passes even with check_untyped_defs
 ```
 
-- **The fixes are one line each:** `os.environ["MODEL"]` or a default, an `is None` branch, the correct
-  key. mypy 1.19 also attaches a `Did you mean "arguments"?` note to the TypedDict error; under
-  `--strict` the same line additionally reports `[no-any-return]`, because the bad key's value is `Any`.
+- **The fixes are one line each:** `os.environ["MODEL"]` or a default, and the correct key. mypy also
+  attaches a `Did you mean "query"?` note to the TypedDict error; under `--strict` the same line
+  additionally reports `[no-any-return]`, because the bad key's value is `Any`.
 - **Why `strict` matters:** unannotated bodies are skipped by default, and even `check_untyped_defs` cannot
-  see through parameters that are implicitly `Any`. Strict mode's `disallow_untyped_defs` forces the
-  annotation that makes the checker useful there.
-- **A side effect of the stub:** `def run(...) -> str: ...` in a regular module is itself reported as
-  `Missing return statement  [empty-body]`; real code has a body or lives in a `.pyi` stub.
-
-### Protocols and variance: a fake that type-checks, a fake that does not
-Check with `mypy --strict fakes.py`; the file is for the checker, not for running. Messages are from
-mypy 1.19, abridged.
-
-```python
-from typing import Protocol, Sequence
-
-class Completer(Protocol):
-    async def complete(self, prompt: str) -> str: ...
-
-class FakeLLM:                                  # no inheritance: matches structurally
-    async def complete(self, prompt: str) -> str:
-        return prompt.upper()
-
-class BadFake:
-    def complete(self, prompt: str) -> str:     # sync: does not match the protocol
-        return prompt
-
-async def summarize(llm: Completer, text: str) -> str:
-    return await llm.complete(f"Summarize: {text}")
-
-def mean(xs: list[float]) -> float:
-    return sum(xs) / len(xs)
-
-def mean_ro(xs: Sequence[float]) -> float:
-    return sum(xs) / len(xs)
-
-async def main() -> None:
-    await summarize(FakeLLM(), "doc")           # ok
-    await summarize(BadFake(), "doc")
-    # error: Argument 1 to "summarize" has incompatible type "BadFake"; expected "Completer"  [arg-type]
-    # note: Expected: def complete(self, prompt: str) -> Coroutine[Any, Any, str]
-    scores: list[int] = [3, 4, 5]
-    mean(scores)
-    # error: Argument 1 to "mean" has incompatible type "list[int]"; expected "list[float]"  [arg-type]
-    # note: "list" is invariant ... Consider using "Sequence" instead, which is covariant
-    mean_ro(scores)                             # ok: Sequence is covariant
-    reveal_type(scores)                         # note: Revealed type is "builtins.list[builtins.int]"
-```
-
-mypy 2.x prints the same errors but shorter revealed types (`list[int]`). The sync fake would have failed at runtime with "object str can't be used in 'await' expression", but
-only on the path that awaits it; mypy reports it before any test runs.
+  see through parameters that are implicitly `Any`. Strict mode's `disallow_untyped_defs` reports
+  `helper` as `Function is missing a type annotation  [no-untyped-def]`, forcing the annotation that makes
+  the checker useful there.
 
 ### Worked scenario: adopting mypy on a legacy service
 Illustrative counts for a 60-module service; the shape of the ratchet is what matters.
@@ -543,6 +470,11 @@ Illustrative counts for a 60-module service; the shape of the ratchet is what ma
 - **pre-commit needs its dependencies.** The `mirrors-mypy` hook runs in its own isolated environment, so
   list typed libraries and stub packages under `additional_dependencies`. Otherwise imports silently
   become `Any` and pre-commit passes code that CI rejects.
+- **Type the model client as a `Protocol`.** Fakes then match structurally with no inheritance, and a
+  sync fake for an async `complete` is an `[arg-type]` error before any test runs, instead of a runtime
+  "can't be used in 'await' expression" on the one path that awaits it.
+- **Accept `Sequence`, not `list`, for read-only inputs.** `list` is invariant, so a `list[int]` is
+  rejected where `list[float]` is expected; `Sequence[float]` is covariant and accepts it.
 
 ## Trade-offs
 - **Strict mode: most bugs caught vs annotation effort.** It fights dynamic code, and flips from burden to

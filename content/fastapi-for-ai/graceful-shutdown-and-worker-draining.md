@@ -346,52 +346,6 @@ sequenceDiagram
 ```
 
 ## Examples
-### Agent scenario: a loop that checkpoints and yields on drain
-The agent loop checks the shared drain file between steps. If draining, it saves the run and tells the
-client to resume elsewhere instead of being killed mid-tool-call.
-
-```python
-import json
-from pathlib import Path
-
-DRAIN_FILE = Path("/tmp/draining")             # touched by the preStop hook
-
-async def run_agent(run_id: str, store, llm, tools, max_steps: int = 30):
-    state = await store.load(run_id)       # {"messages": [...], "step": n, "pending": [...]}
-    while state["step"] < max_steps:
-        if not state.get("pending"):       # step boundary: no tool call half-done
-            if DRAIN_FILE.exists():
-                await store.save(run_id, state, status="interrupted")
-                yield f"event: resume\ndata: {json.dumps({'run_id': run_id})}\n\n"
-                return
-            reply = await llm.complete(state["messages"], tools=tools.schemas())
-            state["messages"].append(reply.message)
-            if not reply.tool_calls:
-                await store.save(run_id, state, status="done")
-                yield f"event: done\ndata: {json.dumps({'text': reply.text})}\n\n"
-                return
-            state["pending"] = [{"id": c.id, "name": c.name, "args": c.arguments}
-                                for c in reply.tool_calls]
-            await store.save(run_id, state, status="running")   # plan saved before side effects
-        for call in state["pending"]:
-            # a run resumed after a kill re-runs these with the same ids, so the same keys
-            result = await tools.call(call["name"], call["args"],
-                                      idempotency_key=f"{run_id}:{call['id']}")
-            state["messages"].append({"role": "tool", "tool_call_id": call["id"], "content": result})
-        state["pending"] = []
-        state["step"] += 1
-        await store.save(run_id, state, status="running")       # checkpoint every step
-        yield f"event: step\ndata: {json.dumps({'step': state['step']})}\n\n"
-```
-
-- **`store`, `llm` and `tools` are your own interfaces** (a Postgres or Redis checkpoint store, a provider
-  client, a tool registry); the shape, not a library API, is the point.
-- **The client treats `resume` like `reconnect`:** it calls a resume endpoint with the run id and lands on
-  a pod that is not draining.
-- **Pending tool calls are saved before they run.** If the pod is SIGKILLed mid-step, the resumed run
-  replays the same calls with the same ids instead of asking the model again (which would return new ids
-  and new keys), so the tool's idempotency store turns each repeat into a no-op.
-
 ### Worked scenario: what one deploy costs a research agent
 Illustrative numbers: runs take ~20 steps of ~6 s each (about 120 s), each step costs about $0.02 in model
 calls, and 40 runs are in flight when a rolling deploy starts.
@@ -447,31 +401,13 @@ send `reconnect` once they pass the cutoff, matching the timeline above.
 
 ```python
 import asyncio, time
-from contextlib import asynccontextmanager
 from pathlib import Path
-import httpx
 from fastapi import FastAPI, Response
 from fastapi.responses import StreamingResponse
 
 DRAIN_FILE = Path("/tmp/draining")   # shared by every worker in the pod
 CUTOFF_S = 58                        # flag at t=0, Uvicorn closes at 5 + 60: leave margin
-
-def draining() -> bool:
-    return DRAIN_FILE.exists()
-
-def past_cutoff() -> bool:
-    try:
-        return time.time() - DRAIN_FILE.stat().st_mtime > CUTOFF_S
-    except FileNotFoundError:
-        return False
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    app.state.http = httpx.AsyncClient(timeout=30)
-    yield                                   # requests are served here
-    await app.state.http.aclose()           # runs only if the server exits before SIGKILL
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 @app.post("/internal/drain", include_in_schema=False)
 async def drain():
@@ -480,23 +416,18 @@ async def drain():
 
 @app.get("/readyz")
 async def readyz(response: Response):
-    if draining():
-        response.status_code = 503
-    return {"ready": not draining()}
-
-async def tokens():                         # stand-in for a provider stream
-    for i in range(500):
-        await asyncio.sleep(0.1)
-        yield f"tok{i} "
+    response.status_code = 503 if DRAIN_FILE.exists() else 200   # balancer stops new requests
+    return {"ready": response.status_code == 200}
 
 @app.get("/v1/chat/stream")
 async def chat_stream():
     async def events():
-        async for tok in tokens():
-            if past_cutoff():
+        for i in range(500):
+            await asyncio.sleep(0.1)          # stand-in for a provider stream
+            if DRAIN_FILE.exists() and time.time() - DRAIN_FILE.stat().st_mtime > CUTOFF_S:
                 yield "event: reconnect\ndata: {}\n\n"
                 return
-            yield f"data: {tok}\n\n"
+            yield f"data: tok{i}\n\n"
         yield "event: done\ndata: {}\n\n"
     return StreamingResponse(events(), media_type="text/event-stream")
 ```
@@ -522,6 +453,15 @@ async def chat_stream():
 - **Record why each stream ended.** Count stream completions by reason (`done`, `reconnect`, client
   disconnect, server error) as a metric. Monitor: `reconnect` and errors spiking at deploy time, which
   says the budget or the workload placement is wrong.
+- **Save pending tool calls before running them.** In a checkpointing agent loop, check the drain flag only
+  at step boundaries, persist the model's tool calls (with their ids) before executing them, and pass
+  `idempotency_key=f"{run_id}:{call_id}"`; a run resumed after a SIGKILL then replays the same calls
+  instead of asking the model again, and the tool's idempotency store makes each repeat a no-op.
+- **Treat `resume` like `reconnect` on the client.** On either event the client calls a resume endpoint
+  with the run id and lands on a pod that is not draining.
+- **Close shared clients in lifespan shutdown.** Code after `yield` in the lifespan (closing the
+  `httpx.AsyncClient`, flushing telemetry) runs only if the server exits before SIGKILL, so leave it room
+  in the grace budget.
 
 ## Trade-offs
 - **Long grace vs rollout speed.** A long grace period lets long streams finish, but it slows rollouts and

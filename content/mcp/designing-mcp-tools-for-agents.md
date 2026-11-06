@@ -348,60 +348,45 @@ flowchart TD
 ## Examples
 ### An agent-friendly search tool
 Prefixed name, enum and bounded schema, concise default, opaque cursor, and errors that say what to do.
-Tested with the Python SDK 1.x (`mcp>=1.10,<2`).
 
 ```python
-# design_server.py
-import base64, json
+# design_server.py  (pip install "mcp>=1.10,<2")
+import base64
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import Field
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 mcp = FastMCP("crm")
-ORDERS = [{"id": f"o_{i}", "customer": "acme" if i % 3 else "globex", "total": 10 * i,
-           "status": "refunded" if i % 7 == 0 else "paid", "lines": ["sku-1"] * 5} for i in range(1, 120)]
+ORDERS = [{"id": f"o_{i}", "customer": "acme" if i % 3 else "globex", "total": 10 * i, "lines": ["sku-1"] * 5}
+          for i in range(1, 120)]
 
-class OrderPage(BaseModel):
-    orders: list[dict]
-    total_matches: int
-    next_cursor: str | None
-
-def _cursor(offset: int) -> str: return base64.urlsafe_b64encode(json.dumps({"o": offset}).encode()).decode()
-def _offset(cursor: str | None) -> int:
-    if not cursor: return 0
-    try: return json.loads(base64.urlsafe_b64decode(cursor))["o"]
-    except Exception: raise ToolError("Invalid cursor. Pass the next_cursor value from the previous call unchanged, or omit it.")
-
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def crm_search_orders(
     customer: str = Field(description="Customer slug, e.g. 'acme'"),
-    status: Literal["paid", "refunded", "any"] = "any",
     limit: int = Field(20, ge=1, le=50, description="Max orders per page"),
     cursor: str | None = Field(None, description="next_cursor from a previous call"),
     response_format: Literal["concise", "detailed"] = "concise",
-) -> OrderPage:
+) -> dict:
     """Search a customer's orders. Use concise unless you need line items."""
-    hits = [o for o in ORDERS if o["customer"] == customer and status in ("any", o["status"])]
+    hits = [o for o in ORDERS if o["customer"] == customer]
     if not hits:
         raise ToolError(f"No orders for customer '{customer}'. Check the slug with crm_find_customer.")
-    start = _offset(cursor)
+    start = int(base64.b64decode(cursor)) if cursor else 0          # opaque offset
     page = hits[start:start + limit]
-    rows = page if response_format == "detailed" else [{k: o[k] for k in ("id", "total", "status")} for o in page]
-    nxt = start + limit
-    return OrderPage(orders=rows, total_matches=len(hits), next_cursor=_cursor(nxt) if nxt < len(hits) else None)
-
-if __name__ == "__main__":
-    mcp.run()
+    if response_format == "concise":
+        page = [{"id": o["id"], "total": o["total"]} for o in page]  # drop the bulky line items
+    end = start + limit
+    nxt = base64.b64encode(str(end).encode()).decode() if end < len(hits) else None
+    return {"orders": page, "total_matches": len(hits), "next_cursor": nxt}
 ```
 
 What a client sees (abridged output of calling it):
 
 ```
 crm_search_orders(customer="acme", limit=2)
-  -> {'orders': [{'id': 'o_1', 'total': 10, 'status': 'paid'}, {'id': 'o_2', 'total': 20, 'status': 'paid'}],
-      'total_matches': 80, 'next_cursor': 'eyJvIjogMn0='}
+  -> {'orders': [{'id': 'o_1', 'total': 10}, {'id': 'o_2', 'total': 20}], 'total_matches': 80, 'next_cursor': 'Mg=='}
 crm_search_orders(customer="acmee")   -> isError: ... No orders for customer 'acmee'. Check the slug with crm_find_customer.
 crm_search_orders(customer="acme", limit=500) -> isError: ... limit: Input should be less than or equal to 50
 ```
@@ -432,6 +417,9 @@ orders of magnitude for one 10-step task.
   announced with list-changed notifications, and old names are removed after usage drops to zero.
 - **Keep definitions stable and ordered.** Deterministic tool order and unchanged descriptions keep the
   host's prompt cache hitting; avoid timestamps or per-request text in descriptions.
+- **Validate cursors and filters too.** An undecodable cursor returns an `isError` saying "pass
+  `next_cursor` unchanged, or omit it", and enum filters such as `status: "paid" | "refunded" | "any"` beat
+  free-text strings the model has to guess.
 
 ## Trade-offs
 - **Fewer broad tools vs many narrow ones.** Broad task-shaped tools cut schema tokens and selection errors

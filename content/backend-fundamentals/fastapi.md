@@ -370,12 +370,12 @@ flowchart TD
 
 ## Examples
 ### Agent-run endpoint that streams steps
-A validated run request with a step budget, a loop inside an async generator, typed SSE events per step,
-and a disconnect check so an abandoned run stops spending. `plan_step` and `run_tool` stand in for a
-model call and an async tool; a LangGraph graph's async streaming method would slot into the same place.
+A validated run request with a step budget, a loop inside an async generator, one SSE event per step, and
+a disconnect check so an abandoned run stops spending. `plan_step` stands in for a model call that picks a
+tool; a LangGraph graph's async streaming method would slot into the same place.
 
 ```python
-import asyncio, json
+import json
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -386,16 +386,8 @@ class RunRequest(BaseModel):
     task: str = Field(min_length=1, max_length=8000)
     max_steps: int = Field(8, ge=1, le=20)        # step budget is part of the contract
 
-async def plan_step(task: str, step: int) -> dict:  # stand-in for a model call that picks a tool
-    await asyncio.sleep(0.05)
-    return {"tool": "search_docs", "args": {"query": task}} if step < 2 else {"final": "Refunds take 5 days."}
-
-async def run_tool(name: str, args: dict) -> str:   # stand-in for an async tool
-    await asyncio.sleep(0.05)
-    return f"3 docs for {args['query']!r}"
-
-def sse(event: dict) -> str:
-    return f"data: {json.dumps(event)}\n\n"
+async def plan_step(task: str, step: int) -> dict:  # stand-in for an awaited model call
+    return {"tool": "search_docs", "query": task} if step < 2 else {"final": "Refunds take 5 days."}
 
 @app.post("/v1/agent/runs")
 async def run_agent(body: RunRequest, request: Request):
@@ -404,15 +396,12 @@ async def run_agent(body: RunRequest, request: Request):
             if await request.is_disconnected():     # user closed the tab: stop paying for steps
                 return
             action = await plan_step(body.task, step)
+            yield f"data: {json.dumps({'step': step, **action})}\n\n"
             if "final" in action:
-                yield sse({"type": "final", "text": action["final"]})
                 break
-            yield sse({"type": "tool_call", "step": step, **action})
-            result = await run_tool(action["tool"], action["args"])
-            yield sse({"type": "tool_result", "step": step, "content": result})
         yield "data: [DONE]\n\n"
     return StreamingResponse(events(), media_type="text/event-stream")
-# POST {"task": "refund policy"} streams 2 tool_call/tool_result pairs, a final event, then [DONE].
+# POST {"task": "refund policy"} streams 2 tool steps, a final step, then [DONE].
 # POST {"task": "x", "max_steps": 50} returns 422 before any model call is made.
 ```
 
@@ -422,7 +411,6 @@ async generator. Every `await` inside `events()` releases the loop to other requ
 whole point of the async design.
 
 ```python
-import json
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import Depends, FastAPI, Request
@@ -439,7 +427,7 @@ app = FastAPI(lifespan=lifespan)
 
 class ChatRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=8000)
-    temperature: float = Field(0.2, ge=0, le=2)   # validated and documented from one declaration
+    temperature: float = Field(0.2, ge=0, le=2)   # {"temperature": 5} is a 422, handler never runs
 
 def http(request: Request) -> httpx.AsyncClient:   # dependency: one shared pool, not one per request
     return request.app.state.http
@@ -449,41 +437,9 @@ async def chat(body: ChatRequest, client: httpx.AsyncClient = Depends(http)):
     async def events():
         async with client.stream("POST", "/generate", json=body.model_dump()) as r:
             async for line in r.aiter_lines():     # each await yields the loop to other requests
-                if line:
-                    yield f"data: {json.dumps({'token': line})}\n\n"
+                yield f"data: {line}\n\n"
         yield "data: [DONE]\n\n"
     return StreamingResponse(events(), media_type="text/event-stream")
-```
-
-### Testing it without a model server
-`dependency_overrides` swaps the shared client for one backed by `httpx.MockTransport`, so the test
-exercises validation, the stream framing and the 422 path with no network.
-
-```python
-import json
-import httpx
-from fastapi.testclient import TestClient
-from main import app, http                         # the module above
-
-def fake_http() -> httpx.AsyncClient:
-    def upstream(request: httpx.Request) -> httpx.Response:
-        assert json.loads(request.content)["prompt"] == "hi"
-        return httpx.Response(200, text="hello\nworld\n")
-    return httpx.AsyncClient(transport=httpx.MockTransport(upstream), base_url="http://test")
-
-app.dependency_overrides[http] = fake_http        # swap the real pool for a fake upstream
-
-def test_chat_streams_tokens():
-    with TestClient(app) as c:                     # the with-block runs lifespan
-        r = c.post("/v1/chat", json={"prompt": "hi"})
-        assert r.status_code == 200
-        assert 'data: {"token": "hello"}' in r.text
-        assert r.text.endswith("data: [DONE]\n\n")
-
-def test_rejects_out_of_range_temperature():
-    with TestClient(app) as c:
-        r = c.post("/v1/chat", json={"prompt": "hi", "temperature": 5})
-        assert r.status_code == 422                # stopped at the boundary, handler never runs
 ```
 
 ### Worked scenario: sizing one worker for 5-second model calls
@@ -534,6 +490,10 @@ and token quota, not FastAPI.
 - **Explicit `response_model` on every route.** Declare the response schema so internal fields are
   filtered, and publish the generated OpenAPI as the contract other teams codegen from. Diff the schema
   in CI to catch accidental breaking changes.
+- **Test streams without a model server.** Override the client dependency
+  (`app.dependency_overrides[http] = fake_http`) with an `httpx.AsyncClient` on `httpx.MockTransport`, and
+  open `with TestClient(app)` so lifespan runs; assert on the SSE framing, the `[DONE]` sentinel and the 422
+  path with no network.
 
 ## Trade-offs
 - **Concurrency vs async discipline.** High concurrency for I/O-bound handlers, but every library on

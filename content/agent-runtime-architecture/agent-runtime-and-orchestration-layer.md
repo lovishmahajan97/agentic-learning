@@ -232,14 +232,6 @@ before dispatch, and approvals park the run instead of blocking a thread. The sa
 crash or an approval because it first looks for a decided-but-unexecuted call in the log.
 
 ```python
-from dataclasses import dataclass, field
-
-@dataclass
-class Run:
-    id: str; tenant: str; user: str
-    status: str = "running"
-    steps: list = field(default_factory=list)          # append-only; the prompt is derived from it
-
 def project(steps):                                    # log -> messages for the next model call
     return [s["message"] for s in steps if "message" in s]
 
@@ -247,35 +239,23 @@ def pending_call(steps):                               # decision recorded, resu
     last = steps[-1] if steps else None
     return last.get("call") if last and last["type"] == "model" else None
 
-class Runtime:
-    def __init__(self, gateway, tools, policy, store, events):
-        self.gateway, self.tools, self.policy, self.store, self.events = gateway, tools, policy, store, events
-
-    def append(self, run, step):
-        run.steps.append(step)
-        self.store.append(run.id, step)                # durable before anything else happens
-        self.events.publish(run.id, step)              # UIs, traces and evals subscribe here
-
-    def tick(self, run: Run, max_steps=40):
-        while run.status == "running" and len(run.steps) < max_steps:
-            call = pending_call(run.steps)             # after a crash or an approval, don't re-ask the model
-            if call is None:
-                d = self.gateway.complete(project(run.steps), tenant=run.tenant)
-                self.append(run, {"type": "model", "message": d.message, "call": d.tool_call})
-                if d.tool_call is None:
-                    run.status = "completed"; break
-                call = d.tool_call
-            verdict = self.policy.check(run, call)     # allow | deny | needs_approval (reads approval records)
-            if verdict.effect == "needs_approval":
-                run.status = "waiting_for_approval"    # parked; the approval event re-schedules tick()
-                self.store.request_approval(run.id, call); break
-            out = ({"error": f"denied: {verdict.reason}"} if verdict.effect == "deny" else
-                   self.tools.dispatch(call, ctx=run, idempotency_key=f"{run.id}:{call.id}"))
-            self.append(run, {"type": "tool_result", "call_id": call.id,
-                              "message": {"role": "tool", "tool_call_id": call.id, "content": out}})
-        if run.status == "running":
-            run.status = "failed"                      # budget exhausted is a terminal state, not a hang
-        self.store.save(run)
+def tick(run, gateway, policy, tools, store, max_steps=40):
+    while run.status == "running" and len(run.steps) < max_steps:
+        call = pending_call(run.steps)                 # after a crash or an approval, don't re-ask the model
+        if call is None:
+            d = gateway.complete(project(run.steps), tenant=run.tenant)
+            store.append(run, {"type": "model", "message": d.message, "call": d.tool_call})  # durable, then run.steps
+            if d.tool_call is None:
+                run.status = "completed"; break
+            call = d.tool_call
+        verdict = policy.check(run, call)              # allow | deny | needs_approval
+        if verdict.effect == "needs_approval":
+            run.status = "waiting_for_approval"; break # parked; the approval event re-schedules tick()
+        out = ({"error": f"denied: {verdict.reason}"} if verdict.effect == "deny" else
+               tools.dispatch(call, idempotency_key=f"{run.id}:{call.id}"))
+        store.append(run, {"type": "tool_result", "message": {"role": "tool", "tool_call_id": call.id, "content": out}})
+    if run.status == "running":
+        run.status = "failed"                          # budget exhausted is a terminal state, not a hang
 ```
 
 ### Worked trace: a refund that waits a day for approval

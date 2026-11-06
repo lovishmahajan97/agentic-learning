@@ -234,35 +234,27 @@ per-task cap stops a degraded small model from sending every step to the large o
 ```python
 import json, litellm
 
-# Model ids are illustrative; use your providers' current ids.
-SMALL, LARGE = "openai/gpt-4o-mini", "anthropic/claude-sonnet-4-20250514"
-ROUTE = {"plan": LARGE, "tool_args": SMALL, "summarize": SMALL}   # step type -> model
+SMALL, LARGE = "openai/gpt-4o-mini", "anthropic/claude-sonnet-4-20250514"   # illustrative ids
+ROUTE = {"plan": LARGE, "tool_args": SMALL, "summarize": SMALL}             # step type -> model
 MAX_ESCALATIONS_PER_TASK = 3
 
-def valid_tool_call(msg, tools):
-    by_name = {t["function"]["name"]: t["function"] for t in tools}
-    if not msg.tool_calls:
-        return False                                            # a tool step that called no tool
-    for tc in msg.tool_calls:
-        fn = by_name.get(tc.function.name)
-        if fn is None:
-            return False                                        # invented tool
-        try:
-            args = json.loads(tc.function.arguments)
-        except json.JSONDecodeError:
-            return False                                        # unparseable arguments
-        if not isinstance(args, dict) or not set(fn["parameters"].get("required", [])) <= args.keys():
-            return False                                        # missing required argument
-    return True
+def valid_tool_call(msg, tools):              # free gate: known tool, parseable args, required args present
+    params = {t["function"]["name"]: t["function"]["parameters"] for t in tools}
+    try:
+        return bool(msg.tool_calls) and all(
+            set(params[tc.function.name].get("required", [])) <= json.loads(tc.function.arguments).keys()
+            for tc in msg.tool_calls)
+    except (KeyError, AttributeError, ValueError):   # invented tool, non-object or unparseable args
+        return False
 
 def run_step(step_type, messages, tools, task):
+    call = lambda m: litellm.completion(model=m, messages=messages, tools=tools).choices[0].message
     model = ROUTE[step_type]
-    msg = litellm.completion(model=model, messages=messages, tools=tools).choices[0].message
+    msg = call(model)
     if model == SMALL and tools and not valid_tool_call(msg, tools) \
             and task["escalations"] < MAX_ESCALATIONS_PER_TASK:
-        task["escalations"] += 1                                # escalate this step only
-        model = LARGE
-        msg = litellm.completion(model=model, messages=messages, tools=tools).choices[0].message
+        task["escalations"] += 1              # escalate this step only
+        model, msg = LARGE, call(LARGE)
     task["trace"].append({"step": step_type, "model": model, "escalated": model != ROUTE[step_type]})
     return msg
 ```
@@ -290,37 +282,30 @@ number to watch in production is `escalated`; its rate is what you tune.
 ```python
 import json, litellm
 
-# Model ids are illustrative and date quickly; use your providers' current ids. The judge should be a
-# different model from the generator it grades: models rate their own outputs favourably.
+# Model ids are illustrative and date quickly. The judge is a different model from the generator it grades.
 SMALL, LARGE, JUDGE = "openai/gpt-4o-mini", "anthropic/claude-sonnet-4-20250514", "anthropic/claude-3-5-haiku-20241022"
 
 def ask(model, messages, **kw):
-    r = litellm.completion(model=model, messages=messages, temperature=0, **kw)
-    return r.choices[0].message.content, r.usage
+    return litellm.completion(model=model, messages=messages, temperature=0, **kw).choices[0].message.content
 
 def passes_check(question, answer):
-    try:                                              # 1) deterministic gate: valid JSON, required fields
-        obj = json.loads(answer)
-        if not isinstance(obj, dict) or not {"answer", "confidence"} <= obj.keys():
-            return False
+    try:
+        obj = json.loads(answer)                      # 1) deterministic gate: valid JSON with an answer
     except json.JSONDecodeError:
         return False
-    verdict, _ = ask(JUDGE, [{"role": "user", "content":   # 2) cheap judge, only after the gate passes
-        f"Question: {question}\nAnswer: {obj['answer']}\n"
-        "Is the answer complete and correct? Reply PASS or FAIL only."}], max_tokens=2)
+    if not isinstance(obj, dict) or "answer" not in obj:
+        return False
+    verdict = ask(JUDGE, [{"role": "user", "content":    # 2) cheap judge, only after the gate passes
+        f"Question: {question}\nAnswer: {obj['answer']}\nComplete and correct? Reply PASS or FAIL only."}],
+        max_tokens=2)
     return verdict.strip().upper().startswith("PASS")
 
 def cascade(question):
-    msgs = [{"role": "system", "content": 'Reply as JSON: {"answer": str, "confidence": number 0-1}'},
-            {"role": "user", "content": question}]
-    answer, usage = ask(SMALL, msgs)
+    msgs = [{"role": "system", "content": 'Reply as JSON: {"answer": str}'}, {"role": "user", "content": question}]
+    answer = ask(SMALL, msgs)
     if passes_check(question, answer):
-        return {"model": SMALL, "answer": answer, "escalated": False, "usage": usage}
-    answer, usage = ask(LARGE, msgs)                  # escalate: same prompt, stronger model
-    return {"model": LARGE, "answer": answer, "escalated": True, "usage": usage}
-
-print(cascade("Our invoice says net-45 but the signed contract says net-30. Which applies, and why?"))
-# Emit `escalated`, both usages and the judge verdict as metrics; alert when the escalation rate jumps.
+        return {"model": SMALL, "answer": answer, "escalated": False}
+    return {"model": LARGE, "answer": ask(LARGE, msgs), "escalated": True}   # same prompt, stronger model
 ```
 
 - **Gate first** *because* it is free and catches the most common failure (unparseable output); the judge
@@ -333,22 +318,15 @@ print(cascade("Our invoice says net-45 but the signed contract says net-30. Whic
 Pure Python; plug in your own unit costs.
 
 ```python
-def route_threshold(c_small, c_large, miss_cost):
-    """Route small when P(small answer adequate) exceeds this."""
+def route_threshold(c_small, c_large, miss_cost):   # route small when P(small answer adequate) exceeds this
     return 1 - (c_large - c_small) / miss_cost
 
 def cascade_cost(c_small, c_check, c_large, p_escalate):
     return c_small + c_check + p_escalate * c_large
 
-for miss in (50, 500):
-    print(f"miss costs {miss:>3}: route small when p > {route_threshold(1, 15, miss):.3f}")
-# miss costs  50: route small when p > 0.720
-# miss costs 500: route small when p > 0.972
-
-for p in (0.10, 0.25, 0.40, 0.60):
-    cost = cascade_cost(1, 0.5, 15, p)
-    print(f"escalate {p:.0%}: {cost:5.2f} units, saving {1 - cost / 15:.0%} vs always-large")
-# 10%: 3.00 (80%)   25%: 5.25 (65%)   40%: 7.50 (50%)   60%: 10.50 (30%)
+print(f"{route_threshold(1, 15, 50):.3f} {route_threshold(1, 15, 500):.3f}")   # 0.720 0.972
+for p in (0.10, 0.25, 0.60):
+    print(f"escalate {p:.0%}: {cascade_cost(1, 0.5, 15, p):.2f} units")      # 3.00, 5.25, 10.50 vs 15
 ```
 
 ### Worked scenario: mean cost falls, p95 rises
@@ -389,6 +367,8 @@ route instead; for a background agent where only task cost matters, the cascade'
 - **Retrain the router on fresh labels.** Rebuild the labelled set from recent traces after any
   prompt-template, tool-schema or model change, because routers trained on old prompts drift. Monitor
   misroute rate on a held-out slice of recent traffic.
+- **Record both rungs' token usage.** On an escalated request, log the small call's, the judge's and the
+  large call's usage, so cost per request reflects what the cascade actually spent.
 
 ## Trade-offs
 - **Lower mean cost vs higher tail latency.** Escalated requests pay in series. This flips when the

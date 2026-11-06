@@ -331,46 +331,32 @@ flowchart TD
 ```
 
 ## Examples
-### Production configuration with one event per LLM call
-JSON output, request context via contextvars, and fields you will later aggregate on. The prompt itself is
-not logged, only its hash.
+### Agent scenario: one event per step, bound to the run
+Bind `run_id` once per run and `step` per iteration, so every tool call line can be grouped by run. Tool
+arguments are hashed, not logged. Needs only `pip install structlog`.
 
 ```python
-import hashlib, logging, time, uuid
+import hashlib, json, uuid
 import structlog
 
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,     # request-scoped fields
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.dict_tracebacks,        # exceptions as structured data
-        structlog.processors.JSONRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    cache_logger_on_first_use=True,
-)
+structlog.configure(processors=[structlog.contextvars.merge_contextvars,
+                                structlog.processors.add_log_level,
+                                structlog.processors.JSONRenderer()])
 log = structlog.get_logger()
 
-def handle_request(user_id: str, prompt: str) -> None:
+def run_agent(steps: list[tuple[str, dict]]) -> None:
     structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(request_id=str(uuid.uuid4()), user_id=user_id)
-    t0 = time.perf_counter()
-    # ... call the model here ...
-    log.info("llm_call", model="gpt-4o-mini", prompt_version="summarize-v3",
-             prompt_sha=hashlib.sha256(prompt.encode()).hexdigest()[:12],
-             tokens_in=812, tokens_out=164, latency_ms=round((time.perf_counter() - t0) * 1000))
+    structlog.contextvars.bind_contextvars(run_id=uuid.uuid4().hex[:8], agent="support-v2")
+    for i, (tool, args) in enumerate(steps, start=1):
+        with structlog.contextvars.bound_contextvars(step=i):      # step leaves with the iteration
+            sha = hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()[:12]
+            log.info("tool_call", tool=tool, status="ok", args_sha=sha)
+    log.info("run_end", steps=len(steps))
 
-handle_request("u_42", "Summarize this contract ...")
-# {"model": "gpt-4o-mini", "prompt_version": "summarize-v3", "prompt_sha": "…", "tokens_in": 812,
-#  "tokens_out": 164, "latency_ms": 0, "event": "llm_call", "request_id": "…", "user_id": "u_42",
-#  "level": "info", "timestamp": "2026-…Z"}
-# (keys follow processor order: call kwargs, then contextvars, level, timestamp; pass
-#  JSONRenderer(sort_keys=True) if your pipeline wants a stable alphabetical order)
+run_agent([("lookup_order", {"id": "A17"}), ("refund", {"id": "A17"})])
+# {"tool": "lookup_order", "status": "ok", "args_sha": "09c3c26f490c", "event": "tool_call",
+#  "agent": "support-v2", "step": 1, "run_id": "e03fef86", "level": "info"}  ...run_end has no step
 ```
-
-- **Do not rely on key order among context fields:** `request_id` and `user_id` can come out in either
-  order, because `merge_contextvars` reads an unordered context mapping. Query by key, or use `sort_keys=True`.
 
 ### Watch request context vanish in a thread pool
 Standard library only. Two concurrent requests each set a `ContextVar`; `asyncio.to_thread` keeps it,
@@ -386,56 +372,19 @@ class AddRequestId(logging.Filter):
         record.request_id = request_id.get()   # read at emit time, in the emitting thread
         return True
 
-handler = logging.StreamHandler()
-handler.addFilter(AddRequestId())
-handler.setFormatter(logging.Formatter("%(request_id)s %(message)s"))
-logging.basicConfig(level=logging.INFO, handlers=[handler])
+logging.basicConfig(level=logging.INFO, format="%(request_id)s %(message)s")
+logging.getLogger().handlers[0].addFilter(AddRequestId())
 log = logging.getLogger("demo")
 
-def blocking_work(label):
-    log.info("in thread via %s", label)
-
 async def handle(rid):
-    request_id.set(rid)                       # per task: each gathered task has its own copy
-    await asyncio.to_thread(blocking_work, "to_thread")                 # req-A / req-B
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, blocking_work, "run_in_executor")  # "-"
-    log.info("back in task")                                            # req-A / req-B
+    request_id.set(rid)                        # per task: each gathered task has its own copy
+    await asyncio.to_thread(log.info, "via to_thread")                          # req-A / req-B
+    await asyncio.get_running_loop().run_in_executor(None, log.info, "via executor")  # -
 
 async def main():
     await asyncio.gather(handle("req-A"), handle("req-B"))
 
 asyncio.run(main())
-```
-
-### Agent scenario: one event per step, bound to the run
-Bind `run_id` once per run and `step` per iteration, so every model call, tool call and retry line can be
-grouped by run. Tool arguments are hashed, not logged. Needs only `pip install structlog`.
-
-```python
-import hashlib, json, logging, time, uuid
-import structlog
-
-structlog.configure(
-    processors=[structlog.contextvars.merge_contextvars, structlog.processors.add_log_level,
-                structlog.processors.TimeStamper(fmt="iso"), structlog.processors.JSONRenderer()],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO))
-log = structlog.get_logger()
-
-def run_agent(task: str, steps: list[tuple[str, dict]]) -> None:
-    structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(run_id=str(uuid.uuid4()), agent="support-v2")
-    for i, (tool, args) in enumerate(steps, start=1):
-        structlog.contextvars.bind_contextvars(step=i)          # later lines carry the step
-        t0 = time.perf_counter()
-        status = "ok" if tool != "refund" else "error"          # stand-in for the real tool call
-        log.info("tool_call", tool=tool, status=status,
-                 args_sha=hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()[:12],
-                 latency_ms=round((time.perf_counter() - t0) * 1000))
-    log.info("run_end", steps=len(steps), outcome="answered")
-
-run_agent("refund A17", [("lookup_order", {"id": "A17"}), ("refund", {"id": "A17"})])
-# {"tool": "lookup_order", "status": "ok", ..., "run_id": "...", "agent": "support-v2", "step": 1, ...}
 ```
 
 ### Worked scenario: an agent that loops
@@ -485,6 +434,11 @@ None of these is possible from `"call failed after 3.2s"`.
   per request.
 - **Trace ID on every event.** A small processor that adds the current OpenTelemetry span's trace ID lets
   you jump from a log line to its trace. Check that a sample of ERROR lines carries a trace ID.
+- **Full production chain.** Add `TimeStamper(fmt="iso")` and `dict_tracebacks` to the processors, use
+  `make_filtering_bound_logger(logging.INFO)` and `cache_logger_on_first_use=True`, and log a prompt hash
+  plus `prompt_version`, `tokens_in`, `tokens_out` and `latency_ms` on every `llm_call`.
+- **Do not rely on JSON key order.** Context fields from `merge_contextvars` can come out in either order;
+  query by key, or pass `JSONRenderer(sort_keys=True)` when a pipeline needs a stable order.
 
 ## Trade-offs
 - **Queryable vs readable.** JSON logs aggregate cleanly but are hard to read in a terminal; render with

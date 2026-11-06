@@ -290,54 +290,9 @@ sequenceDiagram
 ```
 
 ## Examples
-### Agent scenario: parallel tool calls with a per-tool timeout
-The agent runs every tool call the model requested in one step. A slow tool must come back as an error
-result the model can read, not hang the step, and must actually be cancelled.
-
-```python
-import asyncio
-import pytest
-
-async def run_tool_calls(calls, tools, timeout_s):
-    async def one(call):
-        try:
-            async with asyncio.timeout(timeout_s):           # Python 3.11+
-                return {"id": call["id"], "content": await tools[call["name"]](**call["args"])}
-        except TimeoutError:
-            return {"id": call["id"], "error": f"{call['name']} timed out after {timeout_s}s"}
-    return await asyncio.gather(*(one(c) for c in calls))    # keeps call order
-
-def make_tools(state):
-    async def search(q):
-        await asyncio.sleep(0.01)
-        return f"results for {q}"
-    async def browse(url):
-        state["browse_open"] = True
-        try:
-            await asyncio.sleep(10)                          # a hung page load
-        finally:
-            state["browse_open"] = False                     # runs on cancellation
-    return {"search": search, "browse": browse}
-
-@pytest.mark.asyncio
-async def test_slow_tool_becomes_error_result_and_is_cancelled():
-    state = {}
-    calls = [{"id": "c1", "name": "search", "args": {"q": "kv cache"}},
-             {"id": "c2", "name": "browse", "args": {"url": "https://example.com"}}]
-    out = await run_tool_calls(calls, make_tools(state), timeout_s=0.05)
-    assert out[0] == {"id": "c1", "content": "results for kv cache"}
-    assert "timed out" in out[1]["error"]
-    assert state["browse_open"] is False                     # no tool left running
-```
-
-- **Why it matters:** without the timeout one hung tool stalls the whole agent; without cancellation the
-  hung task keeps a connection open after the step has moved on.
-- **Fast:** total runtime is about 0.05 s because the delays are injected, not production-sized.
-
-### Fan-out limit and timeout cancellation
-A fan-out helper must never exceed a concurrency limit, and a timeout must leave no request in flight.
-Both properties exist only while the loop runs. A fake LLM records peak concurrency; the async fixture
-checks in teardown that nothing leaked.
+### Agent scenario: a hung model call times out and is cancelled
+A slow model or tool call must not hang the agent step, and the timeout must actually cancel it. A fake
+LLM counts calls in flight; the async fixture checks in teardown that nothing leaked.
 
 ```python
 # pyproject.toml: [tool.pytest.ini_options] asyncio_mode = "strict"
@@ -347,95 +302,67 @@ import pytest_asyncio
 
 class FakeLLM:
     def __init__(self, delay: float):
-        self.delay, self.in_flight, self.peak = delay, 0, 0
+        self.delay, self.in_flight = delay, 0
     async def complete(self, prompt: str) -> str:
         self.in_flight += 1
-        self.peak = max(self.peak, self.in_flight)
         try:
-            await asyncio.sleep(self.delay)
+            await asyncio.sleep(self.delay)      # a hung call, injected
             return prompt.upper()
         finally:
-            self.in_flight -= 1          # runs on success and on cancellation
-
-async def fan_out(llm, prompts, limit: int):
-    sem = asyncio.Semaphore(limit)
-    async def one(p):
-        async with sem:
-            return await llm.complete(p)
-    return await asyncio.gather(*(one(p) for p in prompts))
+            self.in_flight -= 1                  # runs on success and on cancellation
 
 @pytest_asyncio.fixture
 async def llm():
-    client = FakeLLM(delay=0.01)
+    client = FakeLLM(delay=10)
     yield client
-    assert client.in_flight == 0          # teardown, same loop as the test
-
-@pytest.mark.asyncio
-async def test_fan_out_respects_limit(llm):
-    out = await fan_out(llm, [f"p{i}" for i in range(20)], limit=4)
-    assert out == [f"P{i}" for i in range(20)]   # gather preserves order
-    assert llm.peak == 4
+    assert client.in_flight == 0                 # teardown, same loop as the test
 
 @pytest.mark.asyncio
 async def test_timeout_cancels_inner_call(llm):
-    llm.delay = 10
     with pytest.raises(TimeoutError):
         async with asyncio.timeout(0.05):        # Python 3.11+
             await llm.complete("x")
     assert llm.in_flight == 0
 ```
 
-- **Fast:** the suite runs in well under a second because the delays are tiny.
-- **What a bug looks like:** a broken limit shows up as `peak == 20`; a timeout that does not cancel
-  shows up as `in_flight == 1`.
+- **Why it matters:** without the timeout one hung call stalls the whole agent; without cancellation the
+  hung task keeps a connection open after the step has moved on.
+- **Fast:** the test takes about 0.05 s because the timeout is test-sized; a timeout that does not
+  cancel shows up as `in_flight == 1`.
 
-### Streams must close on early stop and on cancel
-A token stream wraps an HTTP response; when the agent stops early (a stop sequence, a guardrail) or the
-user disconnects, its cleanup must run.
+### Streams must close on early stop
+A token stream wraps an HTTP response; when the agent stops early (a stop sequence, a guardrail), its
+cleanup must run.
 
 ```python
 import asyncio
 from contextlib import aclosing        # Python 3.10+
 import pytest
 
-async def stream_tokens(state: dict, n: int = 100):
+async def stream_tokens(state: dict):
     state["open"] = True
     try:
-        for i in range(n):
-            await asyncio.sleep(0.001)      # stands in for a network read
+        for i in range(100):
+            await asyncio.sleep(0.001)  # stands in for a network read
             yield f"t{i}"
     finally:
         state["open"] = False           # stands in for closing the HTTP response
 
-async def first_k(state: dict, k: int) -> list[str]:
+@pytest.mark.asyncio
+async def test_early_stop_closes_stream():
+    state: dict = {}
     out: list[str] = []
     async with aclosing(stream_tokens(state)) as agen:
         async for tok in agen:
             out.append(tok)
-            if len(out) == k:
+            if len(out) == 3:
                 break                   # aclosing runs the generator's finally now
-    return out
-
-@pytest.mark.asyncio
-async def test_early_stop_closes_stream():
-    state: dict = {}
-    assert await first_k(state, 3) == ["t0", "t1", "t2"]
+    assert out == ["t0", "t1", "t2"]
     assert state["open"] is False       # without aclosing, still True here
-
-@pytest.mark.asyncio
-async def test_cancel_mid_stream_closes_stream():
-    state: dict = {}
-    task = asyncio.create_task(first_k(state, 50))
-    await asyncio.sleep(0.01)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert state["open"] is False
 ```
 
 - **Why `aclosing`:** breaking out of `async for` leaves the async generator suspended; its `finally`
   runs only when it is finalized later. `aclosing` closes it at the end of the block.
-- **The cancel test** proves the cleanup also runs when the consumer task is cancelled mid-stream.
 
 ### Worked incident: "attached to a different loop" only in CI
 | Step | What happened |
@@ -476,6 +403,10 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")   # every test in this mo
 - **Injected delays and clocks.** Pass retry backoff and timeouts as parameters (or a `sleep` callable)
   so tests use 0.01 s where production uses seconds. Track async-lane wall time; a jump usually means a
   real delay crept in.
+- **Cancel streams mid-flight in tests.** Besides early `break`, run the stream consumer as a task,
+  `task.cancel()` it mid-stream, await the `CancelledError`, and assert the response was closed.
+- **Fan-out under a semaphore.** A fake that records peak in-flight calls proves the limit holds: a
+  broken `asyncio.Semaphore` limit shows up as peak equal to the number of prompts.
 
 ## Trade-offs
 - **Function-scoped loops: isolation vs rebuild cost.** Every test is isolated from leaked tasks, but

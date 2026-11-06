@@ -385,77 +385,57 @@ with no base class, so the loop is testable without network or vendor mocks. Thi
 `mypy --strict` on Python 3.10+.
 
 ```python
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 @dataclass
 class Reply:
-    text: str | None = None
+    text: str = ""
     tool: str | None = None
-    args: dict[str, object] = field(default_factory=dict)
 
 class LLMClient(Protocol):
-    def complete(self, messages: list[dict[str, str]], /) -> Reply: ...
+    def complete(self, messages: list[str], /) -> Reply: ...
 
 class Tool(Protocol):
-    @property
-    def name(self) -> str: ...                # read-only: plain attributes also satisfy it
-    def run(self, args: dict[str, object], /) -> str: ...
+    def run(self) -> str: ...
 
 class Clock:                                  # a tool; no base class
-    name = "clock"
-    def run(self, args: dict[str, object], /) -> str:
-        return "2026-10-22T09:00Z"
+    def run(self) -> str: return "2026-10-22T09:00Z"
 
 class ScriptedLLM:                            # test double: satisfies LLMClient structurally
     def __init__(self, replies: list[Reply]) -> None: self.replies = replies
-    def complete(self, messages: list[dict[str, str]], /) -> Reply:
+    def complete(self, messages: list[str], /) -> Reply:
         return self.replies.pop(0)
 
-def run_agent(llm: LLMClient, tools: dict[str, Tool], task: str, max_steps: int = 5) -> str:
-    messages = [{"role": "user", "content": task}]
-    for _ in range(max_steps):
-        r = llm.complete(messages)
-        if r.tool is None:
-            return r.text or ""
-        result = tools[r.tool].run(r.args) if r.tool in tools else f"unknown tool {r.tool}"
-        messages.append({"role": "tool", "content": result})
-    return "stopped: step limit"
+def run_agent(llm: LLMClient, tools: dict[str, Tool], task: str) -> str:
+    messages = [task]
+    while (r := llm.complete(messages)).tool is not None:   # real loops also cap the steps
+        messages.append(tools[r.tool].run())
+    return r.text
 
 llm = ScriptedLLM([Reply(tool="clock"), Reply(text="It is 09:00 UTC.")])
 print(run_agent(llm, {"clock": Clock()}, "What time is it?"))   # It is 09:00 UTC.
 ```
 
-### Structural embedder, generic index, typed decorator
-Two unrelated classes satisfy `Embedder`, the index remembers what it stores (the retrieval half of a
-RAG tool), and the decorator keeps the signature. On Python 3.12+ the `Generic[T]` base can be replaced
-by `class Index[T]:`.
+### Structural embedder and a generic index
+`HashEmbedder` satisfies `Embedder` without inheriting from it, and the index remembers what type it
+stores (the retrieval half of a RAG tool). On Python 3.12+ the `Generic[T]` base can be replaced by
+`class Index[T]:`.
 
 ```python
-import functools, zlib
-from collections.abc import Callable, Sequence
-from typing import Generic, ParamSpec, Protocol, TypeVar, runtime_checkable
+import zlib
+from collections.abc import Sequence
+from typing import Generic, Protocol, TypeVar
 
-@runtime_checkable
 class Embedder(Protocol):
-    dim: int
     def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
 
 class HashEmbedder:                       # no inheritance from Embedder anywhere
-    dim = 16
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        return [self._one(t) for t in texts]
-    def _one(self, text: str) -> list[float]:
-        v = [0.0] * self.dim              # bag of words; crc32 is stable across runs, hash() is not
-        for w in text.lower().split(): v[zlib.crc32(w.encode()) % self.dim] += 1.0
-        return v
-
-class OpenAIEmbedder:                     # wraps a vendor SDK; also structurally an Embedder
-    dim = 1536
-    def __init__(self, client) -> None: self.client = client
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        r = self.client.embeddings.create(model="text-embedding-3-small", input=list(texts))
-        return [d.embedding for d in r.data]
+        vecs = [[0.0] * 16 for _ in texts]    # bag of words; crc32 is stable across runs, hash() is not
+        for v, t in zip(vecs, texts):
+            for w in t.lower().split(): v[zlib.crc32(w.encode()) % 16] += 1.0
+        return vecs
 
 T = TypeVar("T")
 class Index(Generic[T]):
@@ -467,20 +447,12 @@ class Index(Generic[T]):
         self.items.append(item); self.vecs.append(self.embedder.embed([text])[0])
     def nearest(self, text: str) -> T:              # the checker knows this is a T
         q = self.embedder.embed([text])[0]
-        dot = lambda v: sum(a * b for a, b in zip(q, v))
-        return self.items[max(range(len(self.vecs)), key=lambda i: dot(self.vecs[i]))]
-
-P = ParamSpec("P"); R = TypeVar("R")
-def logged(fn: Callable[P, R]) -> Callable[P, R]:   # keeps fn's exact signature
-    @functools.wraps(fn)
-    def inner(*args: P.args, **kwargs: P.kwargs) -> R:
-        print("calling", fn.__name__); return fn(*args, **kwargs)
-    return inner
+        scores = [sum(a * b for a, b in zip(q, v)) for v in self.vecs]
+        return self.items[scores.index(max(scores))]
 
 idx: Index[int] = Index(HashEmbedder())
 idx.add(42, "the answer"); idx.add(7, "a prime")
 print(idx.nearest("answer"))                       # 42 (int, per the checker)
-print(isinstance(HashEmbedder(), Embedder))        # True: attribute presence only
 ```
 
 What the checker catches when you break it:
@@ -489,42 +461,6 @@ What the checker catches when you break it:
 |---|---|
 | `nearest` returns `self.vecs[0]` | `list[float]` is not `T` (only because `self.vecs` is annotated; an unannotated `[]` would leak `Any` and hide the error) |
 | `idx: Index[int] = Index(object())` | `object` is missing `embed` |
-
-### Generic store protocol and a callback protocol (Python 3.12+)
-A memory store swaps for a Redis one without inheritance, and the streaming callback's keyword-only
-`final` is typed exactly (the shape of a token callback that streams an agent's answer to a UI). This
-passes `mypy --strict`.
-
-```python
-from typing import Protocol
-
-class Store[T](Protocol):
-    def get(self, key: str) -> T | None: ...
-    def put(self, key: str, value: T) -> None: ...
-
-class OnToken(Protocol):                     # callback protocol: Callable[...] cannot say "*, final"
-    def __call__(self, token: str, *, final: bool) -> None: ...
-
-class MemoryStore[T]:                        # no inheritance; structurally a Store[T]
-    def __init__(self) -> None:
-        self._d: dict[str, T] = {}
-    def get(self, key: str) -> T | None:
-        return self._d.get(key)
-    def put(self, key: str, value: T) -> None:
-        self._d[key] = value
-
-def stream(words: list[str], on_token: OnToken) -> None:
-    for i, w in enumerate(words):
-        on_token(w, final=i == len(words) - 1)
-
-def printer(token: str, *, final: bool) -> None:
-    print(token, end="\n" if final else " ")
-
-sessions: Store[dict[str, str]] = MemoryStore()
-sessions.put("u1", {"lang": "en"})
-print(sessions.get("u1"))                    # {'lang': 'en'}
-stream(["hello", "world"], printer)          # hello world
-```
 
 ## Production patterns
 - **Consumer-owned protocols at the provider boundary.** Define `LLMClient`, `Embedder`, `Tool` and

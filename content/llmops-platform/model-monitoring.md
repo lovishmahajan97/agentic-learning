@@ -230,52 +230,35 @@ flowchart TD
 
 ## Examples
 ### Windowed monitor per bundle and tenant
-A windowed monitor over logged events: proxies on all requests, judge scores on the sampled subset,
-compared per version against a baseline window with a minimum-sample guard.
+A windowed monitor for one (bundle, tenant) slice: a rate proxy on all requests, judge scores on the
+sampled subset, compared against a baseline window with a minimum-sample guard.
 
 ```python
-import math
-from collections import defaultdict
+import math, random
 from statistics import mean, stdev
 
-MIN_N = 200                       # no verdicts on tiny windows
-LIMITS = {"refusal_rate": 0.05, "schema_fail_rate": 0.02, "judge_drop": 0.3}
+MIN_N, JUDGE_MIN, REFUSAL_LIMIT, JUDGE_DROP = 200, 50, 0.05, 0.3
 
-def summarise(events):            # events: dicts from the trace store, one per request
-    by = defaultdict(list)
-    for e in events:
-        by[(e["bundle"], e["tenant"])].append(e)
-    out = {}
-    for key, es in by.items():
-        judged = [e["judge"] for e in es if e.get("judge") is not None]   # sampled subset
-        out[key] = {"n": len(es),
-                    "refusal_rate": mean(e["refused"] for e in es),
-                    "schema_fail_rate": mean(not e["schema_ok"] for e in es),
-                    "p95_ms": sorted(e["ms"] for e in es)[math.ceil(0.95 * len(es)) - 1],  # nearest rank
-                    "cost_per_req": mean(e["cost"] for e in es),
-                    "judge_mean": mean(judged) if judged else None, "judge_n": len(judged),
-                    "judge_sd": stdev(judged) if len(judged) > 1 else None}
-    return out
-
-def judge_dropped(c, b, z=2.0):   # drop must be large relative to its own noise
-    se = math.sqrt(c["judge_sd"] ** 2 / c["judge_n"] + b["judge_sd"] ** 2 / b["judge_n"])
-    return b["judge_mean"] - c["judge_mean"] > max(LIMITS["judge_drop"], z * se)
-
-def alerts(current, baseline):
-    found = []
-    for key, c in current.items():
-        if c["n"] < MIN_N:
-            continue
-        b = baseline.get(key)
-        for m in ("refusal_rate", "schema_fail_rate"):
-            if c[m] > LIMITS[m] and (b is None or c[m] > 2 * b[m]):
-                found.append((key, m, c[m], "page"))
-        if b and c["judge_n"] >= 50 and b["judge_n"] >= 50 and judge_dropped(c, b):
-            found.append((key, "judge_mean", c["judge_mean"], "ticket+examples"))
+def alerts(cur, base, z=2.0):                 # cur, base: logged events for one slice
+    if len(cur) < MIN_N:
+        return []                             # no verdicts on tiny windows
+    found, refusal = [], mean(e["refused"] for e in cur)
+    if refusal > REFUSAL_LIMIT and refusal > 2 * mean(e["refused"] for e in base):
+        found.append(("refusal_rate", round(refusal, 3), "page"))
+    c = [e["judge"] for e in cur if e["judge"] is not None]       # sampled subset only
+    b = [e["judge"] for e in base if e["judge"] is not None]
+    if len(c) >= JUDGE_MIN and len(b) >= JUDGE_MIN:
+        se = math.sqrt(stdev(c) ** 2 / len(c) + stdev(b) ** 2 / len(b))
+        if mean(b) - mean(c) > max(JUDGE_DROP, z * se):          # drop must beat its own noise
+            found.append(("judge_mean", round(mean(c), 2), "ticket+examples"))
     return found
-# Run hourly: alerts(summarise(last_hour), summarise(same_hour_last_week)).
-# With sd ≈ 0.8 and 50 judged per side, se ≈ 0.16, so only drops above ~0.32 fire: the
-# floor of 50 judged requests is what bounds the smallest regression this slice can see.
+
+random.seed(0)
+window = lambda p_ref, q: [{"refused": random.random() < p_ref,
+                            "judge": random.gauss(q, 0.8) if i % 5 == 0 else None} for i in range(300)]
+print(alerts(window(0.08, 3.6), window(0.02, 4.3)))   # last hour vs same hour last week
+# [('refusal_rate', 0.08, 'page'), ('judge_mean', 3.65, 'ticket+examples')]
+# With sd 0.8 and 50 judged per side, se is about 0.16, so only drops above ~0.32 fire.
 ```
 
 ### Burn-rate SLO and slice false alarms, in numbers
@@ -328,7 +311,6 @@ def run_proxies(spans: list[dict]) -> dict:
         "tool_error_rate": sum(s["error"] for s in tools) / len(tools) if tools else 0.0,
         "repeat_calls": sum(n - 1 for n in calls.values() if n > 1),   # loop signature
         "no_final_answer": not llm or llm[-1].get("finish_reason") != "stop",
-        "tools_used": sorted({s["tool"] for s in tools}),
     }
 # Alert examples: p95 steps per task up 50% vs last week on n >= 200 runs, or the
 # share of runs that never call "search" doubling after a model alias change.
@@ -370,6 +352,8 @@ Illustrative numbers for a RAG support agent after its provider alias moved over
 - **Run-level rollups for agents.** Aggregate spans by run id into one row per task (steps, tools used,
   tool errors, cost, outcome) and alert on those rows, because per-call dashboards hide loops. Monitor
   p95 steps per task and the share of runs hitting the step budget.
+- **Same guard for every rate proxy.** Schema-fail rate uses the same rule as refusals with its own limit
+  (for example 2%): at least 200 requests in the slice, over the limit and more than double the baseline.
 
 ## Trade-offs
 - **1% judge sampling: cheap vs coverage.** A small tenant may get five scored requests a day;

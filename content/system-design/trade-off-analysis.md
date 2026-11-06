@@ -261,94 +261,51 @@ print(f"hybrid breaks the ${CEILING} ceiling above {flip:.0%} escalation")
   re-measure as escalation changes.
 
 ### Break-even: the cost cell of hosted vs self-hosted
-- **Illustrative figures only:** replace them with your own quotes and a load-tested throughput number.
-  The script is the shape of the reasoning, not a benchmark.
-- **The finding:** at these inputs self-hosting only wins above roughly 18 billion tokens a month, and a
-  drop in utilisation from 50% to 40% makes it never win, *because* idle GPUs still bill.
-- **That utilisation sensitivity belongs in the ADR**, alongside the quality and risk dimensions this cell
-  says nothing about. Agent traffic reaches such volumes sooner than chat, because every run makes many
-  model calls.
+Illustrative inputs: hosted at $2.00 per 1M tokens; self-hosted at $2.50 per GPU-hour, 3M tokens per
+GPU-hour (load-tested), plus $6,000 a month of fixed ops. Monthly cost:
 
-```python
-# Illustrative figures only. Replace with your provider quote and your measured throughput.
-HOSTED_PER_M  = 2.00         # $ per 1M tokens, blended input/output
-GPU_HOUR      = 2.50         # $ per GPU-hour, on-demand
-TOK_PER_GPU_H = 3_000_000    # tokens one GPU serves per hour on YOUR workload (load-tested)
-OPS_PER_MONTH = 6_000        # $ people + tooling to run serving, paid regardless of volume
+| Tokens/month | Hosted | Self-hosted, 50% util | Self-hosted, 40% util |
+|---|---|---|---|
+| 0.5B | $1,000 | $6,833 | $7,042 |
+| 5B | $10,000 | $14,333 | $16,417 |
+| 50B | $100,000 | $89,333 | $110,167 |
 
-def monthly(tokens: float, util: float) -> tuple[float, float]:
-    hosted = tokens / 1e6 * HOSTED_PER_M
-    self_hosted = tokens / (TOK_PER_GPU_H * util) * GPU_HOUR + OPS_PER_MONTH
-    return hosted, self_hosted
-
-def break_even_tokens(util: float) -> float:
-    # hosted == self_hosted  =>  tokens * (price_per_token - gpu_cost_per_token) == fixed ops cost
-    gap = HOSTED_PER_M / 1e6 - GPU_HOUR / (TOK_PER_GPU_H * util)
-    return OPS_PER_MONTH / gap if gap > 0 else float("inf")
-
-for util in (0.5, 0.4):
-    be = break_even_tokens(util)
-    verdict = f"{be / 1e9:.1f}B tokens/month" if be != float("inf") else "never (GPU cost/token exceeds hosted)"
-    print(f"utilisation {util:.0%}: self-hosting pays off above {verdict}")
-    for t in (5e8, 5e9, 5e10):
-        h, s = monthly(t, util)
-        print(f"   {t / 1e9:>5.1f}B tokens   hosted ${h:>9,.0f}   self-hosted ${s:>9,.0f}")
-
-# utilisation 50%: self-hosting pays off above 18.0B tokens/month
-#      0.5B tokens   hosted $    1,000   self-hosted $    6,833
-#      5.0B tokens   hosted $   10,000   self-hosted $   14,333
-#     50.0B tokens   hosted $  100,000   self-hosted $   89,333
-# utilisation 40%: self-hosting pays off above never (GPU cost/token exceeds hosted)
-#      0.5B tokens   hosted $    1,000   self-hosted $    7,042
-#      5.0B tokens   hosted $   10,000   self-hosted $   16,417
-#     50.0B tokens   hosted $  100,000   self-hosted $  110,167
-```
-
-**Utilisation is not a free parameter.** It is served tokens divided by the capacity you pay for, and two
-things cap it:
-- **Peak sizing.** A fleet sized for peak idles off-peak, so with a peak-to-average ratio of 2 and no
-  autoscaling, utilisation cannot exceed 50%.
-- **A minimum fleet.** Say two GPUs for redundancy running 24/7 (~1,460 GPU-hours, ~$3,650 a month here),
-  billed at any volume. At 0.5B tokens it would run about 11% utilised, so the real self-hosted cost is
-  ~$9,650, not $6,833.
-- **What it changes.** The floor does not move the 18B break-even, where the fleet is already ~16 GPUs,
-  but it shows why the utilisation cell should be derived from a traffic profile, not typed in.
+- **The finding:** at 50% utilisation self-hosting wins above about 18B tokens a month; at 40% it never
+  wins, because idle GPUs still bill (GPU cost per token exceeds the hosted price).
+- **Utilisation is derived, not typed in.** A peak-to-average ratio of 2 with no autoscaling caps it at
+  50%, and a two-GPU 24/7 redundancy floor (~$3,650 a month) runs only ~11% utilised at 0.5B tokens,
+  making the real self-hosted cost ~$9,650, not $6,833. The floor does not move the 18B break-even,
+  where the fleet is already ~16 GPUs.
 
 ### Runnable: minimax regret when the forecast is a range
-Same illustrative cost model at 50% utilisation, scored across a low, expected and high volume. The choice
-flips with the high end of the forecast, which is exactly what the ADR must record.
+Same illustrative cost model, scored across a low, expected and high volume. The choice flips with the
+high end of the forecast, which is exactly what the ADR must record.
 
 ```python
-# Illustrative: same cost model as the break-even script, at 50% utilisation.
+# Illustrative: hosted at $2 per 1M tokens; self-hosted at 50% utilisation plus $6,000/month ops.
 def hosted(t):      return t / 1e6 * 2.00
 def self_hosted(t): return t / (3_000_000 * 0.5) * 2.50 + 6_000
-
 OPTIONS = {"hosted": hosted, "self-hosted": self_hosted}
 
 def minimax_regret(scenarios: dict[str, float]) -> str:
     cost = {o: {s: f(t) for s, t in scenarios.items()} for o, f in OPTIONS.items()}
     best = {s: min(cost[o][s] for o in OPTIONS) for s in scenarios}
-    worst_regret = {o: max(cost[o][s] - best[s] for s in scenarios) for o in OPTIONS}
-    for o in OPTIONS:
-        print(f"  {o:<12}" + "".join(f"{s}: ${cost[o][s]:>7,.0f}  " for s in scenarios)
-              + f"worst regret ${worst_regret[o]:,.0f}")
-    return min(worst_regret, key=worst_regret.get)
+    regret = {o: max(cost[o][s] - best[s] for s in scenarios) for o in OPTIONS}
+    print({o: f"${r:,.0f}" for o, r in regret.items()})
+    return min(regret, key=regret.get)
 
 for high in (30e9, 50e9):
-    print(f"forecast 1B / 5B / {high / 1e9:.0f}B tokens per month")
-    pick = minimax_regret({"low": 1e9, "expected": 5e9, "high": high})
-    print("  minimax-regret choice:", pick)
+    print(f"1B / 5B / {high / 1e9:.0f}B ->", minimax_regret({"low": 1e9, "expected": 5e9, "high": high}))
+# {'hosted': '$4,000', 'self-hosted': '$5,667'}
+# 1B / 5B / 30B -> hosted
+# {'hosted': '$10,667', 'self-hosted': '$5,667'}
+# 1B / 5B / 50B -> self-hosted
 ```
-
-| Forecast (tokens/month) | Hosted worst regret | Self-hosted worst regret | Choice |
-|---|---|---|---|
-| 1B / 5B / 30B | $4,000 | $5,667 | Hosted |
-| 1B / 5B / 50B | $10,667 | $5,667 | Self-hosted |
 
 - **Read it as a sensitivity finding**, not a verdict: the answer depends on how plausible the high
   scenario is.
-- **Add the minimum-fleet floor** from the note above and self-hosting's low-volume regret grows, which
-  pushes back toward hosted behind a gateway plus a volume trigger.
+- **Add the minimum-fleet floor** from the break-even note and self-hosting's low-volume regret grows,
+  which pushes back toward hosted behind a gateway plus a volume trigger.
 
 ## Production patterns
 - **Evidence-graded matrix in the ADR.** Use for every one-way door. Each cell holds a range and a grade
@@ -368,6 +325,9 @@ for high in (30e9, 50e9):
 - **Pre-mortem and halving test in the review agenda.** Use for one-way doors. Ask "a year later this
   failed, why?" and "would we still choose this at half or double the volume?" before deciding. Monitor
   risks raised there that later appear in incidents.
+- **Self-hosting break-even is utilisation-sensitive.** Record the utilisation assumption in the ADR,
+  derived from a traffic profile; agent traffic reaches break-even volumes sooner than chat because
+  every run makes many model calls.
 
 ## Trade-offs
 - **Full matrix: decisions that survive review vs days of work.** For two-way doors, a one-paragraph

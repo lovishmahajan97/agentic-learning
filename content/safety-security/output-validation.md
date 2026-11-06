@@ -411,15 +411,14 @@ flowchart TD
 
 ## Examples
 ### One contract, three jobs
-Its shape is sent to the provider so the JSON is structurally valid by construction, its validators
-enforce domain rules the provider cannot, and its error messages drive a retry loop, which is exactly
-what Instructor packages behind `response_model=` and `max_retries=`.
+One Pydantic model does three jobs: its shape goes to the provider so the JSON is structurally valid,
+its validators enforce domain rules the provider cannot, and its error text drives a retry. This run
+needs no model call: it feeds in a reply that passes the shape check but breaks a business rule.
 
 ```python
 from datetime import date
 from typing import Literal
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
-import anthropic                     # checked against anthropic 2.1.0 and pydantic 2.14 (HTTP mocked)
+from pydantic import BaseModel, Field, ValidationError, model_validator   # pydantic 2.14
 
 class RefundDecision(BaseModel):
     order_id: str = Field(pattern=r"^ORD-\d{6}$")
@@ -428,60 +427,32 @@ class RefundDecision(BaseModel):
     decision: Literal["approve", "deny", "escalate"]
     amount_cents: int = Field(ge=0)
 
-    @field_validator("order_date")
-    @classmethod
-    def not_in_future(cls, v: date) -> date:
-        if v > date.today():
-            raise ValueError("order_date cannot be in the future")
-        return v
-
     @model_validator(mode="after")
     def deny_means_zero(self):
         if self.decision == "deny" and self.amount_cents != 0:
             raise ValueError("a denied refund must have amount_cents == 0")
         return self
 
-SHAPE = {"type": "object", "additionalProperties": False,          # shape only: providers enforce this
-         "required": ["order_id", "order_date", "reason", "decision", "amount_cents"],
-         "properties": {"order_id": {"type": "string"}, "order_date": {"type": "string"}, "reason": {"type": "string"},
-                        "decision": {"type": "string", "enum": ["approve", "deny", "escalate"]},
-                        "amount_cents": {"type": "integer"}}}
-client = anthropic.Anthropic()
-
-def decide(ticket: str, max_retries: int = 2) -> RefundDecision:
-    messages = [{"role": "user", "content": f"Today is {date.today()}. Decide the refund for:\n{ticket}"}]
-    for _ in range(max_retries + 1):
-        r = client.messages.create(model="claude-opus-5-5", max_tokens=1024, messages=messages,
-                                   output_config={"format": {"type": "json_schema", "schema": SHAPE}})
-        if r.stop_reason == "max_tokens":
-            raise RuntimeError("truncated output: raise max_tokens, retrying will not help")
-        text = next(b.text for b in r.content if b.type == "text")       # parses and has the right keys
-        try:
-            return RefundDecision.model_validate_json(text)                # semantic rules run here
-        except ValidationError as e:                                       # the loop Instructor automates
-            messages += [{"role": "assistant", "content": text},
-                         {"role": "user", "content": f"Fix these validation errors and return the full object:\n{e}"}]
-    raise RuntimeError("no valid decision after retries; route to review")
-
-print(decide("ORD-104233, placed 2026-09-30, blender arrived cracked, paid $89.99.").model_dump())
-# A failure this loop repairs: {"decision": "deny", "amount_cents": 8999, ...} passes the provider's
-# shape check, then model_validator raises "a denied refund must have amount_cents == 0"; the retry
-# carries that exact sentence and the model returns either approve/8999 or deny/0.
+reply = ('{"order_id": "ORD-104233", "order_date": "2026-09-30", "reason": "blender arrived cracked",'
+         ' "decision": "deny", "amount_cents": 8999}')
+try:
+    RefundDecision.model_validate_json(reply)
+except ValidationError as e:
+    print(e.errors()[0]["msg"])   # Value error, a denied refund must have amount_cents == 0
 ```
 
-### The same call with Instructor
-Instructor replaces the hand-written loop: pass the Pydantic class as `response_model` and a retry count.
+A retry loop sends `str(e)` back to the model and asks for the full object again; Instructor packages
+that loop.
+
+### The same contract with Instructor
+Pass the Pydantic class as `response_model` and a retry count; each retry carries the `ValidationError`.
 
 ```python
 import anthropic, instructor         # checked against instructor 1.17.0 (sends the schema as a tool)
 
 client = instructor.from_anthropic(anthropic.Anthropic())
-
 decision = client.messages.create(
-    model="claude-opus-5-5",
-    max_tokens=1024,
-    response_model=RefundDecision,   # the contract above, validators included
-    max_retries=2,                   # each retry carries the ValidationError text
+    model="claude-opus-5-5", max_tokens=1024, response_model=RefundDecision, max_retries=2,
     messages=[{"role": "user", "content": "Decide the refund for: ORD-104233, blender arrived cracked."}],
 )
 print(decision.decision, decision.amount_cents)   # a typed RefundDecision, not a dict
@@ -491,27 +462,24 @@ print(decision.decision, decision.amount_cents)   # a typed RefundDecision, not 
 Lax mode quietly turns `"8999"` into `8999`; strict mode reports it, which matters for money and ids.
 
 ```python
-from typing import Literal
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 class Lax(BaseModel):
-    amount_cents: int = Field(ge=0)
-    decision: Literal["approve", "deny", "escalate"]
+    amount_cents: int
 
 class Strict(Lax):
     model_config = ConfigDict(strict=True)
 
-print(Lax.model_validate({"amount_cents": "8999", "decision": "deny"}).amount_cents)  # 8999, coerced
+print(Lax.model_validate({"amount_cents": "8999"}).amount_cents)   # 8999, coerced
 try:
-    Strict.model_validate({"amount_cents": "8999", "decision": "refund"})
+    Strict.model_validate({"amount_cents": "8999"})
 except ValidationError as e:
-    for err in e.errors():                 # machine-readable: loc, type, msg
-        print(err["loc"], err["type"])     # ('amount_cents',) int_type / ('decision',) literal_error
+    print(e.errors()[0]["loc"], e.errors()[0]["type"])          # ('amount_cents',) int_type
 ```
 
 ### Agent scenario: validating tool arguments in the executor
-The agent proposes `issue_refund`; the executor validates before acting and returns errors as tool
-results, so the model repairs its own call on the next step.
+The executor validates before acting and returns errors as tool results, so the model repairs its own
+call on the next step.
 
 ```python
 from pydantic import BaseModel, Field, ValidationError
@@ -519,32 +487,17 @@ from pydantic import BaseModel, Field, ValidationError
 class IssueRefundArgs(BaseModel):
     order_id: str = Field(pattern=r"^ORD-\d{6}$")
     amount_cents: int = Field(ge=0, le=50_000)       # hard cap: larger refunds need a human
-    reason: str = Field(min_length=10, max_length=300)
 
-TOOLS = {"issue_refund": (IssueRefundArgs, lambda a: f"refunded {a.amount_cents} on {a.order_id}")}
-MAX_REPAIRS = 2
-
-def execute(tool_use, repairs: dict) -> dict:
-    """Turn one tool_use block into a tool_result block; never run unvalidated arguments."""
-    name, tid = tool_use["name"], tool_use["id"]
-    if name not in TOOLS:                              # a hallucinated tool name is also repairable
-        return {"type": "tool_result", "tool_use_id": tid, "is_error": True,
-                "content": f"Unknown tool {name!r}; available: {sorted(TOOLS)}"}
-    model, fn = TOOLS[name]
+def execute(tool_use: dict) -> dict:
     try:
-        args = model.model_validate(tool_use["input"])
-    except ValidationError as e:
-        repairs[name] = repairs.get(name, 0) + 1       # consecutive failures for this tool in this run
-        if repairs[name] > MAX_REPAIRS:
-            raise RuntimeError("tool arguments still invalid after repairs; escalate the run")
-        return {"type": "tool_result", "tool_use_id": tid, "is_error": True,
+        args = IssueRefundArgs.model_validate(tool_use["input"])
+    except ValidationError as e:                     # never run unvalidated arguments
+        return {"type": "tool_result", "tool_use_id": tool_use["id"], "is_error": True,
                 "content": f"Invalid arguments, fix and call again:\n{e}"}
-    repairs.pop(name, None)                            # a valid call resets the repair count
-    return {"type": "tool_result", "tool_use_id": tid, "content": fn(args)}
+    return {"type": "tool_result", "tool_use_id": tool_use["id"], "content": f"refunded {args.amount_cents}"}
 
-repairs = {}                                           # one dict per agent run
-bad = {"id": "t1", "name": "issue_refund", "input": {"order_id": "104233", "amount_cents": "8999"}}
-print(execute(bad, repairs)["content"][:80])   # pattern and missing-field errors go back to the model
+bad = {"id": "t1", "name": "issue_refund", "input": {"order_id": "104233", "amount_cents": 60_000}}
+print(execute(bad)["is_error"])   # True: pattern and cap errors go back to the model
 ```
 
 ### Worked scenario: reading the three metrics
@@ -572,6 +525,14 @@ Illustrative numbers from a week of an extraction pipeline, and what each one sa
   description drifted from the code.
 - **Strict mode for money and identifiers.** Set strict validation on fields where a coerced value is a
   silent bug, and check ids against reference data in a separate step so validators stay cheap.
+- **Send the shape to the provider, keep the rules in Pydantic.** With anthropic 2.1.0 pass a JSON
+  schema (`additionalProperties: false`, all keys required) via
+  `output_config={"format": {"type": "json_schema", "schema": ...}}`; it guarantees keys and types only,
+  so semantic rules (no future `order_date`, deny means zero) stay in validators. Put today's date in the
+  prompt so date rules can pass.
+- **Unknown tool names are repairable too.** Return an error tool result listing the available tools,
+  count consecutive repair failures per tool per run (escalate past two), and reset the count after a
+  valid call.
 
 ## Trade-offs
 - **Constrained decoding vs hidden uncertainty.** It removes retries and guarantees shape, but needs

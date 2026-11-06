@@ -425,30 +425,20 @@ def recall_memory(user_id: str, query: str, k: int = 5) -> list[str]:
 
 ### Why a small tenant gets empty results
 A pure-Python simulation of post-filtering: the "small" tenant owns 1% of 10,000 rows, and the index
-hands `ef` candidates to the `WHERE` clause.
+hands `ef` candidates to the `WHERE` clause with `LIMIT 10`.
 
 ```python
 import random
 
 random.seed(0)
-N, k = 10_000, 10
-rows = [{"id": i, "tenant": "small" if i % 100 == 0 else "big", "score": random.random()}
-        for i in range(N)]                                   # "small" owns 1% of the rows
+rows = [{"tenant": "small" if i % 100 == 0 else "big", "score": random.random()} for i in range(10_000)]
 ranked = sorted(rows, key=lambda r: -r["score"])             # stand-in for the ANN candidate order
 
-def post_filter(ef):                                         # index returns ef candidates, then WHERE
-    return [r for r in ranked[:ef] if r["tenant"] == "small"][:k]
-
-def iterative(ef=40):                                        # keep widening until k rows survive
-    while len(post_filter(ef)) < k and ef < N:
-        ef *= 2
-    return ef, len(post_filter(ef))
-
-pre = [r for r in ranked if r["tenant"] == "small"][:k]      # filter first, then rank: exact
-print("post-filter, ef=40 :", len(post_filter(40)), "rows")   # 0 rows
-print("post-filter, ef=100:", len(post_filter(100)), "rows")  # 2 rows
-print("iterative scan      :", iterative(), "(candidates visited, rows)")  # (1280, 10)
-print("pre-filter          :", len(pre), "rows")              # 10 rows
+for ef in (40, 100, 1280):                                   # index returns ef candidates, then WHERE
+    survivors = [r for r in ranked[:ef] if r["tenant"] == "small"][:10]
+    print(f"post-filter, ef={ef}:", len(survivors), "rows")
+print("pre-filter:", len([r for r in ranked if r["tenant"] == "small"][:10]), "rows")
+# ef=40: 0 rows, ef=100: 2 rows, ef=1280: 10 rows (what an iterative scan widens to); pre-filter: 10
 ```
 
 At 1% selectivity you expect about one survivor per 100 candidates, so `LIMIT 10` needs on the order of

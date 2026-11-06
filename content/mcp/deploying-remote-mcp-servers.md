@@ -288,41 +288,32 @@ Python `mcp` SDK 2.x; on 1.x import `FastMCP` from `mcp.server.fastmcp` and pass
 validation against your identity provider.
 
 ```python
-import os
-from urllib.parse import urlsplit
-from mcp.server.mcpserver import MCPServer                 # mcp SDK 2.x
+# remote_server.py  (pip install "mcp>=2,<3" uvicorn)
+from mcp.server.mcpserver import MCPServer
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.transport_security import TransportSecuritySettings
 
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8000/mcp")
-ISSUER = os.environ.get("ISSUER_URL", "https://auth.example.com")
+PUBLIC_URL = "http://localhost:8000/mcp"           # canonical URL = the token audience
 
 class IntrospectingVerifier:
-    """Replace with JWT validation against your IdP's JWKS or token introspection."""
+    """Toy check; replace with JWT validation against your IdP's JWKS or token introspection."""
     async def verify_token(self, token: str) -> AccessToken | None:
-        if token != os.environ.get("DEV_TOKEN", "dev-token"):
-            return None                                          # -> 401 with WWW-Authenticate
-        return AccessToken(token=token, client_id="dev", scopes=["tickets:read"],
-                           expires_at=None, resource=PUBLIC_URL)
+        if token != "dev-token":
+            return None                                   # -> 401 with WWW-Authenticate
+        return AccessToken(token=token, client_id="dev", scopes=["tickets:read"], resource=PUBLIC_URL)
 
-mcp = MCPServer(
-    "tickets",
-    token_verifier=IntrospectingVerifier(),
-    auth=AuthSettings(issuer_url=ISSUER, resource_server_url=PUBLIC_URL,
-                      required_scopes=["tickets:read"], validate_token_resource=True),
-)
+mcp = MCPServer("tickets", token_verifier=IntrospectingVerifier(),
+                auth=AuthSettings(issuer_url="https://auth.example.com", resource_server_url=PUBLIC_URL,
+                                  required_scopes=["tickets:read"], validate_token_resource=True))
 
 @mcp.tool()
 def get_ticket(ticket_id: str) -> dict:
     """Fetch one support ticket by id, for example 'T-1'."""
     return {"id": ticket_id, "status": "open"}
 
-app = mcp.streamable_http_app(
-    stateless_http=True, json_response=True,                 # any replica can serve any request
-    # by default only localhost Host headers pass (DNS rebinding guard); allow your public host
-    transport_security=TransportSecuritySettings(allowed_hosts=[urlsplit(PUBLIC_URL).netloc]),
-)
+app = mcp.streamable_http_app(stateless_http=True, json_response=True,  # any replica serves any request
+    transport_security=TransportSecuritySettings(allowed_hosts=["localhost:8000"]))  # else 421
 # run: uvicorn remote_server:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
@@ -371,6 +362,9 @@ A team ran a stateful server on 4 replicas with sticky routing and deployed duri
 - **Protect the endpoint itself.** Serve only HTTPS, validate `Host` and `Origin` (the Python SDK's
   `TransportSecuritySettings(allowed_hosts=..., allowed_origins=...)`), restrict CORS to known origins, and
   never treat `Mcp-Session-Id` as authentication. Monitor `421` responses and rejected origins.
+- **Configure per environment.** Read the public URL, issuer and verifier secrets from environment config,
+  and list the public host in `allowed_hosts`: the Python SDK's default admits only localhost `Host`
+  headers, so a deployed server without it answers every request with `421`.
 
 ## Trade-offs
 - **Stateless vs stateful.** Stateless scales trivially and survives deploys but cannot ask the client

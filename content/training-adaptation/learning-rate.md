@@ -183,64 +183,55 @@ The bound is easiest to see on the quadratic, and Adam's normalisation by feedin
 differ by 1000× and watching the parameter move by the same amount.
 
 ```python
+# pip install torch
 import torch
 
-def gd(lr, curvature=4.0, theta=1.0, steps=10):
-    # Loss L = 0.5 * curvature * theta**2, gradient = curvature * theta
+def gd(lr, curvature=4.0, theta=1.0, steps=10):   # loss 0.5 * curvature * theta**2
     for _ in range(steps):
-        theta = theta - lr * curvature * theta          # = theta * (1 - lr * curvature)
+        theta -= lr * curvature * theta             # = theta * (1 - lr * curvature)
     return theta
 
-for lr in (0.05, 0.1, 0.45, 0.5, 0.6):
-    print(f"lr={lr:<5} factor={1 - lr * 4:+.2f}  theta after 10 steps={gd(lr):+.4f}")
-# lr=0.05  factor=+0.80  0.1074   slow, monotone
-# lr=0.1   factor=+0.60  0.0060   fast, monotone
-# lr=0.45  factor=-0.80  0.1074   oscillates, still converges
-# lr=0.5   factor=-1.00  1.0000   bounces forever: exactly the 2/curvature limit
-# lr=0.6   factor=-1.40  28.925   diverges
+for lr in (0.1, 0.45, 0.5, 0.6):
+    print(f"lr={lr:<4} theta after 10 steps={gd(lr):+.4f}")
+# lr=0.1  +0.0060   fast, monotone
+# lr=0.45 +0.1074   oscillates, still converges
+# lr=0.5  +1.0000   bounces forever: exactly the 2/curvature limit
+# lr=0.6  +28.9255  diverges
 
-# Adam normalises the gradient scale away, so the first step is ~lr whatever the gradient size.
-w = torch.nn.Parameter(torch.tensor([1.0]))
-opt = torch.optim.Adam([w], lr=1e-3)
+# Adam normalises the gradient scale away: the first step is ~lr whatever the gradient size.
 for scale in (1.0, 1000.0):
-    w.data.fill_(1.0); opt.state.clear()
-    w.grad = torch.tensor([scale])
-    opt.step()
+    w = torch.nn.Parameter(torch.tensor([1.0]))
+    opt = torch.optim.Adam([w], lr=1e-3)
+    w.grad = torch.tensor([scale]); opt.step()
     print(f"gradient={scale:>6}: moved by {1.0 - w.item():.6f}")   # both ~0.001
 ```
 
 ### A ×3 grid for a LoRA agent fine-tune, scored on tool calls
 The grid is judged on what the agent needs: held-out tool calls that parse, name a real tool and carry
-every required argument. `finetune_lora` and `generate_calls` stand in for the team's training and
-inference helpers; the scorer is runnable as written.
+every required argument. Run this scorer on each adapter's held-out outputs at, for example, 3e-5, 1e-4
+and 3e-4.
 
 ```python
 import json
 
-TOOLS = {"search_orders": {"required": ["customer_id"]},
-         "issue_refund": {"required": ["order_id", "amount"]}}
+TOOLS = {"search_orders": ["customer_id"], "issue_refund": ["order_id", "amount"]}
 
 def tool_call_validity(outputs, tools=TOOLS):
-    """Share of predicted tool calls that parse, name a real tool and include all required args."""
+    """Share of outputs that parse, name a real tool and include all required args."""
     ok = 0
     for out in outputs:
         try:
             call = json.loads(out)
-            ok += all(k in call["arguments"] for k in tools[call["name"]]["required"])
+            ok += all(k in call["arguments"] for k in tools[call["name"]])
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
     return ok / len(outputs)
 
-print(tool_call_validity([
+print(round(tool_call_validity([
     '{"name": "search_orders", "arguments": {"customer_id": "c-42"}}',
     '{"name": "issue_refund", "arguments": {"order_id": "o-9"}}',      # missing amount
     'I will now call issue_refund',                                    # not a tool call at all
-]))                                                                    # 0.333...
-
-# The grid itself, around the usual adapter starting point (about 10x a full fine-tune rate):
-# for lr in (3e-5, 1e-4, 3e-4):
-#     adapter = finetune_lora(base, train_traces, lr=lr, warmup_ratio=0.03, scheduler="cosine")
-#     print(lr, tool_call_validity(generate_calls(adapter, heldout_prompts)), run_suite(adapter))
+]), 3))                                                                # 0.333
 ```
 
 In a Hugging Face fine-tune the same ideas appear as `learning_rate=2e-5`, `warmup_steps=0.03` (a
@@ -267,28 +258,22 @@ when the smoothed loss explodes. The loss curvature here is λ = 2·E[x²] ≈ 0
 near 2/λ = 3.
 
 ```python
-import math, random
+import random
 
 random.seed(0)
 data = [(x, 3 * x + random.gauss(0, 0.1)) for x in (random.uniform(-1, 1) for _ in range(2000))]
 
-def range_test(lr_min=1e-4, lr_max=10.0, steps=200, batch=16):
-    w, best, smooth, history = 0.0, float("inf"), None, []
-    for i in range(steps):
-        lr = lr_min * (lr_max / lr_min) ** (i / (steps - 1))       # exponential ramp
-        xb = random.sample(data, batch)
-        grad = sum(2 * (w * x - y) * x for x, y in xb) / batch      # d/dw of mean squared error
-        loss = sum((w * x - y) ** 2 for x, y in xb) / batch
-        w -= lr * grad
-        smooth = loss if smooth is None else 0.7 * smooth + 0.3 * loss
-        history.append((lr, smooth))
-        best = min(best, smooth)
-        if smooth > 4 * best or math.isnan(smooth):                 # loss has exploded: stop
-            break
-    return history
-
-edge = range_test()[-1][0]
-print(f"loss exploded near lr={edge:.2f}; try a peak around {edge / 10:.2f}")   # conservative: ~10x below
+w, best, smooth, steps = 0.0, float("inf"), None, 200
+for i in range(steps):
+    lr = 1e-4 * (10.0 / 1e-4) ** (i / (steps - 1))                 # exponential ramp, 1e-4 to 10
+    xb = random.sample(data, 16)
+    loss = sum((w * x - y) ** 2 for x, y in xb) / 16
+    w -= lr * sum(2 * (w * x - y) * x for x, y in xb) / 16          # SGD on mean squared error
+    smooth = loss if smooth is None else 0.7 * smooth + 0.3 * loss
+    best = min(best, smooth)
+    if smooth > 4 * best:                                           # loss has exploded: stop
+        break
+print(f"loss exploded near lr={lr:.2f}; try a peak around {lr / 10:.2f}")   # conservative: ~10x below
 # The edge lands between about 3 and 6 depending on the seed (smoothing lags the blow-up).
 ```
 

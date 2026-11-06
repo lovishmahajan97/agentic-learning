@@ -377,12 +377,8 @@ prompts:
 #   bot refuse competitor talk
 
 from nemoguardrails import RailsConfig, LLMRails
-# if an exact example utterance still triggers an LLM intent call, check the embedding index first:
-# on 0.17.0 a source-built annoy 1.17.3 returned wrong neighbours on Apple Silicon; 0.24.1 drops
-# annoy for an exact NumPy cosine search, so there check the threshold and example utterances
 
-config = RailsConfig.from_path("./config")
-rails = LLMRails(config)
+rails = LLMRails(RailsConfig.from_path("./config"))
 res = rails.generate(messages=[{"role": "user", "content": "Is Acme's product better than yours?"}])
 print(res["content"])    # -> "I can only help with questions about our own products."
 rails.explain().print_llm_calls_summary()   # count the model calls this turn actually made
@@ -423,15 +419,13 @@ term list), write a Python action and call it from an output flow instead of an 
 ```python
 # config/actions.py
 import re
-from typing import Optional
 from nemoguardrails.actions import action
 
 ACCOUNT = re.compile(r"\b\d{8,12}\b")     # this bank's account-number format
 
 @action(is_system_action=True)
-async def check_no_account_number(context: Optional[dict] = None) -> bool:
-    bot_message = (context or {}).get("bot_message", "")
-    return not ACCOUNT.search(bot_message)
+async def check_no_account_number(context: dict | None = None) -> bool:
+    return not ACCOUNT.search((context or {}).get("bot_message", ""))
 
 # config/rails.co  (Colang 1.0)
 # define bot inform cannot share account number
@@ -441,7 +435,6 @@ async def check_no_account_number(context: Optional[dict] = None) -> bool:
 #   if not $ok
 #     bot inform cannot share account number
 #     stop
-#
 # config.yml:  rails: output: flows: [check account numbers]
 ```
 
@@ -464,6 +457,9 @@ async def check_no_account_number(context: Optional[dict] = None) -> bool:
 - **Call budget per turn.** Record the `explain()` LLM-call summary in staging for representative agent
   turns and alert when the median calls per turn rises after a config change. Track time to first token
   per stage.
+- **If an exact example utterance still triggers an LLM intent call, check the embedding index first.**
+  On 0.17.0 a source-built annoy 1.17.3 returned wrong neighbours on Apple Silicon; 0.24.1 drops annoy
+  for an exact NumPy cosine search, so there check the threshold and example utterances instead.
 
 ## Trade-offs
 - **Declarative rails vs a framework in the path.** Policy becomes reviewable and swappable per customer, but

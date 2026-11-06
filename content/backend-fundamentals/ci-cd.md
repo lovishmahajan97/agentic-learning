@@ -318,10 +318,7 @@ flowchart TD
 - **The `production` environment** carries required-reviewer protection.
 
 ```yaml
-name: ci
-on:
-  pull_request:
-  push: {branches: [main]}
+on: {pull_request: {}, push: {branches: [main]}}
 permissions: {contents: read}                # least privilege by default; jobs widen it
 jobs:
   test:
@@ -329,9 +326,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4             # pin to a commit SHA in a real repository
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --frozen
-      - run: uv run ruff check . && uv run mypy src
-      - run: uv run pytest -q tests/unit      # model client mocked: deterministic, free, fast
+      - run: uv sync --frozen && uv run ruff check . && uv run mypy src && uv run pytest -q tests/unit
       - run: uv run pytest -q -m smoke tests/eval   # ~20 golden cases against a cheap model
         if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         env: {LLM_API_KEY: "${{ secrets.CI_LLM_KEY }}"}
@@ -342,10 +337,9 @@ jobs:
     environment: production                  # protection rule: required reviewers
     permissions: {contents: read, packages: write, id-token: write}   # id-token: OIDC to the cloud
     steps:
-      - uses: actions/checkout@v4
       - uses: docker/login-action@v3
         with: {registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
-      - id: build
+      - id: build                             # builds from the Git context, so no checkout needed
         uses: docker/build-push-action@v6
         with: {push: true, tags: "ghcr.io/${{ github.repository }}:${{ github.sha }}"}   # repo name must be lowercase
       - uses: aws-actions/configure-aws-credentials@v4
@@ -357,66 +351,23 @@ jobs:
 ```
 
 ### An evaluation gate as a CI step
-Runnable with the standard library. It compares this pull request's eval scores with the baseline from main
-and exits non-zero on a regression beyond tolerance, which fails the job. The scores are illustrative; in a
-real pipeline they come from the eval run's output file.
+Runnable with the standard library. It compares this pull request's agent eval metrics with the baseline
+from main and exits non-zero on a regression beyond its limit, which fails the job. The figures match the
+worked scenario below; in a real pipeline they come from the eval run's output file.
 
 ```python
 import sys
 
-BASELINE  = {"groundedness": 0.91, "format_ok": 0.99, "refusal_rate": 0.04}   # from the last main run
-CANDIDATE = {"groundedness": 0.88, "format_ok": 0.99, "refusal_rate": 0.05}   # this pull request
-HIGHER_IS_BETTER = {"groundedness": True, "format_ok": True, "refusal_rate": False}
-TOLERANCE = {"groundedness": 0.02, "format_ok": 0.01, "refusal_rate": 0.02}   # allowed regression
+BASELINE  = {"success": 0.92, "invalid_calls": 0.1, "steps": 4.0, "tokens": 6000}   # last main run
+CANDIDATE = {"success": 0.85, "invalid_calls": 0.1, "steps": 4.2, "tokens": 6100}   # this pull request
+LIMITS = {"success":       lambda b, c: c >= b - 0.03,   # task success may drop 3 points at most
+          "invalid_calls": lambda b, c: c <= b,          # no new invalid tool calls
+          "steps":         lambda b, c: c <= b * 1.3,    # runs at most 30% longer
+          "tokens":        lambda b, c: c <= b * 1.5}    # tokens per run up 50% at most
 
-def regressions(base, cand):
-    out = []
-    for m, b in base.items():
-        delta = cand[m] - b if HIGHER_IS_BETTER[m] else b - cand[m]   # negative = worse
-        if delta < -TOLERANCE[m]:
-            out.append(f"{m}: {b:.2f} -> {cand[m]:.2f} (tolerance {TOLERANCE[m]:.2f})")
-    return out
-
-bad = regressions(BASELINE, CANDIDATE)
-for line in bad:
-    print("REGRESSION", line)
-print("eval gate:", "FAIL" if bad else "PASS")
-sys.exit(1 if bad else 0)    # a non-zero exit fails the CI job
-# Prints: REGRESSION groundedness: 0.91 -> 0.88 (tolerance 0.02) / eval gate: FAIL
-```
-
-### Agent trajectory gate with fake tools
-Runs each eval task through the agent loop with deterministic fake tools and gates on success, invalid
-tool calls, steps and cost. `run_agent` is your agent entry point; it must accept a tool table and return
-the run's tool calls, final answer and token usage.
-
-```python
-import json, statistics, sys
-
-FAKE_TOOLS = {   # deterministic stand-ins: no network, no side effects, no flakiness from APIs
-    "search_orders": lambda customer_id: [{"id": "o-17", "status": "delayed"}],
-    "issue_refund":  lambda order_id, amount: {"ok": True},
-}
-
-def score(case, run):
-    calls = run["tool_calls"]
-    invalid = sum(1 for c in calls if c["name"] not in FAKE_TOOLS or "error" in c)
-    return {"success": case["check"](run), "invalid": invalid, "steps": len(calls),
-            "tokens": run["usage"]["input"] + run["usage"]["output"]}
-
-def gate(cases, run_agent, baseline, repeats=3):
-    rows = [score(c, run_agent(c["prompt"], tools=FAKE_TOOLS)) for c in cases for _ in range(repeats)]
-    cand = {"success": statistics.mean(r["success"] for r in rows),
-            "invalid": statistics.mean(r["invalid"] for r in rows),
-            "steps": statistics.mean(r["steps"] for r in rows),
-            "tokens": statistics.mean(r["tokens"] for r in rows)}
-    fails = []
-    if cand["success"] < baseline["success"] - 0.03: fails.append("task success dropped")
-    if cand["invalid"] > baseline["invalid"]:          fails.append("more invalid tool calls")
-    if cand["steps"] > baseline["steps"] * 1.3:        fails.append("runs got 30% longer")
-    if cand["tokens"] > baseline["tokens"] * 1.5:      fails.append("tokens per run up 50%")
-    print(json.dumps(cand), *fails, sep="\n")
-    sys.exit(1 if fails else 0)                        # non-zero fails the CI job
+fails = [m for m, ok in LIMITS.items() if not ok(BASELINE[m], CANDIDATE[m])]
+print("eval gate:", "FAIL" if fails else "PASS", fails)   # eval gate: FAIL ['success']
+sys.exit(1 if fails else 0)                                # a non-zero exit fails the CI job
 ```
 
 - **Thresholds here are examples;** set yours from the run-to-run variance you measure on main.
@@ -463,6 +414,9 @@ A team wants to rename `user_name` to `display_name` on a service that deploys b
 - **Prompts and tool schemas as versioned files.** Keep prompts and tool definitions in the repo, include
   their hash in the image and in every trace, so an eval score or an incident maps to exact prompt
   versions. Monitor which prompt hash each environment runs.
+- **Trajectory evals on fake tools.** Run each eval case through the real agent loop with deterministic
+  fake tools (no network, no side effects), repeat each case about 3 times, and gate on the mean task
+  success, invalid tool calls, steps and tokens per run.
 
 ## Trade-offs
 - **Eval on every PR vs cost and noise.** It catches prompt regressions early but costs money, time and

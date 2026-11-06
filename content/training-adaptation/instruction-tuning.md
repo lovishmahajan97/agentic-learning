@@ -158,55 +158,37 @@ flowchart TD
   in the original FLAN work got worse on held-out tasks. Check the base's few-shot ability first.
 
 ## Examples
-### A miniature mixture with a tool-calling task family
-Two task families, several templates each, balanced with a per-task cap. The tool family varies the
-tool's name, wording and argument order so the model learns "read the schema, call it", not one tool. FLAN-style
-pipelines do this at a scale of hundreds of tasks.
+### A tool-calling task family with varied templates
+One task family rendered through several templates, with the tool's name, wording and argument order
+varied, so the model learns "read the schema, call it", not one tool or one phrasing. FLAN-style pipelines
+do this across hundreds of task families.
 
 ```python
 import json, random
 random.seed(0)
 
-sentiment = [("The battery lasts two days, love it.", "positive"),
-             ("Screen cracked in a week.", "negative")]
-tool_rows = [("What's the weather in Pune tomorrow?", {"city": "Pune", "day": "tomorrow"}),
-             ("Will it rain in Oslo today?", {"city": "Oslo", "day": "today"})]
-tool_variants = [("get_weather", "Get the forecast for a city and day."),   # same task, varied name and wording
-                 ("weather_lookup", "Look up weather. Args: city, day."),
-                 ("forecast", "Returns a forecast for the given city on the given day.")]
+rows = [("What's the weather in Pune tomorrow?", {"city": "Pune", "day": "tomorrow"}),
+        ("Will it rain in Oslo today?", {"city": "Oslo", "day": "today"})]
+tools = [("get_weather", "Get the forecast for a city and day."),   # same task, varied name and wording
+         ("forecast", "Returns a forecast for the given city on the given day.")]
+templates = ["Tools: {tools}\nUser: {x}\nRespond with one JSON tool call.",
+             "You can call these tools: {tools}\nRequest: {x}"]
 
-templates = {
-    "sentiment": ["Classify the sentiment of this review as positive or negative.\nReview: {x}",
-                  "Is the following text positive or negative?\n{x}",
-                  "What sentiment does this review express?\n{x}"],
-    "tool_call": ["Tools: {tools}\nUser: {x}\nRespond with one JSON tool call.",
-                  "You can call these tools: {tools}\nRequest: {x}"],
-}
+data = []
+for x, args in rows:
+    name, desc = random.choice(tools)
+    params = random.sample(list(args), k=len(args))               # vary argument order too
+    spec = json.dumps([{"name": name, "description": desc, "parameters": params}])
+    for t in templates:
+        data.append({"instruction": t.format(tools=spec, x=x),
+                     "output": json.dumps({"name": name, "arguments": args})})
 
-def build(cap=1000):
-    out = []
-    for x, y in sentiment[:cap]:                          # cap large tasks so no task dominates
-        for t in random.sample(templates["sentiment"], k=2):
-            out.append({"instruction": t.format(x=x), "output": y, "task": "sentiment"})
-    for x, args in tool_rows[:cap]:
-        name, desc = random.choice(tool_variants)
-        params = random.sample(list(args), k=len(args))   # vary argument order too
-        tools = json.dumps([{"name": name, "description": desc, "parameters": params}])
-        for t in templates["tool_call"]:
-            out.append({"instruction": t.format(tools=tools, x=x),
-                        "output": json.dumps({"name": name, "arguments": args}), "task": "tool_call"})
-    random.shuffle(out)
-    return out
-
-for ex in build()[:3]:
-    print(ex["task"], "|", ex["instruction"].split("\n")[0][:60], "->", ex["output"])
-# Each example is then rendered through the chat template and trained with the SFT loss
-# (instruction masked, output supervised). Hold out whole tasks, and whole tools, to measure generalisation.
+print(len(data), "->", data[0]["output"])
+# 4 -> {"name": "forecast", "arguments": {"city": "Pune", "day": "tomorrow"}}
 ```
 
-- **Hold out entire tasks for evaluation.** If the model handles a task family it never saw, the skill
-  transferred; if it only handles seen tasks, you have a multi-task model, not an instruction-following
-  one. For agents, hold out whole tools and check calls against schemas the model never trained on.
+Each example is then rendered through the chat template and trained with the SFT loss (instruction
+masked, output supervised). Hold out whole tasks, and whole tools, to measure whether the skill transferred.
 
 ### Worked numbers: why the cap matters
 Suppose the real mixture has three tasks with 500,000, 20,000 and 2,000 examples: say general QA,

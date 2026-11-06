@@ -376,40 +376,31 @@ from openai import OpenAI
 
 MODEL = os.environ.get("AGENT_MODEL", "gpt-4o-mini")
 client = OpenAI(timeout=20.0, max_retries=1)          # per step: worst case ~2 × 20 s + backoff
-
 tools = [{"type": "function", "function": {
     "name": "get_order", "description": "Look up an order by id", "strict": True,
     "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
                    "required": ["order_id"], "additionalProperties": False}}}]
-
-def get_order(order_id: str) -> dict:
-    return {"order_id": order_id, "status": "shipped"}
-
-TOOLS = {"get_order": get_order}
+TOOLS = {"get_order": lambda order_id: {"order_id": order_id, "status": "shipped"}}
 
 def run_agent(question: str, max_steps: int = 8, deadline_s: float = 90.0) -> str:
     messages = [{"role": "user", "content": question}]
     start = time.monotonic()
-    for step in range(max_steps):
+    for _ in range(max_steps):
         if time.monotonic() - start > deadline_s:
             return "Sorry, that took too long. Please try again."
-        resp = client.chat.completions.create(model=MODEL, messages=messages, tools=tools)
-        print(step, resp._request_id, resp.usage.prompt_tokens, resp.usage.completion_tokens)
-        msg = resp.choices[0].message
+        msg = client.chat.completions.create(model=MODEL, messages=messages, tools=tools).choices[0].message
         if not msg.tool_calls:
             return msg.content                         # final answer
         messages.append(msg)                           # the assistant turn that asked for tools
         for call in msg.tool_calls:                    # may be several, in one turn
-            fn = TOOLS.get(call.function.name)
-            try:
-                args = json.loads(call.function.arguments)        # model-generated, may be invalid
-                result = fn(**args) if fn else {"error": "unknown tool"}
-            except (json.JSONDecodeError, TypeError) as e:
-                result = {"error": f"bad arguments: {e}"}         # let the model correct itself
+            try:                                       # name and arguments are model-generated
+                result = TOOLS[call.function.name](**json.loads(call.function.arguments))
+            except (KeyError, json.JSONDecodeError, TypeError) as e:
+                result = {"error": f"bad tool call: {e}"}          # let the model correct itself
             messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
     return "Step limit reached."
 
-print(run_agent("Where is order A123?"))
+print(run_agent("Where is order A123?"))               # e.g. Order A123 has shipped.
 ```
 
 - **Errors go back to the model.** Returning `{"error": ...}` as the tool result lets the model fix its
@@ -424,11 +415,10 @@ A classifier step at the front of an agent: decide the category before choosing 
 ```python
 import os
 from typing import Literal
-from pydantic import BaseModel
 import openai
 from openai import OpenAI
+from pydantic import BaseModel
 
-MODEL = os.environ.get("CLASSIFIER_MODEL", "gpt-4o-mini")
 client = OpenAI(timeout=20.0, max_retries=3)        # one client per process; worst case ~4 × 20 s + backoff
 
 class Triage(BaseModel):
@@ -439,27 +429,25 @@ class Triage(BaseModel):
 def triage(ticket: str) -> Triage | None:
     try:
         resp = client.responses.parse(
-            model=MODEL,
+            model=os.environ.get("CLASSIFIER_MODEL", "gpt-4o-mini"),
             instructions="Classify the support ticket.",
             input=ticket,
             text_format=Triage,                     # Pydantic class -> strict JSON Schema
         )
-    except openai.RateLimitError:
-        raise                                       # already retried; let the queue back off
-    except openai.BadRequestError as e:
-        print("bad request, not retrying:", e.status_code, e.message)
+    except openai.BadRequestError as e:             # a 400 is never retried: fix the request
+        print("bad request:", e.status_code, e.message)
         return None
-    print("request id:", resp._request_id, "tokens:", resp.usage.input_tokens, resp.usage.output_tokens)
     return resp.output_parsed                       # a validated Triage, or None on refusal
 
 print(triage("I was charged twice this month and need it fixed today."))
+# e.g. category='billing' urgent=True summary='Customer was charged twice this month.'
 ```
 
 - **On the wire:** `parse` turns `Triage` into a JSON Schema (an enum for `category`, a boolean, a string,
   every field required, no extra properties) sent as a strict text format. The server constrains decoding
   to matching JSON; the SDK validates it back into a `Triage`.
-- **Retry accounting:** a 429 is retried up to three times before `RateLimitError` reaches the `except`, so
-  re-raising hands the failure to an outer queue instead of retrying a fourth time in-process.
+- **Retry accounting:** a 429 is retried up to three times before `RateLimitError` propagates, so let it
+  reach an outer queue that backs off instead of retrying a fourth time in-process.
 
 ### Worked scenario: worst-case time a worker is held
 Using `timeout × (max_retries + 1)`, before backoff:

@@ -273,50 +273,34 @@ flowchart TD
 ## Examples
 ### Env vars, a background server, a port conflict and exit codes
 The script plays out the four ideas with a stand-in model server. Run it with `bash env_and_ports.sh` in
-an empty directory (tested with GNU bash 3.2.57 on macOS, Python 3.9.6 and 3.12.14, curl 8.7.1).
+an empty directory (tested with GNU bash 3.2.57 on macOS, Python 3.9.6, curl 8.7.1).
 
 ```bash
 #!/usr/bin/env bash
-# Env vars, processes, exit codes and ports, as an agent service meets them.
 set -euo pipefail
 PORT=18765
-
-# 1. Shell variable vs environment variable: only exported names reach child processes.
-LLM_MODEL="small-model"                 # shell variable: lives in this shell only
+# 1. Only exported variables reach child processes.
+LLM_MODEL="small-model"                          # shell variable: this shell only
 export LLM_BASE_URL="http://127.0.0.1:$PORT"
 python3 -c 'import os; print("child sees MODEL:", os.environ.get("LLM_MODEL"), "| BASE_URL:", os.environ.get("LLM_BASE_URL"))'
-LLM_MODEL="small-model" python3 -c 'import os; print("one-off prefix:", os.environ["LLM_MODEL"])'
-
-# 2. Start a fake model server in the background; $! is its PID.
-python3 -m http.server "$PORT" --bind 127.0.0.1 >server.log 2>&1 &
+# 2. A background server; $! is its PID and trap cleans it up on any exit.
+python3 -m http.server "$PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
 SERVER_PID=$!
-trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT   # always clean up, even on error
+trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 sleep 1
-
-# 3. Who owns the port? lsof maps a listening port to a PID.
 lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | awk 'NR>1 {print "listening:", $1, "pid", $2}'
-
-# 4. A second server on the same port fails: read the exit code and the error, do not guess.
-set +e
-python3 -m http.server "$PORT" --bind 127.0.0.1 2>err.txt &
-SECOND=$!
-wait "$SECOND"; echo "second server exit code: $?"
-set -e
+# 3. A second server on the same port fails: read the exit code and the error.
+python3 -m http.server "$PORT" --bind 127.0.0.1 2>err.txt || echo "second server exit code: $?"
 grep -o 'Address already in use' err.txt | head -1
-
-# 5. curl exit code vs HTTP status: -f makes HTTP errors non-zero exits.
-curl -s -o /dev/null -w 'GET / -> HTTP %{http_code}\n' "$LLM_BASE_URL/"
+# 4. curl -f turns an HTTP error into exit 22; no listener at all is exit 7.
 curl -sf -o /dev/null "$LLM_BASE_URL/v1/missing" || echo "curl -f exit code: $? (HTTP error)"
-
 kill "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null || true
 curl -s "$LLM_BASE_URL/" >/dev/null || echo "after kill, curl exit code: $? (connection refused)"
 # Output (PID varies):
 # child sees MODEL: None | BASE_URL: http://127.0.0.1:18765
-# one-off prefix: small-model
 # listening: Python pid 64431
 # second server exit code: 1
 # Address already in use
-# GET / -> HTTP 200
 # curl -f exit code: 22 (HTTP error)
 # after kill, curl exit code: 7 (connection refused)
 ```

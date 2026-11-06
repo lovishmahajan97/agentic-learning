@@ -213,27 +213,20 @@ from enum import IntEnum
 class Label(IntEnum):
     PUBLIC = 0; INTERNAL = 1; CONFIDENTIAL = 2; RESTRICTED = 3
 
-# Control matrix: highest label each endpoint is approved to receive.
-ENDPOINTS = {
-    "external-frontier-api": Label.INTERNAL,      # no customer data under current contract
-    "external-api-zdr-eu":   Label.CONFIDENTIAL,  # zero-retention terms, EU processing
-    "self-hosted-vpc":       Label.RESTRICTED,
-}
-PREFERENCE = ["external-frontier-api", "external-api-zdr-eu", "self-hosted-vpc"]
+# Control matrix: highest label each endpoint may receive, in preference order.
+ENDPOINTS = {"external-frontier-api": Label.INTERNAL,      # no customer data under current contract
+             "external-api-zdr-eu":   Label.CONFIDENTIAL,  # zero-retention terms, EU processing
+             "self-hosted-vpc":       Label.RESTRICTED}
 
-def prompt_label(user_label: Label, chunks: list[dict]) -> Label:
-    return max([user_label, *(Label[c["label"]] for c in chunks)])   # high-water mark
-
-def route(user_label, chunks):
-    lvl = prompt_label(user_label, chunks)
-    for ep in PREFERENCE:                      # preferred endpoint first, if approved
-        if ENDPOINTS[ep] >= lvl:
+def route(user_label, chunk_labels):
+    lvl = max([user_label, *chunk_labels])     # high-water mark
+    for ep, approved in ENDPOINTS.items():     # preferred endpoint first, if approved
+        if approved >= lvl:
             return ep, lvl.name
     raise PermissionError(f"no endpoint approved for {lvl.name}")
 
-chunks = [{"id": "faq-12", "label": "PUBLIC"}, {"id": "contract-7#3", "label": "CONFIDENTIAL"}]
-print(route(Label.INTERNAL, chunks))           # ('external-api-zdr-eu', 'CONFIDENTIAL')
-print(route(Label.INTERNAL, chunks[:1]))       # ('external-frontier-api', 'INTERNAL')
+print(route(Label.INTERNAL, [Label.PUBLIC, Label.CONFIDENTIAL]))  # ('external-api-zdr-eu', 'CONFIDENTIAL')
+print(route(Label.INTERNAL, [Label.PUBLIC]))                      # ('external-frontier-api', 'INTERNAL')
 ```
 
 - **One confidential chunk moves the whole request to a different endpoint.**
@@ -252,28 +245,22 @@ class Label(IntEnum):
     PUBLIC = 0; INTERNAL = 1; CONFIDENTIAL = 2; RESTRICTED = 3
 
 SOURCE_DEFAULT = {"hr": Label.CONFIDENTIAL, "wiki": Label.INTERNAL, "website": Label.PUBLIC}
-RAISE_ON = [(re.compile(r"\b(diagnosis|prescription|sick leave)\b", re.I), Label.RESTRICTED),
-            (re.compile(r"\b\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}\b"), Label.RESTRICTED)]
+HEALTH = re.compile(r"\b(diagnosis|prescription|sick leave)\b", re.I)   # stand-in for DLP detectors
 
 def label_chunk(source, owner_label, text):
-    # owner label first, then inheritance from source; unknown sources default to INTERNAL
     label = owner_label if owner_label is not None else SOURCE_DEFAULT.get(source, Label.INTERNAL)
-    for pattern, floor in RAISE_ON:
-        if pattern.search(text):
-            label = max(label, floor)          # scanning may raise a label, never lower it
+    if HEALTH.search(text):
+        label = max(label, Label.RESTRICTED)   # scanning may raise a label, never lower it
     return label
 
-def label_summary(chunk_labels):
-    return max(chunk_labels)                   # high-water mark for anything derived
-
-a = label_chunk("wiki", None, "Team offsite agenda for March")
-b = label_chunk("wiki", None, "Priya is on sick leave until the 14th")
-c = label_chunk("website", Label.PUBLIC, "Pricing starts at 20 per seat")
-print(a.name, b.name, c.name, "->", label_summary([a, b, c]).name)
-# INTERNAL RESTRICTED PUBLIC -> RESTRICTED
+labels = [label_chunk("wiki", None, "Team offsite agenda for March"),
+          label_chunk("wiki", None, "Priya is on sick leave until the 14th"),
+          label_chunk("website", Label.PUBLIC, "Pricing starts at 20 per seat")]
+print([l.name for l in labels], "->", max(labels).name)   # high-water mark for anything derived
+# ['INTERNAL', 'RESTRICTED', 'PUBLIC'] -> RESTRICTED
 ```
 
-- **The detector list is a toy;** in production the raise step calls your DLP detectors, and the point is
+- **The detector is a toy;** in production the raise step calls your DLP detectors, and the point is
   the direction of the rule, not the patterns.
 
 ### Agent scenario: a session label that rises with every tool result
@@ -287,37 +274,21 @@ from enum import IntEnum
 class Label(IntEnum):
     PUBLIC = 0; INTERNAL = 1; CONFIDENTIAL = 2; RESTRICTED = 3
 
-SINK_MAX = {  # highest label each sink may receive; illustrative policy
-    "llm:external-api-zdr-eu": Label.CONFIDENTIAL,
-    "tool:web_search": Label.INTERNAL,            # the query leaves for a third party
-    "tool:post_slack_public": Label.INTERNAL,
-    "memory:write": Label.CONFIDENTIAL,
-}
+SINK_MAX = {"llm:external-api-zdr-eu": Label.CONFIDENTIAL,   # illustrative policy
+            "tool:web_search": Label.INTERNAL}               # the query leaves for a third party
 
 class Session:
     def __init__(self, user_label=Label.INTERNAL):
         self.label = user_label                   # high-water mark of everything in context
-
     def ingest(self, result_label):               # every tool result carries its source's label
         self.label = max(self.label, result_label)
-
-    def check(self, sink):
-        if SINK_MAX[sink] < self.label:
-            raise PermissionError(f"{sink} approved up to {SINK_MAX[sink].name}, context is {self.label.name}")
+    def check(self, sink):                        # the orchestrator blocks the call when False
+        return SINK_MAX[sink] >= self.label
 
 s = Session()
-s.ingest(Label.PUBLIC)                            # read the public FAQ
-s.check("tool:post_slack_public")                 # fine: context is INTERNAL
-s.check("tool:web_search")                        # fine: search before the confidential read
+print(s.check("tool:web_search"))                 # True: search before the confidential read
 s.ingest(Label.CONFIDENTIAL)                      # read a customer contract
-s.check("llm:external-api-zdr-eu")                # fine: endpoint approved for CONFIDENTIAL
-for sink in ("tool:post_slack_public", "tool:web_search"):
-    try:
-        s.check(sink)
-    except PermissionError as e:
-        print(e)
-# tool:post_slack_public approved up to INTERNAL, context is CONFIDENTIAL
-# tool:web_search approved up to INTERNAL, context is CONFIDENTIAL
+print(s.check("llm:external-api-zdr-eu"), s.check("tool:web_search"))   # True False
 ```
 
 - **Session labels are coarse, like session taint.** After the contract, web search is blocked even for a

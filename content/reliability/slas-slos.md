@@ -280,42 +280,32 @@ ended with a final answer, within its 25-step budget, under 2 minutes and with n
   until the budget recovers.
 
 ### Budget table and multi-window burn-rate alerts, runnable
-Reproduces the budget table and evaluates the three alert tiers for the two incidents above (a rule fires
+Computes the budget and evaluates the three alert tiers for the two incidents above (a rule fires
 only when both its long and short windows exceed the threshold).
 
 ```python
 WINDOW_MIN = 30 * 24 * 60                     # 43,200 minutes
 
 def budget_minutes(slo, window_min=WINDOW_MIN):
-    return (1 - slo) * window_min
+    return (1 - slo) * window_min             # 99%: 432, 99.5%: 216, 99.9%: 43.2, 99.99%: 4.32
 
-def burn_rate(bad, total, slo):
-    return (bad / total) / (1 - slo)          # 1 = exactly exhausts the budget at window end
+def burn_rate(bad_fraction, slo):
+    return bad_fraction / (1 - slo)           # 1 = exactly exhausts the budget at window end
 
 # Multi-window rules (SRE Workbook): long window, short window, threshold, action
 RULES = [("1h", "5m", 14.4, "page"), ("6h", "30m", 6, "page"), ("3d", "6h", 1, "ticket")]
 
 def evaluate(counts, slo=0.999):
-    """counts: window -> (bad, total). A rule fires only if BOTH its windows exceed the threshold."""
+    """counts: window -> bad fraction. A rule fires only if BOTH its windows exceed the threshold."""
     return [(action, long_w, thr) for long_w, short_w, thr, action in RULES
-            if burn_rate(*counts[long_w], slo) > thr and burn_rate(*counts[short_w], slo) > thr]
+            if burn_rate(counts[long_w], slo) > thr and burn_rate(counts[short_w], slo) > thr]
 
-for slo in (0.99, 0.995, 0.999, 0.9995, 0.9999):
-    print(f"{slo:.2%}: {budget_minutes(slo):7.2f} min per 30 days")   # 432, 216, 43.2, 21.6, 4.32
-
-rpm = 463                                     # requests per minute in the worked month
-def window(minutes, bad_fraction):
-    total = minutes * rpm
-    return (bad_fraction * total, total)
-
+print(f"{budget_minutes(0.999):.1f} min per 30 days")   # 43.2
 # Day 9: persistent 0.15% bad. Only the slow-burn ticket fires.
-slow_burn = {w: window(m, 0.0015) for w, m in
-             [("5m", 5), ("1h", 60), ("30m", 30), ("6h", 360), ("3d", 4320)]}
+slow_burn = dict.fromkeys(["5m", "30m", "1h", "6h", "3d"], 0.0015)
 print("prompt regression:", evaluate(slow_burn))     # [('ticket', '3d', 1)]
-
 # Day 6, 25 minutes into the 60%-bad incident: each window's bad fraction.
-outage = {"5m": window(5, 0.6), "1h": window(60, 0.25), "30m": window(30, 0.5),
-          "6h": window(360, 0.042), "3d": window(4320, 0.0035)}
+outage = {"5m": 0.6, "30m": 0.5, "1h": 0.25, "6h": 0.042, "3d": 0.0035}
 print("provider outage:  ", evaluate(outage))        # both pages and the ticket
 ```
 

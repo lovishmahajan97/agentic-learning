@@ -162,87 +162,51 @@ flowchart TD
 
 ## Examples
 ### A scoped store with a canary test
-Every method requires a tenant context, the filter runs inside the vector search, the cache key includes
-the tenant, and a parametrised test checks each tenant's canary is invisible to all others. It runs as
-`pytest` against Qdrant's in-process local mode (`pip install qdrant-client pytest`, no server).
+Every store function requires a tenant context, the filter runs inside the vector search, the cache key
+includes the tenant and ACL groups, and a parametrised test checks each tenant sees only its own canary.
+It runs as `pytest` against Qdrant's in-process local mode (no server).
 
 - **Version-sensitive:** checked against qdrant-client 1.16.1, where the call is `client.query_points(...)`
   with `collection_name`, `query=qvec`, `query_filter` and `limit`. The older `search` method (vector
   argument `query_vector`) is gone in that version.
-- **Wire it into the agent:** the retrieval tool calls `answer` or `retrieve` with the context from the
-  request, never with arguments the model produced.
+- **Wire it into the agent:** the retrieval tool calls `retrieve` with the context from the request,
+  never with arguments the model produced.
 
 ```python
+# pip install qdrant-client==1.16.1 pytest
 import hashlib, pytest
 from dataclasses import dataclass
-from qdrant_client import QdrantClient, models   # checked against qdrant-client 1.16.1
+from qdrant_client import QdrantClient, models
 
 @dataclass(frozen=True)
 class TenantCtx:
-    tenant_id: str            # set once from the verified JWT at the API edge
-    user_id: str
-    groups: frozenset         # document ACL groups, also from the verified identity
+    tenant_id: str        # set once from the verified JWT at the API edge
+    groups: frozenset     # document ACL groups, also from the verified identity
 
-class ScopedStore:
-    """Every method takes ctx; there is no unscoped variant to call by mistake."""
-    def __init__(self, vec: QdrantClient, cache: dict, collection="docs"):
-        self.vec, self.cache, self.collection = vec, cache, collection
+def retrieve(vec: QdrantClient, ctx: TenantCtx, qvec, k=8):
+    flt = models.Filter(must=[  # evaluated inside the ANN search, so k is k *within* the tenant
+        models.FieldCondition(key="tenant_id", match=models.MatchValue(value=ctx.tenant_id)),
+        models.FieldCondition(key="acl_groups", match=models.MatchAny(any=sorted(ctx.groups)))])
+    return vec.query_points(collection_name="docs", query=qvec, query_filter=flt, limit=k).points
 
-    def retrieve(self, ctx: TenantCtx, qvec, k=8):
-        # filter evaluated inside the ANN search, so k is k *within* the tenant
-        flt = models.Filter(must=[
-            models.FieldCondition(key="tenant_id", match=models.MatchValue(value=ctx.tenant_id)),
-            models.FieldCondition(key="acl_groups", match=models.MatchAny(any=sorted(ctx.groups)))])
-        return self.vec.query_points(collection_name=self.collection, query=qvec,
-                                     query_filter=flt, limit=k).points
+def cache_key(ctx: TenantCtx, model: str, prompt: str) -> str:  # same tenant, other ACL => other key
+    return hashlib.sha256(f"{ctx.tenant_id}|{sorted(ctx.groups)}|{model}|{prompt}".encode()).hexdigest()
 
-    def cache_key(self, ctx: TenantCtx, model: str, prompt: str) -> str:
-        acl = ",".join(sorted(ctx.groups))       # same tenant, different permissions => different key
-        return hashlib.sha256(f"{ctx.tenant_id}|{acl}|{model}|{prompt}".encode()).hexdigest()
-
-    def answer(self, ctx, model, prompt, qvec, llm):
-        key = self.cache_key(ctx, model, prompt)
-        if (hit := self.cache.get(key)) is not None:
-            return hit
-        out = llm(prompt, self.retrieve(ctx, qvec))
-        self.cache[key] = out                    # a real cache also sets a TTL, e.g. ttl=3600
-        return out
-
-# CI: each tenant's canary document must be invisible to every other tenant
 CANARIES = {"acme": "CANARY-acme-7f3a", "globex": "CANARY-globex-91c2", "initech": "CANARY-initech-c0de"}
 
-def toy_embed(text, dim=64):                     # stand-in for a real embedding model
-    v = [0.0] * dim
-    for w in text.lower().replace("?", " ").split():
-        v[int(hashlib.md5(w.encode()).hexdigest(), 16) % dim] += 1.0
-    return v
-
-@pytest.fixture
-def embed():
-    return toy_embed
-
-@pytest.fixture
-def store():
-    client = QdrantClient(":memory:")            # local mode, no server needed
-    client.create_collection("docs", vectors_config=models.VectorParams(size=64, distance=models.Distance.COSINE))
-    client.upsert("docs", points=[
-        models.PointStruct(id=i, vector=toy_embed(f"{tok} is the secret"),
-                           payload={"tenant_id": t, "acl_groups": ["all-staff"], "text": f"{tok} is the secret"})
-        for i, (t, tok) in enumerate(CANARIES.items())])
-    return ScopedStore(client, cache={})
-
 @pytest.mark.parametrize("asker", CANARIES)
-def test_no_cross_tenant_leak(store, embed, asker):
-    ctx = TenantCtx(tenant_id=asker, user_id="qa-bot", groups=frozenset({"all-staff"}))
-    for owner, token in CANARIES.items():
-        if owner == asker:
-            continue
-        hits = store.retrieve(ctx, embed(f"what is {token}?"), k=50)   # large k on purpose
-        assert not any(token in h.payload["text"] for h in hits), f"{asker} can see {owner}"
+def test_no_cross_tenant_leak(asker):
+    vec = QdrantClient(":memory:")  # local mode, no server needed
+    vec.create_collection("docs", vectors_config=models.VectorParams(size=2, distance=models.Distance.COSINE))
+    vec.upsert("docs", points=[models.PointStruct(id=i, vector=[1.0, 0.0],   # identical vectors: every
+        payload={"tenant_id": t, "acl_groups": ["all-staff"], "text": tok})   # canary is a nearest neighbour
+        for i, (t, tok) in enumerate(CANARIES.items())])
+    hits = retrieve(vec, TenantCtx(asker, frozenset({"all-staff"})), [1.0, 0.0], k=50)  # large k on purpose
+    assert [h.payload["text"] for h in hits] == [CANARIES[asker]]
 ```
 
-- **Why k=50:** the large-k test catches a missing or post-applied filter, because the query is phrased to
-  make the foreign canary the nearest neighbour. Pass `query_filter=None` and all three cases fail.
+- **Why k=50 and identical vectors:** every foreign canary is as near as the tenant's own, so a missing or
+  post-applied filter shows up at once. Pass `query_filter=None` and all three cases fail.
 - **Why ACL groups in the cache key:** two users of the same tenant with different permissions never share
   a cached answer, at the price of a lower hit rate.
 
@@ -321,6 +285,8 @@ stores. An audit of a first draft (illustrative):
   know when to migrate a tenant between tiers.
 - **Tenant offboarding runbook.** One job deletes from the index, caches, agent memory, traces and
   adapters, then re-runs that tenant's canary queries and records the result as deletion evidence.
+- **Expire cached answers.** A tenant-keyed answer cache still sets a TTL (for example `ttl=3600`), so
+  revoked access or deleted documents stop being served from cache.
 
 ## Trade-offs
 - **Collection-per-tenant vs cost.** Hard isolation and trivial deletion, but each collection carries index

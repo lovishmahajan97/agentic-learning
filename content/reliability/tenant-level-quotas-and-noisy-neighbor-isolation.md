@@ -221,65 +221,44 @@ flowchart TD
 ```
 
 ## Examples
-### Admission layer: per-tenant token bucket and concurrency lane
-A single-process sketch: a per-tenant token bucket for tokens per minute with reserve-then-reconcile, plus a
-per-tenant semaphore for concurrency. Every agent step calls `call_llm`. In production the bucket state
-lives in Redis behind an atomic Lua script so every gateway replica sees the same level; the logic is
-identical.
+### Admission layer: per-tenant token bucket
+A single-process sketch of a per-tenant token bucket for tokens per minute with reserve-then-reconcile.
+Every agent step reserves its worst case before calling the model. In production the bucket state lives in
+Redis behind an atomic Lua script so every gateway replica sees the same level; the logic is identical.
 
 ```python
-import asyncio, time
+import time
 from collections import defaultdict
 
-class QuotaExceeded(Exception):
-    def __init__(self, tenant, retry_after):
-        super().__init__(f"tenant {tenant} over token quota"); self.retry_after = retry_after
-
 class TenantLimiter:
-    """Per-tenant token bucket (tokens/min) + concurrency lane. Single-process version."""
-    def __init__(self, tokens_per_min, max_in_flight):
+    """Per-tenant token bucket (tokens/min) with reserve-then-reconcile."""
+    def __init__(self, tokens_per_min):
         self.rate, self.cap = tokens_per_min / 60.0, float(tokens_per_min)
-        self.level = defaultdict(lambda: self.cap)           # starts full: one burst is allowed
+        self.level = defaultdict(lambda: self.cap)        # starts full: one burst is allowed
         self.stamp = defaultdict(time.monotonic)
-        self.lanes = defaultdict(lambda: asyncio.Semaphore(max_in_flight))
 
-    def _refill(self, t):
+    def reserve(self, t, est_tokens):
         now = time.monotonic()
         self.level[t] = min(self.cap, self.level[t] + (now - self.stamp[t]) * self.rate)
         self.stamp[t] = now
-
-    def reserve(self, t, est_tokens):
-        if est_tokens > self.cap:                            # can never fit: a 400, not a retryable 429
-            raise ValueError(f"request needs {est_tokens} tokens; per-minute cap is {self.cap:.0f}")
-        self._refill(t)
-        if self.level[t] < est_tokens:                       # reject now; queueing would hide overload
-            raise QuotaExceeded(t, retry_after=(est_tokens - self.level[t]) / self.rate)
+        if self.level[t] < est_tokens:                    # 429 with an honest Retry-After
+            return False, round((est_tokens - self.level[t]) / self.rate)
         self.level[t] -= est_tokens
+        return True, 0
 
     def reconcile(self, t, est_tokens, used_tokens):
-        self.level[t] += est_tokens - used_tokens            # refund the unused reservation
+        self.level[t] += est_tokens - used_tokens         # refund the unused reservation
 
-async def call_llm(limiter, tenant, prompt_tokens, max_output_tokens, call):
-    est = prompt_tokens + max_output_tokens                  # worst case: output size unknown until done
-    limiter.reserve(tenant, est)
-    async with limiter.lanes[tenant]:                        # the tenant's own concurrency lane
-        try:
-            resp = await call()
-        except Exception:
-            limiter.reconcile(tenant, est, prompt_tokens)    # failed calls still charge the prompt
-            raise
-    limiter.reconcile(tenant, est, resp["usage"]["total_tokens"])
-    return resp
+lim = TenantLimiter(tokens_per_min=50_000)
+est = 15_000 + 1_000                                      # prompt + max_tokens: output size unknown
+print([lim.reserve("C", est)[0] for _ in range(4)])       # [True, True, True, False]
+print(lim.reserve("C", est)[1], lim.reserve("B", est))    # 17 (True, 0)  -- B is untouched
+lim.reconcile("C", est, used_tokens=15_200)               # refund 800 unused tokens
 ```
 
-- **Ordering matters:** the reservation happens before the lane is taken and before any provider call, so
-  a tenant over quota never occupies a slot.
-- **Failed calls still charge the prompt tokens,** so a retry storm counts against the tenant that caused it
-  rather than against the shared pool.
-- **The 429 carries an honest wait:** `retry_after` is computed from the refill rate, so well-behaved
+- **Tenant C hits its own cap, not B's:** the fourth 16k reservation fails for C while B is admitted at once.
+- **The 429 carries an honest wait:** the retry delay is computed from the refill rate, so well-behaved
   clients get a real wait instead of a guess. An agent loop should surface it as a pause, not retry at once.
-- **Oversized requests are a client error.** A request larger than the whole bucket is rejected as a 400,
-  because a 429 for it would promise a retry that can never succeed and invite the client to loop.
 
 ### Round robin vs deficit round robin, runnable
 A's backlog is 20k-token summaries, B's is 400-token chats. Count tokens served over 30 cycles.
@@ -294,7 +273,6 @@ def round_robin(queues, rounds):
             if q:
                 served[t] += q.popleft()          # one request per tenant per cycle
     return served
-
 def drr(queues, quantum, rounds):
     deficit = {t: 0 for t in queues}
     served = {t: 0 for t in queues}
@@ -309,10 +287,8 @@ def drr(queues, quantum, rounds):
                 deficit[t] -= cost
                 served[t] += cost
     return served
-
 def backlog():
     return {"A": deque([20_000] * 50), "B": deque([400] * 1000)}
-
 print("round robin:", round_robin(backlog(), rounds=30))   # A: 600000, B: 12000
 print("DRR:        ", drr(backlog(), quantum=8_000, rounds=30))  # A: 240000, B: 240000
 ```
@@ -366,6 +342,11 @@ sold to specific customers.
 - **Per-tenant dashboards from tags.** Put `tenant_id` on every trace span and cost record; chart token share
   by tenant, queue wait, and 429s split by tenant and by upstream. Isolation works when one tenant's spike
   moves only that tenant's lines.
+- **Reserve before taking a concurrency slot.** Run the quota check before the tenant's in-flight lane and the
+  provider call, so a tenant over quota never occupies a slot.
+- **Failed calls still charge the prompt tokens,** so a retry storm counts against the tenant that caused it.
+- **Oversized requests are a 400, not a 429.** A request larger than the whole bucket can never fit; a 429
+  would promise a retry that never succeeds and invite the client to loop.
 
 ## Trade-offs
 - **Hard caps vs fair share.** Hard per-tenant caps guarantee isolation but strand capacity: if the caps sum

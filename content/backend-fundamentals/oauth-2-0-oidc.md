@@ -395,49 +395,36 @@ sequenceDiagram
 ```
 
 ## Examples
-### Confidential web client: code flow with PKCE and ID-token validation
-A server-side client doing the authorization code flow with PKCE and validating the ID token against the
-provider's JWKS. The pieces that matter are the three random values, the back-channel exchange, and the
-claims that are checked before trusting `sub`.
+### Confidential web client: the callback that validates the ID token
+The server-side half of the code flow: check `state`, redeem the code on the back channel with the PKCE
+verifier, then validate the ID token before trusting `sub`. `start_login` (not shown) stored `state`,
+`nonce` and `verifier` in the server-side session.
 
 ```python
-import base64, hashlib, secrets, urllib.parse, requests, jwt   # pip install requests pyjwt[crypto]
+import requests, jwt   # pip install requests pyjwt[crypto]
 
 ISSUER, CLIENT_ID, CLIENT_SECRET = "https://login.example.com", "my-web-app", "<from secrets manager>"
 REDIRECT_URI = "https://app.example.com/callback"
 disc = requests.get(f"{ISSUER}/.well-known/openid-configuration").json()   # endpoints + jwks_uri
 jwks = jwt.PyJWKClient(disc["jwks_uri"])   # caches keys; refetches when it meets an unknown kid
 
-def start_login(session):            # 1. PKCE pair, state, nonce -> stored server-side, never in the URL
-    verifier = secrets.token_urlsafe(64)
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    session.update(verifier=verifier, state=secrets.token_urlsafe(16), nonce=secrets.token_urlsafe(16))
-    return disc["authorization_endpoint"] + "?" + urllib.parse.urlencode({
-        "response_type": "code", "client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI,
-        "scope": "openid profile email", "state": session["state"], "nonce": session["nonce"],
-        "code_challenge": challenge, "code_challenge_method": "S256"})
-
-def handle_callback(code, returned_state, session):   # 2. browser returns ?code=...&state=...
+def handle_callback(code, returned_state, session):   # browser returns ?code=...&state=...
     if returned_state != session["state"]:
         raise PermissionError("state mismatch: login CSRF or stale session")
-    tok = requests.post(disc["token_endpoint"], data={             # back channel, TLS, server-to-server
+    tok = requests.post(disc["token_endpoint"], data={             # back channel, server-to-server
         "grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI,
         "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
-        "code_verifier": session["verifier"]})
-    tok.raise_for_status(); tok = tok.json()                   # error responses carry no tokens
-    # 3. Validate the ID token: signature via JWKS, pinned algorithm, issuer, audience = our client_id, expiry
+        "code_verifier": session["verifier"]}).json()
     key = jwks.get_signing_key_from_jwt(tok["id_token"])
-    claims = jwt.decode(tok["id_token"], key.key, algorithms=["RS256"],
+    claims = jwt.decode(tok["id_token"], key.key, algorithms=["RS256"],   # pin alg, aud, iss
                         audience=CLIENT_ID, issuer=disc["issuer"])
     if claims.get("nonce") != session["nonce"]:
         raise PermissionError("nonce mismatch: token not minted for this login")
-    user_key = (claims["iss"], claims["sub"])     # sub is unique per issuer; email is a display attribute
-    return user_key, tok["access_token"], tok.get("refresh_token")   # keep tokens server-side
+    return (claims["iss"], claims["sub"])   # sub is unique per issuer; email is a display attribute
 ```
 
-- **After `handle_callback`** the app issues its own HttpOnly session cookie.
-- **The access token** is used only when the backend calls the provider's APIs on the user's behalf.
-- **The refresh token** never leaves the server.
+After `handle_callback` the app issues its own HttpOnly session cookie; access and refresh tokens stay
+server-side.
 
 ### Why a stolen code is useless: PKCE in 15 lines
 Runnable with the standard library. The authorization server stores only the challenge; an interceptor
@@ -460,8 +447,8 @@ print(token_endpoint_accepts(verifier))                     # True: the legitima
 print(token_endpoint_accepts(secrets.token_urlsafe(64)))    # False: attacker with the code only
 ```
 
-### Resource server: bearer middleware for JWT access tokens
-What the API, not the client, runs on every request. It pins issuer, audience and algorithm, then checks
+### Resource server: checking a bearer token's scope
+What the API, not the client, runs on every request: pin issuer, audience and algorithm, then check
 scope. The `scope` claim is a space-separated string in the JWT access-token profile; some providers use
 a different claim name, so confirm yours.
 
@@ -472,8 +459,6 @@ API_AUDIENCE, ISSUER = "https://api.example.com", "https://login.example.com"
 jwks = jwt.PyJWKClient(f"{ISSUER}/.well-known/jwks.json")   # use the jwks_uri from discovery
 
 def authorize(auth_header: str, needed_scope: str) -> dict:
-    if not auth_header.startswith("Bearer "):
-        raise PermissionError("401: missing bearer token")
     token = auth_header.removeprefix("Bearer ")
     key = jwks.get_signing_key_from_jwt(token)
     claims = jwt.decode(token, key.key, algorithms=["RS256"],
@@ -481,43 +466,6 @@ def authorize(auth_header: str, needed_scope: str) -> dict:
     if needed_scope not in claims.get("scope", "").split():
         raise PermissionError("403: insufficient scope")
     return claims   # next: the user's own role check (RBAC) on the resource
-```
-
-### Agent tool runtime: per-user tokens resolved outside the model
-The model emits a tool call; the runtime attaches the right user's token, refreshes it when needed and
-never returns the token to the model. `vault` is your encrypted token store; `refresh` posts
-`grant_type=refresh_token` to the provider's `/token` endpoint.
-
-```python
-import time, requests
-
-class NeedsAuthorization(Exception): ...
-
-def get_token(vault, user_key, provider, refresh):
-    rec = vault.get(user_key, provider)               # keyed on the session's (iss, sub), not model output
-    if rec is None:
-        raise NeedsAuthorization(provider)            # UI shows "Connect GitHub"
-    if rec["expires_at"] - time.time() < 60:          # refresh a minute early
-        new = refresh(provider, rec["refresh_token"])  # rotation: provider returns a new refresh token
-        rec = {"access_token": new["access_token"],
-               "refresh_token": new.get("refresh_token", rec["refresh_token"]),
-               "expires_at": time.time() + new["expires_in"]}
-        vault.put(user_key, provider, rec)
-    return rec["access_token"]
-
-def run_tool(call, session, vault, refresh):
-    try:
-        token = get_token(vault, session.user_key, call.provider, refresh)
-    except NeedsAuthorization as e:
-        return {"error": "needs_authorization", "provider": str(e)}   # model sees this, not a token
-    r = requests.request(call.method, call.url, json=call.args, timeout=20,
-                         headers={"Authorization": f"Bearer {token}"})
-    if r.status_code == 401:                          # consent revoked or token invalidated upstream
-        vault.delete(session.user_key, call.provider)
-        return {"error": "needs_authorization", "provider": call.provider}
-    if r.status_code == 403:                          # scope too narrow, or the user lacks the permission
-        return {"error": "forbidden", "detail": "missing scope or user permission"}
-    return {"status": r.status_code, "body": r.json()}       # the token never enters the transcript
 ```
 
 ### Worked scenario: blast radius of one leaked agent credential
@@ -556,6 +504,11 @@ to "a few users, under an hour", with reuse detection flagging any replay.
 - **Client credentials for the agent's own work.** Background agents (nightly triage, eval runs) get their
   own client registration with narrow scopes, so audit logs separate "the agent did this" from "user X's
   agent did this". Alert on any client-credentials token used against user-scoped endpoints.
+- **Tool runtime token handling.** Resolve the token from the vault by the session's `(iss, sub)`, never
+  from model output; refresh about 60 s before `expires_at` and keep the old refresh token if the
+  provider returns none; on a 401 delete the vaulted token and return `needs_authorization`, on a 403
+  return `forbidden`; set a request timeout (20 s) and never put the token in the tool result. Call
+  `raise_for_status()` on the `/token` response, since error responses carry no tokens.
 
 ## Trade-offs
 - **Delegation vs moving parts.** No password sharing, paid for with redirect complexity, more moving parts

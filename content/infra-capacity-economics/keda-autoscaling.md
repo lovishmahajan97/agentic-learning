@@ -242,7 +242,6 @@ spec:
           sum(vllm:num_requests_running{model_name="chat-8b"})
           + sum(vllm:num_requests_waiting{model_name="chat-8b"})
         threshold: "12"
-        activationThreshold: "0"
 ```
 
 Walkthrough of a day:
@@ -276,7 +275,6 @@ spec:
         containers:
           - name: agent
             image: ghcr.io/example/research-agent:2.3   # CPU pod: runs the loop, calls the model server
-  pollingInterval: 15
   maxReplicaCount: 120              # caps concurrent runs, and so load on the GPU tier
   scalingStrategy:
     strategy: accurate              # list length excludes runs already popped by a Job
@@ -308,32 +306,20 @@ How the agent layer drives the model layer (illustrative fractions; take yours f
   re-measure per-replica capacity with replayed agent traces before trusting it.
 
 ### Replica calculator: the HPA rule KEDA relies on
-A pure-Python model of the 1↔N loop, handy for choosing a threshold before touching the cluster. It applies
-`ceil(total / threshold)`, the ~10% tolerance and the default scale-up rate limit.
+A pure-Python model of the 1↔N rule, handy for choosing a threshold before touching the cluster. It applies
+`ceil(total / threshold)` and the ~10% tolerance.
 
 ```python
 import math
 
 def desired(total, threshold, current, lo=1, hi=8, tolerance=0.1):
-    want = math.ceil(total / threshold)
     if current and abs(total / (threshold * current) - 1) <= tolerance:
-        want = current                                   # inside tolerance: no change
-    return max(lo, min(hi, want))
+        return current
+    return max(lo, min(hi, math.ceil(total / threshold)))
 
-def scale_up_limit(current):
-    return max(current + 4, current * 2)                 # default: +4 pods or +100% per 15 s
-
-replicas, t = 1, 0
-for demand in [70, 70, 70]:                              # 09:00 ramp from one warm replica
-    target = desired(demand, 12, replicas)
-    replicas = min(target, scale_up_limit(replicas)) if target > replicas else replicas
-    print(f"t={t:3d}s demand={demand} target={target} replicas={replicas}")
-    t += 15
-# t=  0s demand=70 target=6 replicas=5
-# t= 15s demand=70 target=6 replicas=6
-# t= 30s demand=70 target=6 replicas=6
-
-print(desired(66, 12, 6), desired(80, 12, 6))           # 6 (within 10%), 7 (scale up)
+print(desired(70, 12, 1))   # 6  (09:00 ramp; the scale-up rate limit gets there in two 15 s periods)
+print(desired(66, 12, 6))   # 6  (within 10%: no change; 80 would give 7)
+print(desired(10, 12, 6))   # 1  (18:00 lull; the scale-down policy removes one pod per 2 min)
 ```
 
 ## Production patterns

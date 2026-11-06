@@ -265,43 +265,30 @@ Runs the server as a real stdio subprocess and talks to it through `ClientSessio
 `mcp/using-mcp-servers-inside-agents`.
 
 ```python
-import json, sys, pytest
+import sys, pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 SERVER = StdioServerParameters(command=sys.executable, args=["tickets_server.py"])
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-async def call(name, args=None):
+async def session_call(fn):                        # dicts with wire names, same on SDK 1.x and 2.x
     async with stdio_client(SERVER) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            if name == "tools/list":
-                return [t.model_dump(by_alias=True, exclude_none=True) for t in (await session.list_tools()).tools]
-            return (await session.call_tool(name, args or {})).model_dump(by_alias=True, exclude_none=True)
+            return (await fn(session)).model_dump(by_alias=True)
 
 @pytest.mark.anyio
 async def test_tool_surface_is_stable():
-    tools = {t["name"]: t for t in await call("tools/list")}
+    tools = {t["name"]: t for t in (await session_call(lambda s: s.list_tools()))["tools"]}
     assert set(tools) == {"get_ticket"}                       # no tool added or removed by accident
-    schema = tools["get_ticket"]["inputSchema"]
-    assert schema["required"] == ["ticket_id"]
-    assert len(tools["get_ticket"]["description"]) < 300      # description budget
-
-@pytest.mark.anyio
-async def test_known_ticket_returns_status():
-    result = await call("get_ticket", {"ticket_id": "T-1"})
-    assert result["isError"] is False
-    assert json.loads(result["content"][0]["text"])["status"] == "open"
+    assert tools["get_ticket"]["inputSchema"]["required"] == ["ticket_id"]
 
 @pytest.mark.anyio
 async def test_unknown_ticket_is_a_readable_error_not_a_crash():
-    result = await call("get_ticket", {"ticket_id": "nope"})
-    assert result["isError"] is True                           # a tool result, not a protocol error
+    result = await session_call(lambda s: s.call_tool("get_ticket", {"ticket_id": "nope"}))
+    assert result["isError"] is True                          # a tool result, not a protocol error
     assert "no ticket nope" in result["content"][0]["text"]
+# pytest -q  ->  2 passed
 ```
 
 - **Faster unit level.** SDK 2.x also accepts a server object directly, `async with Client(server) as c:`
@@ -336,6 +323,9 @@ A team renamed `query` to `q` in a search tool's schema and shortened its descri
   collect them). Alert on error rate and p95 latency per tool.
 - **Record and replay sessions.** Capture JSON-RPC traffic from real agent runs (with secrets redacted) and
   replay it against new builds to catch behaviour changes. Monitor replay mismatches.
+- **Budget tool descriptions.** Assert each description stays under a length budget (for example 300
+  characters) in the contract tests, and keep a happy-path call test (known id returns its status)
+  beside the error test.
 
 ## Trade-offs
 - **Subprocess contract tests vs in-memory tests.** Subprocess tests cover the real launch path and stdout

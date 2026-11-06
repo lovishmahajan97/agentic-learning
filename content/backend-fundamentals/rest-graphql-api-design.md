@@ -255,7 +255,6 @@ async def create_summary(body: SummarizeRequest, response: Response):
 async def get_summary(job_id: str):
     job = JOBS.get(job_id)
     if job is None:
-        # FastAPI wraps this as {"detail": {...}}; a real service maps errors to RFC 9457 in a handler
         raise HTTPException(status_code=404, detail={"type": "not_found", "job_id": job_id})
     return job                                       # 200 whether queued or done; status is in the body
 
@@ -337,6 +336,8 @@ Agent A and agent B both improve the same template within seconds.
 - **Breaking-change gate in CI.** Generate the OpenAPI document on every build and diff it against the
   released one with a tool such as oasdiff; fail on removed fields or tightened types, because generated
   tool definitions change with it. Track the count of deliberate breaking changes per release.
+- **FastAPI's `HTTPException` wraps errors as `{"detail": ...}`.** Map them to Problem Details in an
+  exception handler rather than relying on the default shape.
 
 ## Trade-offs
 - **REST caching vs round trips.** REST gets HTTP caching, retry-safety by method and tooling for free,

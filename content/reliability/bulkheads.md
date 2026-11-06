@@ -218,17 +218,15 @@ flowchart TD
 
 ## Examples
 ### Per-dependency semaphore bulkheads with a degrade path
-Semaphore bulkheads with a short bounded wait, separate HTTP clients so the connection pool is partitioned
-too, and a degrade path when a compartment is full. The caps come from Little's law with illustrative
-traffic numbers.
+A semaphore bulkhead with a short bounded wait, and a degrade path when the compartment is full. The cap
+comes from Little's law with illustrative traffic numbers. Runnable: the CRM hangs and the 21st caller is
+rejected in 50 ms.
 
 ```python
-import asyncio, httpx
+import asyncio
 
 class BulkheadFull(Exception): pass
-
-class Bulkhead:
-    """Caps concurrent calls to one dependency; a caller waits at most max_wait for a slot."""
+class Bulkhead:                     # caps concurrent calls to one dependency
     def __init__(self, name, max_concurrent, max_wait=0.25):
         self.name, self.max_wait = name, max_wait
         self.sem = asyncio.Semaphore(max_concurrent)
@@ -237,30 +235,24 @@ class Bulkhead:
         try:
             await asyncio.wait_for(self.sem.acquire(), self.max_wait)
         except asyncio.TimeoutError:
-            raise BulkheadFull(f"{self.name} at capacity")     # fail fast; never queue without bound
+            raise BulkheadFull(f"{self.name} at capacity")   # fail fast; never queue without bound
         try:
             return await fn(*args, **kw)
         finally:
-            self.sem.release()                                  # released on success, error or cancellation
+            self.sem.release()                                # released on success, error or cancellation
 
-# Little's law: concurrency = peak rate x tail latency, plus headroom. Illustrative numbers:
-# LLM 20 rps x 3 s = 60 -> cap 100; vector DB 40 rps x 0.05 s = 2 -> cap 10; CRM 5 rps x 0.3 s = 1.5 -> cap 20
-# (generous headroom for the CRM, but still a tenth of the 200-worker pool, so a hang can take at most 20).
-LLM = Bulkhead("llm", 100)
-VEC = Bulkhead("vector_db", 10)
+# Little's law: 5 rps x 0.3 s = 1.5 -> cap 20 of 200 workers; own client: httpx.Limits(max_connections=20)
 CRM = Bulkhead("crm_api", 20, max_wait=0.05)
 
-# Separate HTTP clients: the connection pool is a shared resource as well.
-llm_http = httpx.AsyncClient(limits=httpx.Limits(max_connections=100), timeout=30.0)
-crm_http = httpx.AsyncClient(limits=httpx.Limits(max_connections=20), timeout=5.0)
-
-async def handle(req):
-    docs = await VEC.run(search, req.query)
+async def main():
+    hung = [asyncio.create_task(CRM.run(asyncio.sleep, 30)) for _ in range(20)]  # CRM hangs
+    await asyncio.sleep(0.01)
     try:
-        account = await CRM.run(lookup_account, req.user_id)
-    except BulkheadFull:
-        account = None                                          # degrade: answer without CRM context
-    return await LLM.run(generate, req, docs, account)
+        await CRM.run(asyncio.sleep, 0)
+    except BulkheadFull as e:
+        print(e, "-> answer without CRM context")   # crm_api at capacity -> answer without CRM context
+
+asyncio.run(main())
 ```
 
 - **Outcome with the CRM hung:** at most 20 permits plus 20 connections are ever tied up; the other 180
@@ -296,37 +288,19 @@ async def run_tool_calls(calls, tools):
 
 - **A hung sandbox holds at most 8 workers,** however many runs ask for code execution at once; every
   other run gets `tool_busy` within 100 ms.
-- **The bulkhead does not end a hang.** Each tool still needs its own timeout (as the HTTP clients above
-  have), or the 8 runs holding permits wait forever and the compartment never frees.
+- **The bulkhead does not end a hang.** Each tool still needs its own timeout (for example 5 seconds on the
+  CRM's HTTP client), or the 8 runs holding permits wait forever and the compartment never frees.
 - **The model sees `tool_busy`** in the tool results and can finish the answer with the other tools.
 
-### Sizing calculator with the oversubscription check
-Runnable: computes normal demand, the latency each cap tolerates, and whether the healthy paths still fit
-when one compartment is pinned at its cap.
+### Sizing with the oversubscription check
+Little's law gives normal demand (`peak_rps × p99`), the cap tolerates average latency up to
+`cap / rps`, and the healthy paths must still fit when one compartment is pinned at its cap (pool 200).
 
-```python
-POOL = 200
-deps = {                      # name: (peak_rps, p99_latency_s, cap)
-    "llm":       (20, 3.0, 100),
-    "vector_db": (40, 0.05, 10),
-    "crm_api":   (5, 0.3, 20),
-}
-
-def demand(rps, latency):
-    return rps * latency      # Little's law: concurrency = rate x time in system
-
-for name, (rps, p99, cap) in deps.items():
-    print(f"{name}: normal {demand(rps, p99):.1f}, cap {cap}, "
-          f"sheds once avg latency > {cap / rps:.2f}s")
-
-for hung, (_, _, cap) in deps.items():   # pin one compartment at its cap
-    healthy = sum(demand(r, l) for n, (r, l, _) in deps.items() if n != hung)
-    left = POOL - cap
-    print(f"{hung} hung: {left} workers left, healthy paths need {healthy:.1f} -> "
-          f"{'ok' if left >= healthy else 'CASCADE'}")
-# crm_api: normal 1.5, cap 20, sheds once avg latency > 4.00s
-# crm_api hung: 180 workers left, healthy paths need 62.0 -> ok
-```
+| Dependency | Normal demand | Cap | Sheds once latency > | If pinned: workers left vs healthy demand |
+|---|---|---|---|---|
+| llm (20 rps, 3 s) | 60 | 100 | 5.00 s | 100 vs 3.5: ok |
+| vector_db (40 rps, 0.05 s) | 2 | 10 | 0.25 s | 190 vs 61.5: ok |
+| crm_api (5 rps, 0.3 s) | 1.5 | 20 | 4.00 s | 180 vs 62.0: ok |
 
 ### Worked scenario: the CRM hang, before and after
 | Quantity | Shared pool | With bulkheads |
@@ -366,6 +340,9 @@ fleet of 200 agent workers. Each run holds a worker for its whole duration.
 - **Namespace quotas for deployment bulkheads.** In Kubernetes, give each workload class or tenant tier its
   own namespace with a `ResourceQuota`, or its own node pool, so one class cannot schedule over another.
   Monitor quota usage and pending pods per namespace.
+- **Match each client's pool and timeout to its bulkhead.** For example the LLM client gets 100
+  connections and a 30 s timeout, the CRM client 20 connections and 5 s, so a hang holds no more
+  connections than permits.
 
 ## Trade-offs
 - **Isolation vs utilization.** Capacity in one compartment cannot be borrowed by another, so the CRM's 20

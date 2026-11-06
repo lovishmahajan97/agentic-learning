@@ -220,22 +220,19 @@ structured results. `agent_run` is the single-agent loop from the agentic-archit
 import asyncio, json
 
 READ_ONLY = ["search_docs", "fetch_page"]            # workers never receive write tools
-FAILED = {"answer": None, "sources": [], "confidence": 0.0}
 
-async def worker(run_id, subtask, budget_usd=0.10, retries=1):
+async def worker(run_id, subtask, retries=1):
     for attempt in range(retries + 1):               # independent worker -> retry it alone
         try:
-            result = await agent_run(
+            out = json.loads(await agent_run(
                 run_id=f"{run_id}/{subtask['id']}/{attempt}",   # child span under the parent run
-                system="Answer the sub-question using the tools. Return JSON: {answer, sources, confidence}. "
-                       "Use answer=null if the tools do not support an answer.",
-                task=json.dumps(subtask), tools=READ_ONLY, max_steps=6, budget_usd=budget_usd)
-            out = json.loads(result)
+                system="Answer from the tools as JSON {answer, sources, confidence}; answer=null if unsupported.",
+                task=json.dumps(subtask), tools=READ_ONLY, max_steps=6, budget_usd=0.10))
             if out.get("answer"):
                 return {"id": subtask["id"], **out}
         except (json.JSONDecodeError, TimeoutError):
             pass                                     # malformed or slow: a detectable failure
-    return {"id": subtask["id"], **FAILED}
+    return {"id": subtask["id"], "answer": None, "sources": [], "confidence": 0.0}
 
 async def supervise(run_id, question, max_workers=5):
     plan = call_model(f"Split into at most {max_workers} independent sub-questions as JSON "
@@ -247,10 +244,9 @@ async def supervise(run_id, question, max_workers=5):
     evidence = [r for r in results if r["answer"] and r["confidence"] >= 0.5]
     if len(evidence) < max(1, (len(plan) + 1) // 2):                    # quorum: a majority must succeed
         return {"status": "insufficient_evidence", "results": results}
-    synthesis = call_model("Synthesize an answer with citations from these findings only. Name any "
-                           "sub-question that has no finding:\n" + json.dumps(evidence)
-                           + f"\n\nQuestion: {question}").text
-    return {"status": "ok", "answer": synthesis, "sub_results": results}
+    return {"status": "ok", "sub_results": results, "answer": call_model(
+        "Synthesize an answer with citations from these findings only. Name any sub-question that has "
+        f"no finding:\n{json.dumps(evidence)}\n\nQuestion: {question}").text}
 ```
 
 The choices that matter:

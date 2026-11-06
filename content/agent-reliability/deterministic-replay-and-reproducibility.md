@@ -381,42 +381,31 @@ import hashlib, json
 def _h(obj):
     return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
-class NonDeterminismError(RuntimeError):
-    pass
+class NonDeterminismError(RuntimeError): pass
 
 class Effects:
     """Every non-deterministic boundary goes through `do`. Orchestration stays pure."""
     def __init__(self, mode: str, log: list[dict], live: dict):
         self.mode, self.log, self.live, self.i = mode, log, live, 0
-
     def do(self, kind: str, **inputs):
         key = _h({"kind": kind, **inputs})
-        if self.mode == "replay":
-            if self.i >= len(self.log):
-                raise NonDeterminismError(f"effect #{self.i} ({kind}) not in recording")
-            rec = self.log[self.i]
-            if rec["key"] != key:
-                raise NonDeterminismError(f"effect #{self.i}: recorded {rec['kind']}/{rec['key']}, got {kind}/{key}")
-            self.i += 1
-            return rec["output"]
-        out = self.live[kind](**inputs)                      # record mode: run it, then log it
-        self.log.append({"seq": self.i, "kind": kind, "key": key, "output": out}); self.i += 1
-        return out
+        if self.mode == "record":                    # run it live, then log it
+            self.log.append({"kind": kind, "key": key, "output": self.live[kind](**inputs)})
+        elif self.i >= len(self.log) or self.log[self.i]["key"] != key:
+            raise NonDeterminismError(f"effect #{self.i} ({kind}) does not match the recording")
+        self.i += 1
+        return self.log[self.i - 1]["output"]         # replay: served from the log, nothing called
 
 def agent(task: str, fx: Effects, max_steps: int = 8) -> str:
     messages = [{"role": "user", "content": f"{task} (today is {fx.do('clock')})"}]
     for _ in range(max_steps):
         resp = fx.do("llm", model="model-x@2026-06", messages=messages, temperature=0)
-        messages.append({"role": "assistant", "content": resp["text"], "tool_calls": resp.get("tool_calls", [])})
+        messages.append({"role": "assistant", "content": resp["text"]})
         if not resp.get("tool_calls"):
             return resp["text"]
         for call in resp["tool_calls"]:
-            result = fx.do("tool", name=call["name"], arguments=call["arguments"])
-            messages.append({"role": "tool", "name": call["name"], "content": result})
+            messages.append({"role": "tool", "content": fx.do("tool", **call)})
     return "step budget exhausted"
-
-# Record once against live services and persist `log`. Later, replay with no network at all:
-#   answer = agent(task, Effects("replay", log, live={}))   -> identical trajectory, step by step
 ```
 
 ### Record, replay and a refused replay (runnable)
@@ -431,16 +420,14 @@ def fake_llm(model, messages, temperature):
 
 live = {"clock": lambda: "2026-10-19T03:00", "llm": fake_llm,
         "tool": lambda name, arguments: {"status": "shipped"}}
-
 log = []
 print(agent("Where is o-7?", Effects("record", log, live)))       # Order o-7 shipped.
 print([r["kind"] for r in log])                                   # ['clock', 'llm', 'tool', 'llm']
 print(agent("Where is o-7?", Effects("replay", log, live={})))    # same answer, nothing called
-
 try:                                                              # input (or code) changed
     agent("Where is o-8?", Effects("replay", log, live={}))
 except NonDeterminismError as e:
-    print("refused:", e)                                          # effect #1: recorded llm/..., got llm/...
+    print("refused:", e)       # refused: effect #1 (llm) does not match the recording
 ```
 
 ### Budgeting N for the statistical grade

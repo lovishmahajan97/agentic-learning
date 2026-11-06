@@ -233,17 +233,10 @@ service later means a second `Tool` implementation that speaks HTTP; the loop do
 
 ```python
 # app/retrieval/api.py — the only module other packages may import from retrieval
-from dataclasses import dataclass
 from typing import Protocol
 
-@dataclass(frozen=True)
-class Passage:
-    doc_id: str
-    text: str
-    score: float
-
 class Retriever(Protocol):                      # the contract; unchanged by extraction
-    def search(self, tenant_id: str, query: str, k: int = 8) -> list[Passage]: ...
+    def search(self, tenant_id: str, query: str, k: int = 8) -> list[str]: ...
 
 # app/tools/api.py — every tool the model can call implements this
 class Tool(Protocol):
@@ -266,14 +259,18 @@ def run_agent(tenant_id: str, run_id: str, task: str, tools: dict[str, Tool], ll
             out = tools[call.name].run(tenant_id, call.args, f"{run_id}:{step}:{call.id}")
             messages.append({"role": "tool", "tool_call_id": call.id, "content": out})
     return "stopped: step budget reached"
+```
 
-# .importlinter — the build fails if the agent loop imports internals
-# [importlinter:contract:retrieval-is-private]
-# name = agent must not import retrieval internals
-# type = forbidden
-# source_modules = app.agent
-# forbidden_modules = app.retrieval.service
-# allow_indirect_imports = True
+The CI contract that fails the build if the agent loop imports internals:
+
+```ini
+# .importlinter
+[importlinter:contract:retrieval-is-private]
+name = agent must not import retrieval internals
+type = forbidden
+source_modules = app.agent
+forbidden_modules = app.retrieval.service
+allow_indirect_imports = True
 ```
 
 ### Hop calculator: what a proposed split costs
@@ -282,18 +279,11 @@ Run this before a design review to put numbers on a synchronous chain and a para
 ```python
 MINUTES_PER_MONTH = 30 * 24 * 60   # 43,200
 
-def chain(per_service: float, hops: int) -> tuple[float, float]:
-    avail = per_service ** hops                       # independent failures: the optimistic shape
-    downtime_h = (1 - avail) * MINUTES_PER_MONTH / 60
-    return avail, downtime_h
-
-def fanout_slow(n: int, p_slow: float = 0.01) -> float:
-    return 1 - (1 - p_slow) ** n                      # P(at least one callee beyond its p99)
-
 for hops in (1, 3, 5, 10):
-    a, h = chain(0.999, hops)
-    print(f"{hops:>2} hops: {a:.3%} available, ~{h:.1f} h/month down, "
-          f"fan-out slow {fanout_slow(hops):.1%}")
+    avail = 0.999 ** hops                       # independent failures: the optimistic shape
+    down_h = (1 - avail) * MINUTES_PER_MONTH / 60
+    slow = 1 - (1 - 0.01) ** hops               # fan-out: P(at least one callee beyond its p99)
+    print(f"{hops:>2} hops: {avail:.3%} available, ~{down_h:.1f} h/month down, fan-out slow {slow:.1%}")
 #  1 hops: 99.900% available, ~0.7 h/month down, fan-out slow 1.0%
 #  3 hops: 99.700% available, ~2.2 h/month down, fan-out slow 3.0%
 #  5 hops: 99.501% available, ~3.6 h/month down, fan-out slow 4.9%

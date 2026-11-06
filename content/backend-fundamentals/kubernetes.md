@@ -380,7 +380,7 @@ flowchart TD
 ```
 
 ## Examples
-### Deployment and Service for a GPU-backed inference API
+### Deployment for a GPU-backed inference API
 - **Capacity:** the rollout never drops below three ready replicas.
 - **Startup:** the startup probe allows up to ten minutes of model loading before liveness checks begin.
 - **Traffic:** the readiness endpoint gates it.
@@ -399,68 +399,52 @@ spec:
     metadata: {labels: {app: llm-api}}
     spec:
       terminationGracePeriodSeconds: 120       # let long streaming responses finish
-      nodeSelector: {accelerator: nvidia-l4}
-      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]   # GPU nodes are tainted
       containers:
       - name: api
         image: registry.example.com/llm-api@sha256:3f9c...   # immutable digest, not :latest
-        ports: [{containerPort: 8000}]
-        envFrom: [{secretRef: {name: llm-api-secrets}}]   # frozen at start; mount as files for hot rotation
         resources:
           requests: {cpu: "2", memory: 8Gi, nvidia.com/gpu: 1}
           limits:   {memory: 8Gi, nvidia.com/gpu: 1}          # no CPU limit: avoids throttling
-        startupProbe:                            # model load may take minutes
-          httpGet: {path: /health, port: 8000}
-          periodSeconds: 10
-          failureThreshold: 60                   # up to 10 min before giving up
-        readinessProbe:
-          httpGet: {path: /ready, port: 8000}    # 200 only after the model is loaded and warm
-          periodSeconds: 5
-        livenessProbe:
-          httpGet: {path: /health, port: 8000}   # cheap, no downstream calls
-          periodSeconds: 30
-        lifecycle:
-          preStop: {exec: {command: ["sleep", "5"]}}   # let endpoint removal propagate
----
-apiVersion: v1
-kind: Service
-metadata: {name: llm-api}
-spec:
-  selector: {app: llm-api}
-  ports: [{port: 80, targetPort: 8000}]
+        startupProbe:                            # 10 s x 60 failures = up to 10 min of model loading
+          {httpGet: {path: /health, port: 8000}, periodSeconds: 10, failureThreshold: 60}
+        readinessProbe:                          # 200 only after the model is loaded and warm
+          {httpGet: {path: /ready, port: 8000}, periodSeconds: 5}
+        livenessProbe:                           # cheap, no downstream calls
+          {httpGet: {path: /health, port: 8000}, periodSeconds: 30}
+        lifecycle: {preStop: {exec: {command: ["sleep", "5"]}}}   # let endpoint removal propagate
 ```
+
+A Service with `selector: {app: llm-api}` and `ports: [{port: 80, targetPort: 8000}]` gives the replicas one
+stable address.
 
 ### A level-triggered reconcile loop you can run
 A toy Deployment controller with `maxSurge` 1. Each step looks only at the current state, so when a node
 dies mid-rollout it does not need to replay the lost event: the next diff simply includes the missing Pod.
 
 ```python
-MAX_SURGE = 1
 desired = {"replicas": 3, "image": "v2"}
+MAX_SURGE = 1
 pods = ["v1", "v1", "v1"]                      # observed: 3 Pods on the old image
 
 def reconcile(pods):
-    """One level-triggered step: compute the current diff and take ONE action."""
+    """One level-triggered step: diff current state against desired, take ONE action."""
     new = [p for p in pods if p == desired["image"]]
     old = [p for p in pods if p != desired["image"]]
     if len(new) < desired["replicas"] and len(pods) < desired["replicas"] + MAX_SURGE:
         return pods + [desired["image"]], "create new Pod"
     if old:
-        pods = pods.copy(); pods.remove(old[0])
-        return pods, "delete one old Pod"
-    if len(new) > desired["replicas"]:
-        return pods[1:], "scale down extra Pod"
+        return old[1:] + new, "delete one old Pod"
     return pods, "in sync"
 
 for step in range(10):
     if step == 3:
         pods = pods[1:]                        # a node dies: one Pod vanishes, no event replayed
-        print("   !! lost a Pod:", pods)
     pods, action = reconcile(pods)
-    print(f"{step}: {action:22} {pods}")
+    print(f"{step}: {action:18} {pods}")
     if action == "in sync":
         break
-# Converges to ['v2', 'v2', 'v2'] in six steps despite the lost Pod.
+# Step 3 (after the lost Pod) just creates another v2; step 5 prints: in sync ['v2', 'v2', 'v2']
 ```
 
 ### Worked scenario: the termination and startup timelines of the manifest above
@@ -530,6 +514,10 @@ Checkpointing turns "raise the grace period forever" into a bounded, per-step bu
   defaults do not), so test a denied connection after enabling.
 - **Evals as CronJobs on the production image.** Run the agent eval suite nightly as a CronJob pinned to the
   deployed digest, writing scores to your metrics store. Alert when a score drops versus the last run.
+- **Schedule GPU Pods onto their pool explicitly.** Pair the `nvidia.com/gpu` toleration with a
+  `nodeSelector` such as `accelerator: nvidia-l4`, and load secrets with `envFrom: [{secretRef: ...}]` only
+  if a restart on rotation is acceptable: env values are frozen at container start, so mount secrets as
+  files for hot rotation.
 
 ## Trade-offs
 - **Declarative reconciliation vs operating cost.** Self-healing and repeatable deploys, paid for with a large

@@ -173,34 +173,28 @@ stubs for your encoder, vector store and chunker.
 ```python
 from collections import defaultdict
 
-parents = {}                                   # parent_id -> {"text": ..., "doc": ...}
+parents = {}                                   # parent_id -> section text; parents are never embedded
 
-def ingest(doc_id, text):
-    # split by heading yields (heading_path, section_text) pairs, e.g. ("API > Search", "...")
+def ingest(doc_id, text):                      # split yields (heading_path, section_text) pairs
     for p_i, (heading, section) in enumerate(split(text, by="heading", max_tokens=1500)):
         pid = f"{doc_id}#p{p_i}"
-        parents[pid] = {"text": section, "doc": doc_id}
+        parents[pid] = section
         for c_i, child in enumerate(split(section, max_tokens=200)):
             index.add(id=f"{pid}#c{c_i}",
-                      vector=embed(f"{heading}\n{child}", kind="passage"),  # heading aids matching
-                      meta={"parent_id": pid, "child_text": child})         # bare child for citing
+                      vector=embed(f"{heading}\n{child}", kind="passage"),         # heading aids matching
+                      meta={"parent_id": pid, "heading": heading, "child_text": child})  # bare child cited
 
 def retrieve_parents(query, k_children=20, n_parents=4):
-    hits = index.search(embed(query, kind="query"), k_children)   # [(score, meta)]
     by_parent = defaultdict(list)
-    for score, meta in hits:
+    for score, meta in index.search(embed(query, kind="query"), k_children):   # [(score, meta)]
         by_parent[meta["parent_id"]].append((score, meta["child_text"]))
     ranked = sorted(by_parent.items(), key=lambda kv: max(s for s, _ in kv[1]), reverse=True)
-    out = []
-    for pid, children in ranked[:n_parents]:
-        out.append({"parent_id": pid, "text": parents[pid]["text"],
-                    "matched_spans": [t for _, t in children]})   # keep spans for citations
-    return out
+    return [{"parent_id": pid, "text": parents[pid], "matched_spans": [t for _, t in hits]}
+            for pid, hits in ranked[:n_parents]]                  # send parents, cite matched spans
 
 ctx = retrieve_parents("What is the rate limit for the search endpoint on the Pro plan?")
-# A short child "Pro plan: 50 requests/minute, bursts to 100 for 10 s" scores highest; the
-# generator receives its 1,500-token parent section, which also names the endpoint and the
-# exceptions, and the citation points at the matched child span rather than the whole section.
+# The child "Pro plan: 50 requests/minute, bursts to 100 for 10 s" scores highest; the generator gets
+# its 1,500-token parent section, and the citation points at the matched child span.
 ```
 
 ### Runnable: three aggregation rules, three different winners
@@ -241,33 +235,22 @@ Illustrative, using the manual above with a 6,000-token evidence budget:
 | Whole document as parent | ~25k-token manual | 0 | overflow |
 
 ### Agent scenario: snippets first, sections on demand
-Two tools over the same two stores; `index`, `embed` and `parents` are as in the ingestion example, with
-one addition: `ingest` also stores `"heading": heading` in each child's `meta`, so snippets can show it.
+Two tools over the same two stores; `index`, `embed` and `parents` are as in the ingestion example. The
+docstrings double as the tool descriptions the agent sees.
 
 ```python
-TOOLS = [
-    {"name": "search_manual",
-     "description": "Search the product manuals. Returns short matched snippets with a section id and "
-                    "heading path. Call read_section before answering from a snippet that lacks the plan, "
-                    "endpoint, table header or exceptions.",
-     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
-                      "required": ["query"]}},
-    {"name": "read_section",
-     "description": "Return the full text of one manual section by its section id.",
-     "input_schema": {"type": "object", "properties": {"section_id": {"type": "string"}},
-                      "required": ["section_id"]}},
-]
-
 def search_manual(query, k_children=20, max_snippets=8):
+    """Search the product manuals. Returns short snippets with a section id and heading path. Call
+    read_section before answering from a snippet that lacks the plan, endpoint, table header or exceptions."""
     hits = index.search(embed(query, kind="query"), k_children)          # [(score, meta)]
-    return [{"section_id": m["parent_id"], "heading": m.get("heading", ""),
-             "snippet": m["child_text"]} for _, m in hits[:max_snippets]]
+    return [{"section_id": m["parent_id"], "heading": m["heading"], "snippet": m["child_text"]}
+            for _, m in hits[:max_snippets]]
 
 def read_section(section_id):
-    p = parents.get(section_id)
-    if p is None:                                    # store drift: say so, never return empty text
+    """Return the full text of one manual section by its section id."""
+    if section_id not in parents:                    # store drift: say so, never return empty text
         return {"status": "not_found", "section_id": section_id}
-    return {"status": "ok", "section_id": section_id, "text": p["text"]}
+    return {"status": "ok", "section_id": section_id, "text": parents[section_id]}
 ```
 
 Illustrative transcript cost for a task with 4 searches, using ~200-token children and ~1,200-token

@@ -213,24 +213,18 @@ scrubbed before it returns to the loop. The model-facing loop never imports this
 ```python
 import re
 
-class CredentialBroker:
-    """Lives in the tool-executor process only. Durable material stays in the vault."""
+class CredentialBroker:                                     # tool-executor process only
     def __init__(self, vault, oauth):
         self.vault, self.oauth = vault, oauth
 
     def access_token(self, ctx, integration, scopes):
-        path = f"tenants/{ctx.tenant_id}/users/{ctx.user_id}/{integration}/refresh_token"
-        refresh = self.vault.read(path)                     # decrypted with the tenant's key
-        tok = self.oauth.exchange(refresh, scope=" ".join(sorted(scopes)))
-        # lifetime (expires_in) is decided by the authorization server; configure it to minutes there
+        refresh = self.vault.read(f"tenants/{ctx.tenant_id}/users/{ctx.user_id}/{integration}/refresh_token")
         self.vault.audit(run_id=ctx.run_id, integration=integration, scopes=scopes)
-        return tok                                          # short-lived, down-scoped, never logged
+        return self.oauth.exchange(refresh, scope=" ".join(sorted(scopes)))  # short-lived, never logged
 
-TOOL_SCHEMA = {                                             # what the model sees: no secret-shaped fields
-    "name": "crm_search",
-    "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
-                     "required": ["query"], "additionalProperties": False},
-}
+TOOL_SCHEMA = {"name": "crm_search",                        # what the model sees: no secret-shaped fields
+               "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+                                "required": ["query"], "additionalProperties": False}}
 
 SECRET_RE = re.compile(r"(sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|eyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,})")
 
@@ -244,11 +238,7 @@ def run_crm_search(ctx, args, broker, http):
     return {"status": r.status_code, "body": scrub(r.text)[:20_000]}
 
 # Sandbox side: generated code only ever sees this; the proxy adds auth for allow-listed hosts.
-# For HTTPS the proxy must terminate TLS with a CA the sandbox trusts (SSL_CERT_FILE); a plain
-# CONNECT tunnel is opaque end to end and nothing can be injected into it.
 SANDBOX_ENV = {"HTTPS_PROXY": "http://egress-proxy:3128", "SSL_CERT_FILE": "/etc/egress-ca.pem"}
-# The allow-list and per-host method/path rules live in the proxy's config, not in the sandbox:
-# anything the sandbox can read, generated code can read and rewrite.
 ```
 
 ### Worked trace: one injection through the zones
@@ -309,6 +299,10 @@ with tempfile.TemporaryDirectory() as fs:
   and any cross-tenant key use.
 - **Scrubber hits as an alert** — always on. Count every redaction by tool and source, and page on any hit,
   because a non-zero count means something upstream is returning secrets.
+- **Token lifetime and proxy rules live outside the agent** — always. The access token's `expires_in` is set
+  by the authorization server, so configure minutes there; keep the egress allow-list and per-host
+  method and path rules in the proxy's config, since anything the sandbox can read, generated code can read
+  and rewrite. A plain CONNECT tunnel is opaque end to end, so header injection needs TLS termination.
 
 ## Trade-offs
 - **Per-call minting vs stored tokens.** A short-lived token per call bounds any leak to minutes and one

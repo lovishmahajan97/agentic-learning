@@ -168,30 +168,25 @@ import tiktoken
 
 enc = tiktoken.get_encoding("cl100k_base")          # stand-in; use your model's tokenizer
 count = lambda s: len(enc.encode(s))
-
 WINDOW, MAX_OUT, TEMPLATE_OVERHEAD = 8_192, 800, 64  # overhead: role markers, illustrative
 
 def fit_history(system, chunks, history, question):
     fixed = count(system) + sum(map(count, chunks)) + count(question) + TEMPLATE_OVERHEAD
     budget = WINDOW - MAX_OUT - fixed
-    if budget < 0:
-        raise ValueError(f"fixed parts exceed window by {-budget} tokens: trim chunks")
     kept = []
     for turn in reversed(history):                  # newest turns are worth the most
-        n = count(turn)
-        if n > budget:
+        if count(turn) > budget:
             break
-        kept.insert(0, turn); budget -= n
+        kept.insert(0, turn); budget -= count(turn)
     return kept, budget
 
 system = "You are a support assistant. " * 60                 # ~360 tokens
-chunks = ["Policy section ... " * 120 for _ in range(6)]        # 6 chunks, ~360 tokens each
+chunks = ["Policy section ... " * 120] * 6                    # 6 chunks, ~360 tokens each
 history = [f"turn {i}: " + "words " * 250 for i in range(20)]  # ~250 tokens per turn
 kept, left = fit_history(system, chunks, history, "How do I get a refund?")
 print(f"kept {len(kept)} of {len(history)} turns, {left} tokens spare")
-# Roughly: fixed parts ~2,600 tokens, so ~4,800 remain for history and about 18 of the 20
-# ~250-token turns survive. Dropping the oldest turns is the crude option; summarizing them is the
-# usual upgrade, and it is what you would do before ever cutting the system prompt or chunks.
+# kept 18 of 20 turns, 204 tokens spare (fixed parts ~2,600 tokens)
+# Summarizing the dropped turns is the usual upgrade, before ever cutting the system prompt or chunks.
 ```
 
 ### Compacting an agent loop's tool outputs

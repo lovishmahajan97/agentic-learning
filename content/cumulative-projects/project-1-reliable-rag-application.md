@@ -205,47 +205,29 @@ DOCS = {  # doc_id -> text; in the project this comes from your ingestion step
                 "and costs 15 dollars.",
     "security": "Passwords must be rotated every 90 days. Two-factor authentication is required for admins.",
 }
-
-def chunk(doc_id, text, size=12, overlap=4):          # word windows; swap for structure-aware chunking
-    w = text.split()
-    return [{"id": f"{doc_id}#{i}", "doc": doc_id, "text": " ".join(w[i:i + size])}
-            for i in range(0, max(len(w) - overlap, 1), size - overlap)]
-
 tok = lambda s: re.findall(r"[a-z0-9]+", s.lower())
-CHUNKS = [c for d, t in DOCS.items() for c in chunk(d, t)]
-DF = Counter(t for c in CHUNKS for t in set(tok(c["text"])))
+W = {d: t.split() for d, t in DOCS.items()}             # 12-word windows, 4 overlap, stable ids doc#offset
+CHUNKS = {f"{d}#{i}": " ".join(w[i:i + 12]) for d, w in W.items() for i in range(0, max(len(w) - 4, 1), 8)}
+DF = Counter(t for text in CHUNKS.values() for t in set(tok(text)))
 
-def retrieve(q, k=2):                                   # BM25-lite; replace with hybrid search later
-    def score(c):
-        tf = Counter(tok(c["text"]))
-        return sum(tf[t] * math.log(1 + len(CHUNKS) / DF[t]) for t in set(tok(q)) if t in tf)
-    return [c for c in sorted(CHUNKS, key=score, reverse=True)[:k] if score(c) > 0]
+def score(q, text):                                     # BM25-lite; replace with hybrid search later
+    tf = Counter(tok(text))
+    return sum(tf[t] * math.log(1 + len(CHUNKS) / DF[t]) for t in set(tok(q)) if t in tf)
 
-def answer(q):                                          # stand-in for the LLM call: must cite or abstain
-    hits = retrieve(q)
-    if not hits:
-        return {"answer": "I don't know from the provided documents.", "citations": []}
-    return {"answer": hits[0]["text"], "citations": [h["id"] for h in hits]}
-
-GOLDEN = [  # question, doc that must be retrieved, phrase the answer must contain (None = must abstain)
-    ("How long do refunds take?", "refund-policy", "14 days"),
-    ("How much does express shipping cost?", "shipping", "15 dollars"),
-    ("How often must passwords rotate?", "security", "90 days"),
-    ("What is the CEO's salary?", None, None),
-]
-rows = []
+def answer(q, k=2):                                     # stand-in for the LLM call: must cite or abstain
+    hits = [c for c in sorted(CHUNKS, key=lambda c: -score(q, CHUNKS[c]))[:k] if score(q, CHUNKS[c]) > 0]
+    return {"answer": CHUNKS[hits[0]] if hits else "I don't know.", "citations": hits}
+GOLDEN = [("How long do refunds take?", "refund-policy", "14 days"),  # None = must abstain
+          ("How much does express shipping cost?", "shipping", "15 dollars"),
+          ("How often must passwords rotate?", "security", "90 days"), ("What is the CEO's salary?", None, None)]
 for q, doc, must in GOLDEN:
     out = answer(q)
-    docs = {c.split("#")[0] for c in out["citations"]}
-    rows.append((doc is None or doc in docs,                       # retrieval hit@2
-                 (must is None and not out["citations"]) or (must is not None and must in out["answer"])))
-print(f"chunks={len(CHUNKS)} hit@2={sum(r[0] for r in rows)}/{len(rows)} "
-      f"answer_correct={sum(r[1] for r in rows)}/{len(rows)}")
-for (q, *_), (hit, ok) in zip(GOLDEN, rows):
-    print(f"{'PASS' if hit and ok else 'FAIL'}  {q}")
+    hit = doc is None or doc in {c.split("#")[0] for c in out["citations"]}   # retrieval hit@2
+    ok = not out["citations"] if must is None else must in out["answer"]       # answer correct
+    print(f"hit={hit} correct={ok}  {q}")
 ```
 
-Run on Python 3.9, it prints `chunks=7 hit@2=4/4 answer_correct=2/4`. The two failures are the lesson:
+Run on Python 3.9, every row prints `hit=True`, but two print `correct=False`. Those two are the lesson:
 - **Express shipping.** The right document is found, but "costs 15 dollars" sits in the next chunk and
   "cost" does not match "costs", so only the first chunk is retrieved.
 - **CEO salary.** The common word "is" matches the security chunk, so the app cites it instead of abstaining.

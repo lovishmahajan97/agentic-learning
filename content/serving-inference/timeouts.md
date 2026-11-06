@@ -184,20 +184,14 @@ class Deadline:
     def remaining(self) -> float:
         return self.at - time.monotonic()
 
-async def step(name, duration, deadline, min_useful=0.2):
-    left = deadline.remaining()
-    if left < min_useful:                             # fail fast instead of starting doomed work
-        raise TimeoutError(f"skipped {name}: only {left:.1f}s left")
-    await asyncio.wait_for(asyncio.sleep(duration), timeout=left)   # never longer than what is left
-    return name
-
-async def agent(budget_s=1.0):
+async def agent(budget_s=1.0, min_useful=0.2):
     d, done = Deadline(budget_s), []
-    try:
-        for name, dur in [("plan", 0.3), ("search", 0.2), ("draft", 0.4), ("review", 0.3)]:
-            done.append(await step(name, dur, d))
-    except (TimeoutError, asyncio.TimeoutError) as e:
-        return done, f"partial ({e})"
+    for name, dur in [("plan", 0.3), ("search", 0.2), ("draft", 0.4), ("review", 0.3)]:
+        left = d.remaining()
+        if left < min_useful:                         # fail fast instead of starting doomed work
+            return done, f"partial (skipped {name}: only {left:.1f}s left)"
+        await asyncio.wait_for(asyncio.sleep(dur), timeout=left)   # never longer than what is left
+        done.append(name)
     return done, "complete"
 
 print(asyncio.run(agent()))
@@ -213,8 +207,7 @@ timer, an idle timer that resets on every line (heartbeats included), and a tota
   turns a stuck queue into an error after 15 s instead of 46.
 
 ```python
-import asyncio, json, time
-import httpx
+import asyncio, json, time, httpx
 
 TTFT_P99, TPOT_P99 = 8.0, 0.05            # measured for this model and traffic, in seconds
 FIRST_TOKEN, IDLE = 15.0, 20.0
@@ -224,32 +217,22 @@ def call_budget(max_tokens: int) -> float:
 
 async def stream_completion(client: httpx.AsyncClient, payload: dict, deadline: float) -> str:
     budget = min(call_budget(payload["max_tokens"]), deadline - time.monotonic())
-    if budget < 2.0:
-        raise TimeoutError("not enough budget left to start this call")
-    first_by = time.monotonic() + FIRST_TOKEN
+    first_by, text = time.monotonic() + FIRST_TOKEN, []
     timeout = httpx.Timeout(connect=3.0, read=IDLE + 5, write=10.0, pool=3.0)  # socket backstop
-    text = []
-    try:
-        async with asyncio.timeout(budget):                       # total deadline (Python 3.11+)
-            async with client.stream("POST", "/v1/chat/completions",
-                                     json={**payload, "stream": True}, timeout=timeout) as r:
-                r.raise_for_status()
-                lines = r.aiter_lines()
-                while True:
-                    wait = IDLE if text else min(IDLE, first_by - time.monotonic())
-                    try:
-                        line = await asyncio.wait_for(anext(lines), max(wait, 0.0))
-                    except StopAsyncIteration:
-                        break
-                    if not line.startswith("data: ") or line == "data: [DONE]":
-                        continue                                  # heartbeats reset IDLE only
+    async with asyncio.timeout(budget):                           # total deadline (Python 3.11+)
+        async with client.stream("POST", "/v1/chat/completions",
+                                 json={**payload, "stream": True}, timeout=timeout) as r:
+            lines = r.aiter_lines()
+            while True:
+                wait = IDLE if text else min(IDLE, first_by - time.monotonic())   # first-token is cumulative
+                try:
+                    line = await asyncio.wait_for(anext(lines), max(wait, 0.0))
+                except StopAsyncIteration:
+                    break
+                if line.startswith("data: ") and line != "data: [DONE]":   # heartbeats reset IDLE only
                     delta = json.loads(line[6:])["choices"][0]["delta"].get("content")
                     if delta: text.append(delta)
-    except (TimeoutError, httpx.TimeoutException) as e:
-        # leaving `client.stream` closed the connection: the upstream's only signal to stop decoding
-        phase = "first-token" if not text else "idle-or-total"
-        raise TimeoutError(f"{phase} timeout after {len(text)} chunks") from e
-    return "".join(text)
+    return "".join(text)   # timeouts raise TimeoutError; exiting `client.stream` closes the connection
 ```
 
 ### Agent scenario: a tool timeout returned to the model
@@ -315,6 +298,10 @@ call, then raise the idle timeout on hops you own.
   fallback share.
 - **Label timeouts by cause.** Emit first-token, idle and total timeouts as separate metric labels per
   layer; a rise in first-token timeouts is usually the first visible sign of upstream overload.
+- **Refuse calls the budget cannot finish.** If less than a minimum useful budget remains (about 2 s for
+  an LLM call), raise a timeout before connecting instead of starting doomed work.
+- **Check status before reading the stream.** Call `raise_for_status()` on the streamed response so an
+  HTTP error is not mistaken for an empty answer or a first-token timeout.
 
 ## Trade-offs
 - **Short first-token timeout vs bursts.** It fails fast and enables cheap fallback, but under a traffic

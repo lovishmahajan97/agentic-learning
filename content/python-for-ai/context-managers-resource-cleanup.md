@@ -342,26 +342,18 @@ async def resource(kind: str, name: str):
     try:
         yield f"{kind}:{name}"
     finally:
-        await asyncio.sleep(0)                       # async teardown: stop container, close session
-        print(f"close {kind}:{name}")
+        print(f"close {kind}:{name}")                # stop container, close session
 
-async def agent_run(task: str, servers: list[str], fail: bool = False) -> str:
+async def agent_run(task: str, servers: list[str]) -> str:
     async with AsyncExitStack() as stack:
-        await stack.enter_async_context(resource("span", task))         # trace span for the run
         sandbox = await stack.enter_async_context(resource("sandbox", "py"))
-        sessions = [await stack.enter_async_context(resource("mcp", s)) for s in servers]
-        await asyncio.sleep(0.05)                    # model and tool steps would run here
-        if fail:
-            raise RuntimeError("tool returned malformed output")
-        return f"done with {sandbox} and {len(sessions)} servers"
+        for s in servers:                            # how many is only known at runtime
+            await stack.enter_async_context(resource("mcp", s))
+        await asyncio.sleep(1)                       # model and tool steps would run here
+        return f"done with {sandbox}"
 
 async def main():
-    print(await agent_run("triage", ["github", "jira"]))
-    try:
-        await agent_run("triage", ["github"], fail=True)
-    except RuntimeError as e:
-        print("run failed:", e)
-    t = asyncio.create_task(agent_run("long", ["github", "jira"]))
+    t = asyncio.create_task(agent_run("triage", ["github", "jira"]))
     await asyncio.sleep(0.01); t.cancel()            # user pressed Stop
     try:
         await t
@@ -369,65 +361,18 @@ async def main():
         print("run cancelled")
 
 asyncio.run(main())
+# open sandbox:py, open mcp:github, open mcp:jira, close mcp:jira, close mcp:github, close sandbox:py, run cancelled
 ```
 
-- **Every path closes everything:** success, the raised tool error and the cancellation all print the same
-  `close` lines, newest first, so the MCP sessions close before the sandbox and the span ends last.
+- **Every path closes everything:** the cancellation prints the `close` lines newest first, so the MCP
+  sessions close before the sandbox; a normal return or a raised tool error takes the same path.
 - **The list of servers is data**, which is why `AsyncExitStack` beats nested `async with` here.
 
-### App lifespan with AsyncExitStack
-Two process-scoped clients opened in a lifespan; a crash mid-request still closes both, in reverse order.
-
-```python
-import asyncio
-from contextlib import AsyncExitStack, asynccontextmanager
-
-class Client:                              # stands in for httpx.AsyncClient, a DB pool
-    def __init__(self, name: str): self.name = name
-    async def aclose(self): print(f"{self.name}: closed")
-
-@asynccontextmanager
-async def open_client(name: str):
-    client = Client(name)
-    print(f"{name}: opened")
-    try:
-        yield client
-    finally:
-        await client.aclose()              # runs on success, error or cancellation
-
-@asynccontextmanager
-async def lifespan(app=None):              # FastAPI calls lifespan(app) with this shape
-    async with AsyncExitStack() as stack:
-        llm = await stack.enter_async_context(open_client("llm-http"))
-        db = await stack.enter_async_context(open_client("vector-db"))
-        yield {"llm": llm, "db": db}
-
-async def main() -> None:
-    try:
-        async with lifespan() as deps:
-            print("serving with", sorted(deps))
-            raise RuntimeError("crash mid-request")
-    except RuntimeError as exc:
-        print("propagated:", exc)
-
-asyncio.run(main())
-```
-
-**Output, in order:**
-1. `llm-http: opened`, `vector-db: opened`, `serving with ['db', 'llm']`.
-2. `vector-db: closed` then `llm-http: closed`, in reverse order.
-3. `propagated: crash mid-request`.
-
-- **The error is not suppressed**, both clients are closed, and the dependency opened last is closed first.
-- **The clients are created once per process**, not once per request or agent run, which is the point of
-  putting them in a lifespan.
-
-### Guarding partial setup, plus a timing span that is also a decorator
+### Guarding partial setup with `ExitStack.pop_all()`
 A class that acquires two resources in `__enter__` uses an `ExitStack` so a failure on the second closes
 the first, then hands the stack over with `pop_all()`. Runs on Python 3.9+.
 
 ```python
-import time
 from contextlib import ExitStack, contextmanager
 
 @contextmanager
@@ -443,39 +388,21 @@ def resource(name: str, fail: bool = False):
 class Pipeline:                               # acquires two resources in __enter__
     def __init__(self, fail_second: bool = False):
         self.fail_second = fail_second
-
     def __enter__(self):
         with ExitStack() as stack:
             self.llm = stack.enter_context(resource("llm"))
             self.db = stack.enter_context(resource("db", fail=self.fail_second))
             self._stack = stack.pop_all()     # success: keep both open past this block
         return self                           # failure: the with above closes llm
-
     def __exit__(self, *exc):
         return self._stack.__exit__(*exc)     # unwind in reverse order
 
-@contextmanager
-def timed_span(name: str):
-    start = time.perf_counter()
-    try:
-        yield
-    finally:
-        print(f"{name}: {(time.perf_counter() - start) * 1000:.0f} ms")
-
-@timed_span("embed")                          # also works as a decorator, fresh generator per call
-def embed(texts: list[str]) -> int:
-    time.sleep(0.05)
-    return len(texts)
-
-with Pipeline():
-    print(embed(["a", "b"]))
+with Pipeline(): pass             # llm: opened / db: opened / db: closed / llm: closed
 try:
     with Pipeline(fail_second=True):
         pass
 except ConnectionError as exc:
-    print("setup failed:", exc)
-# llm: opened / db: opened / embed: 50 ms (about) / 2 / db: closed / llm: closed
-# llm: opened / llm: closed / setup failed: db: connect failed
+    print("setup failed:", exc)   # llm: opened / llm: closed / setup failed: db: connect failed
 ```
 
 Without the `ExitStack` in `__enter__`, the failing run would leak `llm`, because `__exit__` never runs

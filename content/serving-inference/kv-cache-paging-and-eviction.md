@@ -182,49 +182,37 @@ it shows the bookkeeping that makes paging and eviction work.
 ```python
 from collections import OrderedDict
 
-BLOCK = 16                      # tokens per block
+BLOCK = 16                                 # tokens per block
+free = list(range(4))                      # a 4-block pool
+cached = OrderedDict()                     # content_hash -> unreferenced block, LRU order
 
-class Pool:
-    def __init__(self, n_blocks):
-        self.free = list(range(n_blocks))
-        self.refs = {}                 # physical block -> reference count
-        self.cached = OrderedDict()    # content_hash -> block, LRU order (ref 0)
+def alloc():
+    if not free and cached:                # evict the least-recently-used cached block
+        free.append(cached.popitem(last=False)[1])
+    if not free:
+        raise MemoryError("pool exhausted: preempt a sequence")
+    return free.pop()
 
-    def alloc(self):
-        if not self.free and self.cached:            # evict an unreferenced cached block
-            _, blk = self.cached.popitem(last=False)
-            self.free.append(blk)
-        if not self.free:
-            raise MemoryError("pool exhausted: preempt a sequence")
-        blk = self.free.pop(); self.refs[blk] = 1
-        return blk
+def append_tokens(table, n_now, k):        # a block table grows one block per 16 tokens
+    for n in range(n_now, n_now + k):
+        if n % BLOCK == 0:
+            table.append(alloc())
 
-    def release(self, blk, content_hash=None):
-        self.refs[blk] -= 1
-        if self.refs[blk] == 0:
-            if content_hash: self.cached[content_hash] = blk   # keep for prefix reuse
-            else: self.free.append(blk)
-
-class Seq:
-    def __init__(self, pool): self.pool, self.table, self.n = pool, [], 0
-    def append_token(self):
-        if self.n % BLOCK == 0: self.table.append(self.pool.alloc())
-        self.n += 1
-
-pool = Pool(n_blocks=4)
-a, b = Seq(pool), Seq(pool)
-for _ in range(40): a.append_token()           # a uses 3 blocks (last one 8/16 full)
-for _ in range(16): b.append_token()           # b uses the 4th block; pool is now full
+a, b = [], []
+append_tokens(a, 0, 40)                    # a uses 3 blocks (last one 8/16 full)
+append_tokens(b, 0, 16)                    # b uses the 4th block; pool is now full
 try:
-    b.append_token()                           # needs a 5th block -> no free, no cached
+    append_tokens(b, 16, 1)                # needs a 5th block: no free, no cached
 except MemoryError as e:
-    print(e)                                   # scheduler would now preempt b (recompute or swap)
+    print(e)                               # pool exhausted: preempt a sequence
+cached["a-prefix"] = a.pop()               # a releases its last block with a content hash
+append_tokens(b, 16, 1); print(b)          # b now evicts it instead of raising: [0, 1]
 ```
 
 - **Capacity:** 4 blocks of 16 tokens hold 64 tokens; internal waste is the 8 empty slots in `a`'s last
   block.
-- **With reuse:** if `a` had finished and released its blocks with a content hash, `b`'s next allocation
-  would have evicted the least-recently-used of them instead of raising.
+- **With reuse:** a block released with a content hash stays cached at reference count 0, so the next
+  allocation evicts the least-recently-used of them instead of raising.
 
 ### Worked scenario: contiguous versus paged at real scale
 `max_model_len` 8,192, an 8B GQA model at 128 KB per token, and a request that stops after 600 tokens.
@@ -243,23 +231,19 @@ Illustrative lower bounds: recompute counts only the matmul term at ~900 TFLOPs 
 quadratic term on top), and swap assumes ~25 GB/s of effective host-link bandwidth each way.
 
 ```python
-FLOPS, PCIE = 900e12, 25e9              # illustrative hardware figures
+FLOPS, PCIE = 900e12, 25e9                 # illustrative hardware figures
 
-def recompute_ms(params_b, tokens):     # matmul term only; attention grows quadratically on top
+def recompute_ms(params_b, tokens):        # matmul term only
     return 2 * params_b * 1e9 * tokens / FLOPS * 1e3
 
-def swap_ms(kv_bytes_per_token, tokens):  # out to host and back in
+def swap_ms(kv_bytes_per_token, tokens):   # out to host and back in
     return 2 * kv_bytes_per_token * tokens / PCIE * 1e3
 
-GQA, MHA = 128 * 1024, 512 * 1024       # 8B-class GQA vs 7B-class MHA, fp16 cache
-for name, kv, params in [("GQA 8B", GQA, 8), ("MHA 7B", MHA, 7)]:
-    for t in (4_000, 32_000):
-        print(f"{name} {t:>6} tokens: recompute >= {recompute_ms(params, t):4.0f} ms, "
-              f"swap ~ {swap_ms(kv, t):4.0f} ms")
-# GQA 8B   4000 tokens: recompute >=   71 ms, swap ~   42 ms
-# GQA 8B  32000 tokens: recompute >=  569 ms, swap ~  336 ms
-# MHA 7B   4000 tokens: recompute >=   62 ms, swap ~  168 ms
-# MHA 7B  32000 tokens: recompute >=  498 ms, swap ~ 1342 ms
+for name, kv, params in [("GQA 8B", 128 * 1024, 8), ("MHA 7B", 512 * 1024, 7)]:
+    t = 32_000
+    print(f"{name}: recompute >= {recompute_ms(params, t):.0f} ms, swap ~ {swap_ms(kv, t):.0f} ms")
+# GQA 8B: recompute >= 569 ms, swap ~ 336 ms
+# MHA 7B: recompute >= 498 ms, swap ~ 1342 ms
 ```
 
 - **Read it as:** the thin GQA cache favours swap, and more so at long lengths once attention's quadratic
@@ -269,7 +253,7 @@ for name, kv, params in [("GQA 8B", GQA, 8), ("MHA 7B", MHA, 7)]:
 ### Agent scenario: the transcript evicted during a slow tool call
 A research agent on the 8B GQA model has a 20,000-token transcript and calls a web-scrape tool that takes
 30 s. The pool is busy, so its unreferenced blocks are evicted LRU before the next step. Same illustrative
-figures as above.
+figures and functions as above (`recompute_ms(8, tokens)`, `swap_ms(128 * 1024, 20_000) / 2`).
 
 | Next step finds | What runs | Extra latency on that step |
 |---|---|---|
@@ -277,15 +261,6 @@ figures as above.
 | System prompt and tools cached (6,000), rest evicted | re-prefill ~15,000 tokens | ~267 ms |
 | Everything evicted | re-prefill 21,000 tokens | ~373 ms |
 | Evicted to a host-memory tier | copy ~2.6 GB back over the host link, then prefill ~1,000 | ~105 ms + ~18 ms |
-
-```python
-KV = 128 * 1024
-ctx, new = 20_000, 1_000
-print("hit:", round(recompute_ms(8, new)), "ms")
-print("tail evicted:", round(recompute_ms(8, ctx - 6_000 + new)), "ms")
-print("all evicted:", round(recompute_ms(8, ctx + new)), "ms")
-print("host tier:", round(swap_ms(KV, ctx) / 2), "ms in +", round(recompute_ms(8, new)), "ms")
-```
 
 - **Read it as:** one miss costs a few hundred milliseconds per step on this model (more on bigger models
   or longer transcripts) and burns prefill compute other agents needed. Across a 20-step run with many

@@ -202,37 +202,32 @@ extra working memory is one tensor times the number of models (the loaded state 
 still fit in CPU RAM), and it copies non-float buffers unchanged.
 
 ```python
+# pip install torch
 import torch
 
 def ties_merge(base, finetunes, k=0.2, lam=1.0):
-    """base, finetunes: state dicts (name -> tensor) of the same architecture and base lineage.
-    Returns base + lam * TIES-merged task vector."""
+    """base, finetunes: state dicts of the same base lineage. Returns base + lam * TIES task vector."""
     merged = {}
     for name, w0 in base.items():
         if not w0.is_floating_point():                       # token ids, buffers: pass through
             merged[name] = w0.clone(); continue
-        taus = torch.stack([ft[name].float() - w0.float() for ft in finetunes])   # [n_tasks, ...]
-        # 1. Trim: keep the top-k fraction of each task vector by magnitude
-        flat = taus.abs().flatten(1)
-        n_keep = max(1, int(k * flat.shape[1]))
-        thresh = flat.kthvalue(flat.shape[1] - n_keep + 1, dim=1).values  # per-task cutoff
-        taus = taus * (taus.abs() >= thresh.view(-1, *([1] * (taus.dim() - 1))))
-        # 2. Elect: the sign with more total magnitude at each parameter wins
-        sign = torch.sign(taus.sum(0))
-        # 3. Disjoint merge: average only the entries that agree with the elected sign
-        agree = (torch.sign(taus) == sign) & (taus != 0)
+        taus = torch.stack([ft[name].float() - w0.float() for ft in finetunes]).flatten(1)
+        n_keep = max(1, int(k * taus.shape[1]))                                # 1. trim per task
+        thresh = taus.abs().kthvalue(taus.shape[1] - n_keep + 1, dim=1).values
+        taus = taus * (taus.abs() >= thresh[:, None])
+        sign = torch.sign(taus.sum(0))                                         # 2. elect sign
+        agree = (torch.sign(taus) == sign) & (taus != 0)                       # 3. disjoint merge
         tau = (taus * agree).sum(0) / agree.sum(0).clamp(min=1)
-        merged[name] = (w0.float() + lam * tau).to(w0.dtype)
+        merged[name] = (w0.float() + lam * tau.view_as(w0)).to(w0.dtype)
     return merged
 
-# usage sketch (every path must be a fine-tune of exactly the same base revision):
-# from transformers import AutoModelForCausalLM
-# base = AutoModelForCausalLM.from_pretrained("org/base-8b").state_dict()
-# fts = [AutoModelForCausalLM.from_pretrained(p).state_dict() for p in ("org/support-sft", "org/tools-sft")]
-# model = AutoModelForCausalLM.from_pretrained("org/base-8b"); model.load_state_dict(ties_merge(base, fts))
-# Then: run the per-task evals, a general benchmark, the chat-template smoke test and the safety suite.
-# mergekit expresses the same recipe as a YAML config (merge_method: ties, density: 0.2, weight: ...).
+base = {"w": torch.zeros(4)}
+fts = [{"w": torch.tensor([.30, -.02, .10, -.40])}, {"w": torch.tensor([-.25, .01, .12, -.05])}]
+print(ties_merge(base, fts, k=0.5)["w"])   # tensor([ 0.3000,  0.0000,  0.1200, -0.4000])
 ```
+
+With Hugging Face models, pass `model.state_dict()` of the base and each fine-tune, then
+`load_state_dict` the result into a fresh base model.
 
 ### Reproduce the four-parameter walkthrough
 Pure Python; runs anywhere and prints the table's last row.

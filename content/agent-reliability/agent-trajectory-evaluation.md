@@ -357,13 +357,13 @@ flowchart TD
 
 ## Examples
 ### Scorers over a recorded trajectory
-Scorers over a recorded trajectory and an aggregate over repeated runs. The outcome check inspects end
-state; the process checks are computed from events; the ordered-subsequence check accepts any valid path.
+Scorers over one recorded trajectory. The outcome check inspects end state, the process checks are
+computed from events, and the ordered-subsequence check accepts any valid path. The run below reaches the
+right end state through a forbidden call, so it fails.
 
 ```python
 import json
 from collections import Counter
-from math import comb
 
 def ok_subsequence(actions: list[str], required: list[str]) -> bool:
     """required actions appear in order; other actions may be interleaved."""
@@ -372,34 +372,22 @@ def ok_subsequence(actions: list[str], required: list[str]) -> bool:
 
 def score_run(trajectory: list[dict], task: dict, end_state: dict) -> dict:
     calls = [e for e in trajectory if e["type"] == "tool.call.requested"]
-    results = [e for e in trajectory if e["type"] == "tool.call.result"]
     actions = [c["name"] for c in calls]
     violations = [a for a in actions if a in task["forbidden_tools"]]
-    outcome = task["success"](end_state) and not violations          # policy violation zeroes the run
     sigs = Counter((c["name"], json.dumps(c["arguments"], sort_keys=True)) for c in calls)
-    redundant = sum(v - 1 for v in sigs.values())    # approximation: ignores state changes in between
-    return {
-        "success": bool(outcome),
-        "steps": len(calls),
-        "efficiency": task["reference_steps"] / max(len(calls), 1),
-        "tool_success_rate": sum(r["ok"] for r in results) / max(len(results), 1),
-        "order_ok": ok_subsequence(actions, task["required_order"]),
-        "redundant_calls": redundant,
-        "violations": len(violations),
-    }
+    return {"success": task["success"](end_state) and not violations,   # a violation zeroes the run
+            "order_ok": ok_subsequence(actions, task["required_order"]),
+            "steps": len(calls),
+            "redundant_calls": sum(v - 1 for v in sigs.values()),   # ignores state changes in between
+            "violations": len(violations)}
 
-def aggregate(runs: list[dict], k: int = 3) -> dict:
-    """Runs of ONE task. Average pass_hat_k over tasks for the suite figure."""
-    n = len(runs); c = sum(r["success"] for r in runs)
-    return {"n": n, "pass_rate": c / n, "pass_hat_k": comb(c, k) / comb(n, k),   # unbiased pass^k
-            "mean_steps": sum(r["steps"] for r in runs) / n,
-            "violation_runs": sum(r["violations"] > 0 for r in runs)}
-
-task = {"forbidden_tools": {"delete_order"}, "reference_steps": 3,
-        "required_order": ["lookup_order", "refund"],
-        "success": lambda s: s["orders"]["A1"]["refunded"] == 40.0}
-# runs = [score_run(record(agent, task), task, env.state()) for _ in range(10)]
-# aggregate(runs) with 8 of 10 successes -> {"pass_rate": 0.8, "pass_hat_k": 0.467 (56/120), ...}
+task = {"forbidden_tools": {"delete_order"}, "required_order": ["lookup_order", "refund"],
+        "success": lambda s: s["orders"]["A1"]["refunded"] == 40}
+call = lambda name, **args: {"type": "tool.call.requested", "name": name, "arguments": args}
+run = [call("lookup_order", order_id="A1"), call("delete_order", order_id="A1"),
+       call("refund", order_id="A1", amount=40)]                      # right end state, forbidden path
+print(score_run(run, task, {"orders": {"A1": {"refunded": 40}}}))
+# {'success': False, 'order_ok': True, 'steps': 3, 'redundant_calls': 0, 'violations': 1}
 ```
 
 ### Same 80% pass rate, very different agents (runnable)

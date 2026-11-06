@@ -292,160 +292,69 @@ flowchart TD
 ```
 
 ## Examples
-### A guarded agent tool: approval, timeout and errors as results
-One decorator factory gives every tool the same contract: side-effecting tools need an approval flag, each
-call has a timeout, and failures come back as a string the model can read instead of crashing the loop.
+### A guarded agent tool: timeout and errors as results
+One decorator factory gives every tool the same contract: each call has a timeout, and failures come
+back as a string the model can read instead of crashing the loop.
 
 ```python
 import asyncio, functools, inspect
 
-class NeedsApproval(Exception): ...
-
 def agent_tool(timeout: float = 10.0, side_effect: bool = False):
     def decorator(fn):
-        if not inspect.iscoroutinefunction(fn):
-            raise TypeError("agent_tool expects async def tools")
-
         @functools.wraps(fn)                     # keep name, docstring and signature for the schema
-        async def wrapper(*args, approved: bool = False, **kwargs):
-            if side_effect and not approved:
-                raise NeedsApproval(f"{fn.__name__} needs human approval")   # loop pauses for a human
+        async def wrapper(*args, **kwargs):
             try:
-                async with asyncio.timeout(timeout):
+                async with asyncio.timeout(timeout):      # Python 3.11+
                     return await fn(*args, **kwargs)
             except TimeoutError:
                 return f"error: {fn.__name__} timed out after {timeout}s"
             except Exception as e:                # CancelledError is BaseException, so it still propagates
                 return f"error: {type(e).__name__}: {e}"
-        wrapper.side_effect = side_effect          # metadata the agent loop can read
+        wrapper.side_effect = side_effect          # the loop asks a human before calling these
         return wrapper
     return decorator
 
-@agent_tool(timeout=2.0)
+@agent_tool(timeout=0.5)
 async def get_weather(city: str) -> str:
     """Current weather for a city."""
     if city == "Atlantis":
         raise KeyError("unknown city")
-    await asyncio.sleep(0.1); return f"{city}: 18C, cloudy"
+    await asyncio.sleep(0.1 if city == "Paris" else 5)
+    return f"{city}: 18C"
 
-@agent_tool(side_effect=True)
-async def send_email(to: str, body: str) -> str:
-    """Send an email to a customer."""
-    await asyncio.sleep(0.1); return f"sent to {to}"
-
-async def main():
-    print(get_weather.__name__, inspect.signature(get_weather))   # get_weather (city: str) -> str
-    print(await get_weather("Paris"))                             # Paris: 18C, cloudy
-    print(await get_weather("Atlantis"))                          # error: KeyError: 'unknown city'
-    try:
-        await send_email("a@b.c", "hi")
-    except NeedsApproval as e:
-        print("paused:", e)
-    print(await send_email("a@b.c", "hi", approved=True))         # sent to a@b.c
-
-asyncio.run(main())
+print(get_weather.__name__, inspect.signature(get_weather))   # get_weather (city: str) -> str
+print(asyncio.run(get_weather("Paris")))      # Paris: 18C
+print(asyncio.run(get_weather("Atlantis")))   # error: KeyError: 'unknown city'
+print(asyncio.run(get_weather("Oslo")))       # error: get_weather timed out after 0.5s
 ```
 
-- **`inspect.signature` follows `__wrapped__`**, so the schema still shows `(city: str)`; the extra
-  `approved` keyword lives only on the wrapper and is never exposed to the model.
+- **`inspect.signature` follows `__wrapped__`**, so the schema still shows `(city: str)`.
 - **Errors as results** let the model retry with different arguments or explain the failure, which is
   usually better than aborting the whole run.
 
-### An async retry decorator with backoff and jitter
-```python
-import asyncio, functools, inspect, random, time
-from collections.abc import Awaitable, Callable
-from typing import ParamSpec, TypeVar
-
-P, R = ParamSpec("P"), TypeVar("R")
-
-class Transient(Exception): ...
-
-def retry(attempts: int = 3, base_delay: float = 0.5):
-    def decorator(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
-        if not inspect.iscoroutinefunction(fn):
-            raise TypeError("retry() here supports async functions only")
-
-        @functools.wraps(fn)
-        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-            for attempt in range(1, attempts + 1):
-                start = time.perf_counter()
-                try:
-                    return await fn(*args, **kwargs)
-                except Transient as exc:
-                    ms = (time.perf_counter() - start) * 1000
-                    print(f"{fn.__name__} attempt {attempt} failed after {ms:.0f} ms: {exc}")
-                    if attempt == attempts:
-                        raise
-                    delay = base_delay * 2 ** (attempt - 1)
-                    await asyncio.sleep(delay * random.uniform(0.5, 1.5))  # jitter
-        return wrapper
-    return decorator
-
-@retry(attempts=4, base_delay=0.1)
-async def complete(prompt: str) -> str:
-    """Call the model provider."""
-    await asyncio.sleep(0.05)
-    if random.random() < 0.5:
-        raise Transient("429 rate limited")
-    return f"answer to {prompt!r}"
-
-print(complete.__name__, complete.__doc__)     # complete Call the model provider.
-print(asyncio.run(complete("hi")))
-```
-
-**The numbers** (4 attempts, 0.1 s base delay, 50% failure rate):
-| Quantity | Value |
-|---|---|
-| Waits between failures | about 0.1, 0.2 and 0.4 s, with ±50% jitter |
-| A call that never succeeds | gives up after roughly 0.7 s of backoff plus four call durations (0.2 s here) |
-| Probability all four attempts fail | 0.5⁴ = 1/16, so about 6% of calls still raise |
-
-- **Retries change the error rate; they do not remove it.** In a 10-step agent run where every step makes
-  one such call, a 6% per-call failure rate compounds, which is why tool errors should come back as results.
-- **What ran when:** `retry(...)` executed once at import and returned `decorator`; `decorator(complete)`
-  also ran once at import and rebound the name `complete` to `wrapper`; only `wrapper`'s body runs per call.
-- **Why jitter:** many clients failing on the same 429 would otherwise retry in lockstep and hit the
-  provider together again.
-- **In production** you would usually use `tenacity` rather than hand-roll this.
-
 ### A tool registry that survives decoration
 Registration plus an async-aware timer, stacked in the right order. Remove the `@functools.wraps(fn)`
-above `async_wrapper` and the registry records `async_wrapper` with no docstring and params
-`['args', 'kwargs']`: exactly the schema an LLM would then guess against.
+above `async_wrapper` and the registry records `async_wrapper` with params `['args', 'kwargs']`: exactly
+the schema an LLM would then guess against.
 
 ```python
 import asyncio, functools, inspect, time
 
-TOOLS: dict[str, dict] = {}
+TOOLS: dict[str, list[str]] = {}
 
 def tool(fn):                                    # registration: records whatever it receives
-    TOOLS[fn.__name__] = {"doc": inspect.getdoc(fn),
-                          "params": list(inspect.signature(fn).parameters)}  # follows __wrapped__
+    TOOLS[fn.__name__] = list(inspect.signature(fn).parameters)   # follows __wrapped__
     return fn
 
 def timed(fn):
-    def report(start: float) -> None:
-        print(f"{fn.__name__} took {(time.perf_counter() - start) * 1000:.0f} ms")
-
-    if inspect.iscoroutinefunction(fn):          # async in, async out
-        @functools.wraps(fn)
-        async def async_wrapper(*args, **kwargs):
-            start = time.perf_counter()
-            try:
-                return await fn(*args, **kwargs)  # time the awaited work, not coroutine creation
-            finally:
-                report(start)
-        return async_wrapper
-
     @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
+    async def async_wrapper(*args, **kwargs):
         start = time.perf_counter()
         try:
-            return fn(*args, **kwargs)
+            return await fn(*args, **kwargs)     # time the awaited work, not coroutine creation
         finally:
-            report(start)
-    return wrapper
+            print(f"{fn.__name__} took {(time.perf_counter() - start) * 1000:.0f} ms")
+    return async_wrapper
 
 @tool                                            # on top, so it registers the timed wrapper
 @timed
@@ -454,10 +363,26 @@ async def search_docs(query: str, k: int = 5) -> list[str]:
     await asyncio.sleep(0.12)                    # stands in for a vector-store query
     return [query] * k
 
-print(TOOLS)       # {'search_docs': {'doc': 'Search the knowledge base.', 'params': ['query', 'k']}}
-print(inspect.iscoroutinefunction(search_docs))  # True: frameworks will await it
+print(TOOLS)                                     # {'search_docs': ['query', 'k']}
 asyncio.run(search_docs("refund policy"))        # search_docs took 120 ms (about)
 ```
+
+### Worked scenario: what a retry decorator buys
+`@retry(attempts=4, base_delay=0.1)` with exponential backoff, ±50% jitter and a 50% transient failure
+rate:
+
+| Quantity | Value |
+|---|---|
+| Waits between failures | about 0.1, 0.2 and 0.4 s, with ±50% jitter |
+| A call that never succeeds | gives up after roughly 0.7 s of backoff plus four call durations |
+| Probability all four attempts fail | 0.5⁴ = 1/16, so about 6% of calls still raise |
+
+- **Retries change the error rate; they do not remove it.** In a 10-step agent run where every step makes
+  one such call, a 6% per-call failure rate compounds, which is why tool errors should come back as results.
+- **What runs when:** `retry(...)` runs once at import and returns the decorator, which also runs once and
+  rebinds the name to the wrapper; only the wrapper's body runs per call.
+- **Why jitter:** many clients failing on the same 429 would otherwise retry in lockstep and hit the
+  provider together again.
 
 ## Production patterns
 - **One house tool decorator.** Give every agent tool the same wrapper (timeout, errors returned as

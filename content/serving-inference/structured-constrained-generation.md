@@ -207,27 +207,17 @@ decodes greedily with a fake model that prefers illegal tokens.
 VOCAB = ["7", "42", "123", "1234", "a", " 5", "<eos>"]
 ACCEPT = 3                                      # DFA for "exactly three digits": state = digits seen
 
-def step(state, ch):
-    return state + 1 if ch.isdigit() and state < ACCEPT else None   # None = dead state
+def walk(state, tok):
+    """Run the DFA over every character of a token; None = dead state."""
+    for ch in tok:
+        if not (ch.isdigit() and state < ACCEPT):
+            return None
+        state += 1
+    return state
 
-def build_index(vocab):
-    """Compile time: for every DFA state, which tokens are legal and where they lead."""
-    index = {}
-    for s in range(ACCEPT + 1):
-        index[s] = {}
-        for tok in vocab:
-            if tok == "<eos>":
-                if s == ACCEPT:
-                    index[s][tok] = "done"      # EOS only in the accepting state
-                continue
-            cur = s
-            for ch in tok:                      # walk every character of the token
-                cur = step(cur, ch)
-                if cur is None:
-                    break
-            if cur is not None:
-                index[s][tok] = cur
-    return index
+# Compile time: for every state, which tokens are legal and where they lead.
+index = {s: {t: walk(s, t) for t in VOCAB[:-1] if walk(s, t) is not None} for s in range(ACCEPT + 1)}
+index[ACCEPT]["<eos>"] = "done"                 # EOS only in the accepting state
 
 def constrained_greedy(scores, index):
     """Run time: a lookup per step, then argmax among allowed tokens only."""
@@ -237,14 +227,11 @@ def constrained_greedy(scores, index):
         tok = max(allowed, key=lambda t: scores.get(t, float("-inf")))
         out.append(tok)
         state = allowed[tok]
-    return "".join(t for t in out if t != "<eos>")
+    return "".join(out[:-1])                    # drop <eos>
 
-index = build_index(VOCAB)
-for s, allowed in index.items():
-    print(s, allowed)       # 0 {'7': 1, '42': 2, '123': 3} ... 3 {'<eos>': 'done'}
-# The "model" prefers 1234 and a, both illegal from the start state.
-fake_logits = {"1234": 5.0, "a": 4.0, "<eos>": 3.0, "42": 1.0, "7": 0.5}
-print(constrained_greedy(fake_logits, index))   # -> 427
+print(index[0])                                 # {'7': 1, '42': 2, '123': 3}
+fake_logits = {"1234": 5.0, "a": 4.0, "<eos>": 3.0, "42": 1.0, "7": 0.5}   # prefers illegal 1234 and a
+print(constrained_greedy(fake_logits, index))   # 427
 ```
 
 ### Worked scenario: parse failures across an agent run
@@ -261,83 +248,6 @@ compound per run (run failure = 1 − (1 − p)^10).
 Constrained decoding removes the shape column entirely; the remaining retry budget goes to errors no
 grammar can express. Check `finish_reason` too: output cut at `max_tokens` is the one way a constrained
 call still fails to parse.
-
-### Agent router step: schema-constrained tool choice
-A router picks one of the agent's tools under a JSON Schema via `response_format`, with reasoning first.
-The enum makes an unknown tool name impossible; Pydantic and a lookup catch wrong-but-valid values.
-
-```python
-from typing import Literal
-from openai import OpenAI
-from pydantic import BaseModel
-
-TOOLS = {"search_orders": lambda q: f"orders matching {q}", "refund": lambda q: f"refund for {q}"}
-
-class Route(BaseModel):
-    reasoning: str                                        # free text FIRST
-    tool: Literal["search_orders", "refund", "ask_human"]
-    query: str
-
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
-
-def route(user_msg: str, retries: int = 1) -> str:
-    msgs = [{"role": "system", "content": "Pick the next tool for this support agent."},
-            {"role": "user", "content": user_msg}]
-    for _ in range(retries + 1):
-        resp = client.chat.completions.create(
-            model="Qwen/Qwen2.5-7B-Instruct", messages=msgs, temperature=0,
-            response_format={"type": "json_schema",
-                             "json_schema": {"name": "route", "schema": Route.model_json_schema()}})
-        r = Route.model_validate_json(resp.choices[0].message.content)   # shape is guaranteed
-        if r.tool == "ask_human":
-            return "escalated"
-        if r.query.strip():                                              # semantic check, not shape
-            return TOOLS[r.tool](r.query)
-        msgs += [{"role": "assistant", "content": resp.choices[0].message.content},
-                 {"role": "user", "content": "query was empty; give a concrete query"}]
-    return "escalated"
-
-print(route("I was charged twice for order 1182, please fix it."))
-```
-
-### A choice constraint from scratch
-The output must be exactly one of a fixed set of choices, then stop. The allowed-token table is a trie
-built once from the tokenizer, so each step is a lookup rather than a vocabulary scan: the structure
-Outlines and XGrammar generalise to regexes and grammars.
-
-```python
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
-
-name = "Qwen/Qwen2.5-0.5B-Instruct"
-tok = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float16).cuda().eval()
-
-class ChoiceConstraint(LogitsProcessor):
-    """Allow only token sequences that spell one of `choices`, then EOS."""
-    def __init__(self, choices, prompt_len):
-        self.trie, self.prompt_len = {}, prompt_len
-        for c in choices:                                   # built ONCE: grammar x tokenizer
-            # one canonical tokenization per choice; real engines allow every token path that spells it
-            node = self.trie
-            for t in tok(c, add_special_tokens=False).input_ids:
-                node = node.setdefault(t, {})
-            node[tok.eos_token_id] = {}                     # accepting state: EOS becomes legal
-    def __call__(self, input_ids, scores):
-        node = self.trie
-        for t in input_ids[0, self.prompt_len:].tolist():  # replay emitted tokens to find the state
-            node = node.get(t, {})
-        allowed = list(node) or [tok.eos_token_id]
-        mask = torch.full_like(scores, float("-inf"))
-        mask[0, allowed] = 0.0
-        return scores + mask                                # every other token gets probability 0
-
-msgs = [{"role": "user", "content": "Is the sky green? Answer with one word."}]
-ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt").cuda()
-proc = LogitsProcessorList([ChoiceConstraint(["yes", "no", "unknown"], ids.shape[1])])
-out = model.generate(ids, max_new_tokens=5, do_sample=False, logits_processor=proc)
-print(repr(tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)))   # -> 'no'
-```
 
 ### Production call: schema-constrained output plus semantic validation
 Against vLLM's OpenAI-compatible server (hosted providers accept the same `response_format` shape). The
@@ -385,6 +295,12 @@ print(ticket.category, ticket.priority)
 - **Schema compatibility test in CI.** Run every tool and output schema through the target backend with a
   few fixture prompts, asserting that unsupported keywords (`format: date`, `minimum`, `pattern`) are
   either enforced or re-checked after generation.
+- **Enum the router's tool names.** A router step that picks the next tool puts the names in a
+  `Literal` enum (plus an `ask_human` escape), so an unknown tool is impossible; an empty or wrong query
+  still needs the semantic check and one fed-back retry.
+- **Use the engine's choice mode, not a hand-built trie.** A trie over one tokenization per choice misses
+  other token paths that spell the same word; engine choice and grammar modes (XGrammar, Outlines) cover
+  them all and compile the table once per schema.
 
 ## Trade-offs
 - **Guaranteed validity vs distribution shift.** Retries vanish, but the constraint can push the model

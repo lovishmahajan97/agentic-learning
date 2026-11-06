@@ -242,29 +242,38 @@ flowchart TD
 ```
 
 ## Examples
-### The online path in code
-Hybrid retrieval with reciprocal rank fusion, a cross-encoder reranker, and token-budgeted context
-assembly with the ACL filter inside the search. The `store`, `reranker`, `embed` and `log_trace` calls
-stand in for your vector database, BM25 index, embedding model and tracing; the pipeline shape is what
-matters.
+### Runnable: why fusion rewards agreement
+Reciprocal rank fusion merges the dense and BM25 lists; ids near the top of any list win. Pure Python, no
+dependencies. Chunk `a` is 1st in dense only; chunk `b` is 3rd in both lists.
 
 ```python
-from collections import defaultdict
-
 def rrf(ranked_lists, k=60):
-    """Reciprocal rank fusion: ids near the top of any list win."""
-    score = defaultdict(float)
+    s = {}
     for lst in ranked_lists:
-        for rank, chunk_id in enumerate(lst, start=1):
-            score[chunk_id] += 1.0 / (k + rank)
-    return sorted(score, key=score.get, reverse=True)
+        for rank, cid in enumerate(lst, start=1):
+            s[cid] = s.get(cid, 0.0) + 1.0 / (k + rank)
+    return dict(sorted(s.items(), key=lambda kv: -kv[1]))
 
-def retrieve(query, user, store, reranker, k_dense=40, k_sparse=40, budget_tokens=2400):
+dense  = ["a", "x", "b", "y"]
+sparse = ["p", "q", "b", "z"]
+for cid, sc in list(rrf([dense, sparse]).items())[:3]:
+    print(cid, round(sc, 4))
+# b 0.0317   <- 3rd in both lists: 2/63
+# a 0.0164   <- 1st in one list only: 1/61
+# p 0.0164
+```
+
+### The online path in code
+Hybrid retrieval fused with `rrf` above, a cross-encoder reranker, and token-budgeted context assembly
+with the ACL filter inside the search. The `store`, `reranker`, `embed` and `log_trace` calls stand in for
+your vector database, BM25 index, embedding model and tracing; the pipeline shape is what matters.
+
+```python
+def retrieve(query, user, store, reranker, budget_tokens=2400):
     acl = {"tenant": user.tenant, "groups": user.groups}          # filter inside the search
-    dense = store.vector_search(embed(query), k=k_dense, filters=acl)
-    sparse = store.bm25_search(query, k=k_sparse, filters=acl)
-    candidates = rrf([dense, sparse])[:60]
-    chunks = store.fetch(candidates)                                # text + metadata
+    dense = store.vector_search(embed(query), k=40, filters=acl)
+    sparse = store.bm25_search(query, k=40, filters=acl)
+    chunks = store.fetch(list(rrf([dense, sparse]))[:60])          # text + metadata
     scores = reranker.score(query, [c.text for c in chunks])       # joint (query, chunk) scoring
     ordered = [c for _, c in sorted(zip(scores, chunks), key=lambda p: -p[0])]
     context, used = [], 0
@@ -277,31 +286,25 @@ def retrieve(query, user, store, reranker, k_dense=40, k_sparse=40, budget_token
 def answer(query, user, store, reranker, llm):
     ctx = retrieve(query, user, store, reranker)
     passages = "\n\n".join(f"[{i+1}] ({c.source}) {c.text}" for i, c in enumerate(ctx))
-    prompt = ("Answer using only the passages below and cite passage numbers. "
+    out = llm("Answer using only the passages below and cite passage numbers. "
               "If the passages do not contain the answer, say so.\n\n"
               f"{passages}\n\nQuestion: {query}")
-    out = llm(prompt)
     log_trace(query=query, chunk_ids=[c.id for c in ctx], answer=out)   # one trace id per request
     return out
 ```
 
 ### The same retrieval exposed as an agent tool
 The model sees `query` and `k` only. The user comes from the session, the result is compact, and an
-empty result is explicit. The schema shape follows the common JSON-schema tool format; adapt the
-wrapper to your framework (a LangGraph tool node, an MCP tool, a provider SDK tool list).
+empty result is explicit. The schema follows the common JSON-schema tool format; adapt the wrapper to
+your framework (a LangGraph tool node, an MCP tool, a provider SDK tool list).
 
 ```python
 SEARCH_TOOL = {
     "name": "search_docs",
     "description": "Search internal docs the current user may read. Returns cited chunks.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "A focused search query"},
-            "k": {"type": "integer", "minimum": 1, "maximum": 8},
-        },
-        "required": ["query"],
-    },
+    "input_schema": {"type": "object", "required": ["query"], "properties": {
+        "query": {"type": "string", "description": "A focused search query"},
+        "k": {"type": "integer", "minimum": 1, "maximum": 8}}},
 }
 
 def run_search_tool(args, session, store, reranker, calls_so_far, max_calls=4):
@@ -312,27 +315,6 @@ def run_search_tool(args, session, store, reranker, calls_so_far, max_calls=4):
     if not chunks:
         return {"results": [], "note": "no permitted results; try other terms or stop"}
     return {"results": [{"id": c.id, "source": c.source, "text": c.text[:800]} for c in chunks]}
-```
-
-### Runnable: why fusion rewards agreement
-Pure Python, no dependencies. Chunk `a` is 1st in dense only; chunk `b` is 3rd in both lists.
-
-```python
-def rrf_scores(ranked_lists, k=60):
-    s = {}
-    for lst in ranked_lists:
-        for rank, cid in enumerate(lst, start=1):
-            s[cid] = s.get(cid, 0.0) + 1.0 / (k + rank)
-    return dict(sorted(s.items(), key=lambda kv: -kv[1]))
-
-dense  = ["a", "x", "b", "y"]
-sparse = ["p", "q", "b", "z"]
-for cid, sc in rrf_scores([dense, sparse]).items():
-    print(cid, round(sc, 4))
-# b 0.0317   <- 3rd in both lists: 2/63
-# a 0.0164   <- 1st in one list only: 1/61
-# p 0.0164
-# ...
 ```
 
 ### Worked scenario: what search calls cost a research agent

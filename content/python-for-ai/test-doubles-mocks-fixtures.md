@@ -320,60 +320,10 @@ flowchart TD
 ```
 
 ## Examples
-### Agent scenario: tool dispatch with a scripted model and recording tools
-The model is a scripted stub; tools are fakes that record what they ran with. State checks cover the
-normal path; a call check covers the one requirement that is an interaction: a destructive tool never
-runs without approval.
-
-```python
-class FakeTool:
-    def __init__(self, result, destructive=False):
-        self.result, self.destructive, self.runs = result, destructive, []
-    def __call__(self, **kwargs):
-        self.runs.append(kwargs)
-        return self.result
-
-class ScriptedLLM:
-    def __init__(self, *actions): self.actions, self.seen = list(actions), []
-    def next_action(self, transcript):
-        self.seen.append(list(transcript))
-        return self.actions.pop(0)
-
-def run_step(llm, tools, transcript, approve):
-    action = llm.next_action(transcript)
-    tool = tools.get(action["tool"])
-    if tool is None:
-        return {"error": f"unknown tool {action['tool']}"}
-    if tool.destructive and not approve(action):
-        return {"error": "denied by approval policy"}
-    return {"result": tool(**action["args"])}
-
-def test_read_tool_result_is_returned():
-    search = FakeTool(["doc-7", "doc-2"])
-    llm = ScriptedLLM({"tool": "search", "args": {"q": "refund policy"}})
-    assert run_step(llm, {"search": search}, [], approve=lambda a: True) == {"result": ["doc-7", "doc-2"]}
-    assert search.runs == [{"q": "refund policy"}]
-
-def test_destructive_tool_never_runs_without_approval():
-    delete = FakeTool("deleted", destructive=True)
-    llm = ScriptedLLM({"tool": "delete_file", "args": {"path": "/data/a.csv"}})
-    out = run_step(llm, {"delete_file": delete}, [], approve=lambda a: False)
-    assert out == {"error": "denied by approval policy"}
-    assert delete.runs == []                 # the interaction is the requirement
-
-def test_hallucinated_tool_is_an_error_result():
-    llm = ScriptedLLM({"tool": "rm_rf", "args": {}})
-    assert run_step(llm, {}, [], approve=lambda a: True) == {"error": "unknown tool rm_rf"}
-```
-
-- **No mocks of the registry or the loop:** the real dispatch code runs, so refactoring it does not
-  break these tests unless behaviour changes.
-- **One behaviour assertion, on purpose:** `delete.runs == []` is the safety property itself.
-
 ### Summarizer: scripted fake, autospec mock, monkeypatch
-A summarizer retries once on empty output and truncates to a limit read from the environment. Three
-doubles: a scripted stub-with-spy (what most teams call a fake LLM) for state checks, an autospecced
-mock for one interaction that matters, and `monkeypatch` for configuration.
+A summarizer truncates model output to a limit read from the environment. Three doubles: a scripted
+stub-with-spy (what most teams call a fake LLM) for state checks, an autospecced mock for one interaction
+that matters, and `monkeypatch` for configuration. Runnable with `pip install pytest`.
 
 ```python
 import os
@@ -381,87 +331,59 @@ import pytest
 from unittest.mock import create_autospec
 
 class LLMClient:                                   # the real client's interface
-    def complete(self, messages: list[dict], *, model: str) -> str: ...
-
+    def complete(self, prompt: str, *, model: str) -> str: ...
 def summarize(text: str, *, client, model: str = "large") -> str:
     limit = int(os.environ.get("SUMMARY_MAX_CHARS", "500"))
-    for _ in range(2):
-        out = client.complete([{"role": "user", "content": f"Summarize: {text}"}], model=model)
-        if out.strip():
-            return out[:limit]
-    raise RuntimeError("model returned empty output twice")
+    return client.complete(f"Summarize: {text}", model=model)[:limit]
 
 class FakeLLM:                                     # stub + spy: scripted replies, records calls
     def __init__(self, replies): self.replies, self.calls = list(replies), []
-    def complete(self, messages, *, model):
-        self.calls.append((messages, model))
+    def complete(self, prompt, *, model):
+        self.calls.append(prompt)
         return self.replies.pop(0)
-
 @pytest.fixture
 def make_llm():                                    # factory fixture
     return lambda *replies: FakeLLM(replies)
 
-def test_retries_once_on_empty(make_llm):
-    llm = make_llm("", "a summary")
-    assert summarize("long text", client=llm) == "a summary"
-    assert len(llm.calls) == 2
-
-def test_gives_up_after_two_empties(make_llm):
-    with pytest.raises(RuntimeError):
-        summarize("x", client=make_llm("", "  "))
+def test_truncates_to_env_limit(monkeypatch, make_llm):
+    monkeypatch.setenv("SUMMARY_MAX_CHARS", "5")   # undone after the test
+    llm = make_llm("abcdefgh")
+    assert summarize("x", client=llm) == "abcde"
+    assert len(llm.calls) == 1                     # spy: one model call, prompt text not pinned
 
 def test_forwards_model_name():
     llm = create_autospec(LLMClient, instance=True)    # rejects calls the real class would reject
     llm.complete.return_value = "ok"
     summarize("text", client=llm, model="small")
     assert llm.complete.call_args.kwargs["model"] == "small"
-
-def test_truncates_to_env_limit(monkeypatch, make_llm):
-    monkeypatch.setenv("SUMMARY_MAX_CHARS", "5")       # undone after the test
-    assert summarize("x", client=make_llm("abcdefgh")) == "abcde"
 ```
 
 None of these tests hit the network, and none breaks if `summarize` changes how it builds its prompt.
 
 ### Transport seam: `httpx.MockTransport` scripts a 429, then a reply
 Cutting at the HTTP layer exercises request building, status handling and response parsing. Runnable
-with `pip install httpx pytest`.
+with `pip install httpx`.
 
 ```python
 import httpx
-import pytest
 
 def classify(text: str, http: httpx.Client) -> str:
-    for attempt in range(3):
+    for _ in range(2):                                 # one retry on 429
         r = http.post("/v1/chat", json={"messages": [{"role": "user", "content": text}]})
-        if r.status_code == 429 and attempt < 2:
-            continue                                   # real code would back off here
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip().lower()
-    raise AssertionError("unreachable")
+        if r.status_code != 429:
+            break
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"].strip().lower()
 
-def scripted(*responses):
-    seen, queue = [], list(responses)
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        return queue.pop(0)
-    return httpx.MockTransport(handler), seen
+replies = [httpx.Response(429),
+           httpx.Response(200, json={"choices": [{"message": {"content": "  SPAM\n"}}]})]
+seen = []
+def handler(request: httpx.Request) -> httpx.Response:
+    seen.append(request.url.path)
+    return replies.pop(0)
 
-def reply(content):
-    return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
-
-def test_retries_rate_limit_then_parses():
-    transport, seen = scripted(httpx.Response(429), reply("  SPAM\n"))
-    with httpx.Client(transport=transport, base_url="https://llm.test") as http:
-        assert classify("win a prize", http) == "spam"
-    assert len(seen) == 2
-    assert seen[0].url.path == "/v1/chat"
-
-def test_gives_up_after_three_429s():
-    transport, _ = scripted(*[httpx.Response(429)] * 3)
-    with httpx.Client(transport=transport, base_url="https://llm.test") as http:
-        with pytest.raises(httpx.HTTPStatusError):
-            classify("x", http)
+with httpx.Client(transport=httpx.MockTransport(handler), base_url="https://llm.test") as http:
+    print(classify("win a prize", http), seen)     # spam ['/v1/chat', '/v1/chat']
 ```
 
 ### Worked scenario: which patch target?
@@ -492,6 +414,9 @@ API key despite the patch.
 - **Turn agent traces into scripts.** When a production run misbehaves, export its model replies and
   tool results from your tracing tool and feed them to the scripted fake and fake tools, so the exact
   run replays offline as a regression test. Track how many tests came from traces.
+- **Run the real dispatcher in agent tests.** Pair a scripted model with recording fake tools, mock
+  neither the registry nor the loop, and assert calls only where the call is the requirement, such as a
+  destructive tool never running without approval.
 
 ## Trade-offs
 - **Fakes: readable vs drift.** They make tests readable and refactor-proof, but are code you maintain

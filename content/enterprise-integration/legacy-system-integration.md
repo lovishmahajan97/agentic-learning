@@ -208,23 +208,14 @@ flowchart TD
 ### Decoding a fixed-width EBCDIC extract
 A nightly SFTP extract contains fixed-width 30-byte records in EBCDIC: customer id `PIC X(10)`, name
 `PIC X(16)`, balance `PIC S9(5)V99 COMP-3` (seven digits plus a sign nibble = 4 bytes, two implied
-decimals). The anti-corruption layer decodes it into a typed record the agent's lookup tool can return.
+decimals). The anti-corruption layer decodes it into a record the agent's lookup tool can return.
 
 ```python
 from decimal import Decimal
-from dataclasses import dataclass
-
-@dataclass
-class Customer:
-    customer_id: str
-    name: str
-    balance: Decimal
 
 def unpack_comp3(raw: bytes, scale: int) -> Decimal:
     """COBOL packed decimal: two digits per byte, last nibble is the sign (C/F positive, D negative)."""
-    nibbles = []
-    for b in raw:
-        nibbles += [b >> 4, b & 0x0F]
+    nibbles = [n for b in raw for n in (b >> 4, b & 0x0F)]
     sign = nibbles.pop()                       # final nibble
     if sign < 0x0A or any(n > 9 for n in nibbles):   # A-F are signs, 0-9 digits
         raise ValueError(f"corrupt packed field {raw.hex()}")
@@ -233,17 +224,16 @@ def unpack_comp3(raw: bytes, scale: int) -> Decimal:
         value = -value
     return Decimal(value).scaleb(-scale)
 
-def parse_record(rec: bytes) -> Customer:
+def parse_record(rec: bytes) -> dict:
     assert len(rec) == 30, len(rec)
-    return Customer(
-        customer_id=rec[0:10].decode("cp037").strip(),   # cp037 = EBCDIC US/Canada
-        name=rec[10:26].decode("cp037").strip(),
-        balance=unpack_comp3(rec[26:30], scale=2),
-    )
+    return {"customer_id": rec[0:10].decode("cp037").strip(),   # cp037 = EBCDIC US/Canada
+            "name": rec[10:26].decode("cp037").strip(),
+            "balance": unpack_comp3(rec[26:30], scale=2)}
 
 # 12345.67 packs to 12 34 56 7C; -1.50 packs to 00 00 15 0D
-assert unpack_comp3(bytes.fromhex("1234567C"), 2) == Decimal("12345.67")
-assert unpack_comp3(bytes.fromhex("0000150D"), 2) == Decimal("-1.50")
+print(unpack_comp3(bytes.fromhex("1234567C"), 2), unpack_comp3(bytes.fromhex("0000150D"), 2))  # 12345.67 -1.50
+rec = "CUST000042".encode("cp037") + "ADA LOVELACE".ljust(16).encode("cp037") + bytes.fromhex("0000150D")
+print(parse_record(rec))   # {'customer_id': 'CUST000042', 'name': 'ADA LOVELACE', 'balance': Decimal('-1.50')}
 ```
 
 - **Wrong decoding fails silently.** Reading the file as UTF-8 raises decode errors or produces garbage
@@ -259,8 +249,7 @@ reply once.
 ```python
 import uuid
 
-class LegacyTimeout(Exception):
-    pass
+class LegacyTimeout(Exception): pass
 
 def update_contact(pending: dict, gateway, claim_id: str, address: str) -> str:
     ref = uuid.uuid4().hex[:12].upper()            # client reference, agreed field width
@@ -269,8 +258,7 @@ def update_contact(pending: dict, gateway, claim_id: str, address: str) -> str:
         try:
             gateway.send(claim_id, address, ref)   # 2. ref goes in a field the system persists
             break
-        except LegacyTimeout:
-            # 3. wait out the transaction's max run time (not shown), then look before retrying
+        except LegacyTimeout:                      # 3. wait out max run time (not shown), then look
             if gateway.find_by_reference(ref):
                 break                              # it ran; only the reply was lost
     else:
@@ -279,18 +267,15 @@ def update_contact(pending: dict, gateway, claim_id: str, address: str) -> str:
     return f"applied {ref}"
 
 class FakeGateway:                                 # applies the write, then loses the reply once
-    def __init__(self):
-        self.rows, self.lose_reply = {}, True
+    def __init__(self): self.rows, self.lost = {}, False
     def send(self, claim_id, address, ref):
         self.rows[ref] = (claim_id, address)
-        if self.lose_reply:
-            self.lose_reply = False
-            raise LegacyTimeout()
-    def find_by_reference(self, ref):
-        return ref in self.rows
+        if not self.lost:
+            self.lost = True; raise LegacyTimeout()
+    def find_by_reference(self, ref): return ref in self.rows
 
 gw, pending = FakeGateway(), {}
-print(update_contact(pending, gw, "CLM4471", "1 New St"))
+print(update_contact(pending, gw, "CLM4471", "1 New St"))   # applied <ref>
 print(len(gw.rows), pending)                       # 1 {}: applied once, nothing in doubt
 ```
 

@@ -261,31 +261,24 @@ sequenceDiagram
 ## Examples
 ### Triage with handoffs, a tool and an input guardrail
 Requires `pip install openai-agents` and `OPENAI_API_KEY`. The guardrail is itself a tiny agent with a
-structured output.
+typed `bool` output.
 
 ```python
-import asyncio
-from pydantic import BaseModel
 from agents import (Agent, GuardrailFunctionOutput, InputGuardrailTripwireTriggered,
-                    Runner, function_tool, input_guardrail, trace)
+                    Runner, function_tool, input_guardrail)
 
 @function_tool
 def get_order_status(order_id: str) -> str:
     """Return the shipping status of an order, given its ID such as A100."""
-    return {"A100": "shipped 2025-05-02", "A200": "processing"}.get(order_id, "unknown order")
+    return {"A100": "shipped 2025-05-02"}.get(order_id, "unknown order")
 
-class TopicCheck(BaseModel):
-    off_topic: bool
-    reason: str
-
-checker = Agent(name="Topic checker", model="gpt-4o-mini", output_type=TopicCheck,
-                instructions="Flag messages unrelated to orders, billing or refunds.")
+checker = Agent(name="Topic checker", model="gpt-4o-mini", output_type=bool,
+                instructions="Answer true if the message is unrelated to orders, billing or refunds.")
 
 @input_guardrail
 async def on_topic(ctx, agent, user_input):
     res = await Runner.run(checker, user_input, context=ctx.context)
-    return GuardrailFunctionOutput(output_info=res.final_output,
-                                   tripwire_triggered=res.final_output.off_topic)
+    return GuardrailFunctionOutput(output_info=res.final_output, tripwire_triggered=res.final_output)
 
 orders = Agent(name="Orders agent", handoff_description="Order and shipping status questions",
                instructions="Look up orders with get_order_status. Never guess a status.",
@@ -295,15 +288,11 @@ billing = Agent(name="Billing agent", handoff_description="Charges, invoices and
 triage = Agent(name="Triage agent", instructions="Hand off to the right specialist.",
                handoffs=[orders, billing], input_guardrails=[on_topic])
 
-async def main():
-    with trace("support-triage"):
-        try:
-            res = await Runner.run(triage, "Where is my order A100?", max_turns=8)
-            print(res.last_agent.name, "->", res.final_output)
-        except InputGuardrailTripwireTriggered:
-            print("Refused: off-topic request")
-
-asyncio.run(main())
+try:
+    res = Runner.run_sync(triage, "Where is my order A100?")
+    print(res.last_agent.name, "->", res.final_output)
+except InputGuardrailTripwireTriggered:
+    print("Refused: off-topic request")
 ```
 
 - **Expected:** `Orders agent -> ...shipped 2025-05-02...`. Ask for a poem instead and the guardrail
@@ -322,7 +311,6 @@ from agents import Agent, MaxTurnsExceeded, RunContextWrapper, Runner, function_
 @dataclass
 class UserCtx:
     user_id: str
-    plan: str
 
 INVOICES = {"u1": ["INV-1", "INV-7"], "u2": ["INV-3"]}
 
@@ -336,7 +324,7 @@ agent = Agent[UserCtx](name="Account agent", tools=[list_my_invoices],
 
 async def handle(user_id: str, message: str) -> str:
     try:
-        res = await Runner.run(agent, message, context=UserCtx(user_id, "pro"), max_turns=6)
+        res = await Runner.run(agent, message, context=UserCtx(user_id), max_turns=6)
         return res.final_output
     except MaxTurnsExceeded:
         return "This needs a human; I have opened a ticket."   # fail closed, log the trace ID

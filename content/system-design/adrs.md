@@ -221,121 +221,66 @@ confirmation and explicit revisit triggers.
 
 **Status:** Accepted (2026-03-12)  **Supersedes:** none  **Deciders:** platform lead, security, CTO
 
-**Context.** Six engineers, launch in ten weeks. Expected launch volume ~20M tokens/month, highly
-uncertain (illustrative). NFRs: p95 time-to-first-token <= 1.5 s, cost <= $0.04 per conversation,
-EU data residency, provider must be swappable without client changes.
+**Context.** Six engineers, launch in ten weeks, ~20M tokens/month expected (illustrative).
+NFRs: p95 time-to-first-token <= 1.5 s, EU data residency, provider swappable without client changes.
 
-**Decision drivers.** Time to launch; engineering capacity; residency; cost at uncertain volume;
-ability to switch models as quality and prices change.
+**Drivers.** Time to launch; team capacity; residency; cost at uncertain volume.
 
-**Considered options.**
-1. Hosted model API (EU region) behind an internal gateway.
-2. Self-hosted open-weight model on two GPUs with vLLM.
+**Options.** 1. Hosted API (EU region) behind a gateway. 2. Self-hosted open-weight model with vLLM.
 3. Hybrid: hosted for chat, self-hosted for embeddings.
 
-**Decision.** Option 1. All model calls go through the gateway, which owns routing, quotas, prompt
-caching and per-tenant metering. We will not self-host any generation model in v1.
+**Decision.** Option 1. All model calls go through the gateway; no self-hosted generation model in v1.
 
-**Consequences.**
-- Easier: launch on time; model swaps are a gateway config change; no GPU operations.
-- Harder: per-token cost grows linearly with usage; dependence on provider rate limits and uptime;
-  residency relies on the provider's EU endpoint and DPA.
-- Follow-up: contract tests against the gateway interface; monthly cost and quality review.
+**Consequences.** Easier: on-time launch; model swaps are a gateway config change. Harder: cost grows
+linearly with usage; we depend on provider rate limits and its EU endpoint.
 
-**Confirmation.** CI import rule: only `gateway/` may import a provider SDK; provider keys exist only in
-the gateway's secret scope.
+**Confirmation.** CI import rule: only `gateway/` may import a provider SDK.
 
-**Evidence at decision time.** Golden set v3 (312 cases): hosted model faithfulness 0.91 vs best
-open-weight candidate 0.84; p95 TTFT 0.9 s vs 1.3 s on a single GPU under load test. Illustrative.
+**Evidence.** Golden set v3 (312 cases): faithfulness 0.91 hosted vs 0.84 best open-weight.
 
-**Revisit when:** sustained volume > 2B tokens/month for three months; an open-weight model reaches
->= 0.90 on golden set v3 or later; the provider cannot meet a customer's residency requirement; or
-provider price changes by more than 30%.
+**Revisit when:** volume > 2B tokens/month for three months; an open-weight model reaches >= 0.90 on
+golden set v3 or later; a customer's residency requirement cannot be met; price changes by > 30%.
 ```
 
 ### Agent scenario: an autonomy ADR and the test that confirms it
-A support agent can look up orders and issue refunds. The ADR records the autonomy decision; the test is
-its confirmation, so a new write tool registered without approval fails CI. Figures are illustrative.
+A support agent can look up orders and issue refunds. ADR-0012 records the decision "the agent drafts
+refunds; a human approves every write tool call", because a wrong refund is real money and hard to claw
+back. It revisits when refund accuracy on a later golden set passes the eval gate.
 
-```markdown
-# ADR-0012: The support agent drafts refunds; a human approves every refund write
-
-**Status:** Accepted  **Supersedes:** none  **Deciders:** support lead, platform lead, security
-
-**Context.** Agent has read tools (lookup_order, search_kb) and one write tool (issue_refund).
-On agent golden set v2 (illustrative), the agent picked the correct refund amount in most
-but not all cases; a wrong refund is real money and hard to claw back.
-
-**Options.** 1. Fully autonomous refunds. 2. Human approval for every write tool call.
-3. Autonomous below a small amount, approval above it.
-
-**Decision.** Option 2 for v1. Every tool marked as a write requires human approval
-before it executes. Read tools run without approval.
-
-**Consequences.** Safer; slower resolution; a reviewer queue to staff.
-
-**Confirmation.** CI test over the tool registry: every write tool requires approval.
-
-**Revisit when:** refund-amount accuracy on golden set v3 or later is high enough that option 3
-passes the eval gate, or reviewer queue time breaches its SLO for a month.
-```
+The test below is its confirmation, so a new write tool registered without approval fails CI.
 
 ```python
-# CI fitness function for ADR-0012: the tool registry must match the decision.
-from dataclasses import dataclass
+# CI fitness function for ADR-0012: every write tool requires human approval.
+REGISTRY = {  # tool name -> (writes, requires_approval)
+    "lookup_order": (False, False),
+    "issue_refund": (True, True),
+    "cancel_order": (True, False),  # added last sprint
+}
 
-@dataclass(frozen=True)
-class Tool:
-    name: str
-    writes: bool
-    requires_approval: bool
-
-REGISTRY = [
-    Tool("lookup_order", writes=False, requires_approval=False),
-    Tool("search_kb", writes=False, requires_approval=False),
-    Tool("issue_refund", writes=True, requires_approval=True),
-    Tool("cancel_order", writes=True, requires_approval=False),   # added last sprint
-]
-
-def adr_0012_violations(registry):
-    return [t.name for t in registry if t.writes and not t.requires_approval]
-
-print(adr_0012_violations(REGISTRY))
+violations = [name for name, (writes, approved) in REGISTRY.items() if writes and not approved]
+print(violations)
 # ['cancel_order']  -> CI fails, citing ADR-0012, until approval is added or a new ADR supersedes it
 ```
 
-### Runnable: a CI check that supersede links go both ways
+### Runnable: a CI check on supersede links
 Immutability only works if the chain is navigable. This check fails the build when a new record
 supersedes an old one that was never marked *Superseded*.
 
 ```python
-import re, tempfile
-from pathlib import Path
+import re
 
-STATUS = re.compile(r"\*\*Status:\*\*\s*(Proposed|Accepted|Deprecated|Superseded by ADR-(\d{4}))")
-SUPERSEDES = re.compile(r"\*\*Supersedes:\*\*\s*(none|ADR-(\d{4}))")
-
-def lint(adr_dir):
-    recs, errors = {}, []
-    for p in sorted(Path(adr_dir).glob("[0-9][0-9][0-9][0-9]-*.md")):
-        text = p.read_text()
-        st, sup = STATUS.search(text), SUPERSEDES.search(text)
-        if not st:
-            errors.append(f"{p.name}: missing or unknown Status")
-        recs[p.name[:4]] = (st.group(2) if st else None, sup.group(2) if sup else None)
-    for num, (superseded_by, supersedes) in recs.items():
-        if supersedes and recs.get(supersedes, (None,))[0] != num:
-            errors.append(f"ADR-{num} supersedes ADR-{supersedes}, which is not marked Superseded by ADR-{num}")
-        if superseded_by and recs.get(superseded_by, (None, None))[1] != num:
-            errors.append(f"ADR-{num} says Superseded by ADR-{superseded_by}, which does not link back")
+def lint(adrs):  # {"0007": record text, ...}
+    errors = []
+    for num, text in adrs.items():
+        m = re.search(r"\*\*Supersedes:\*\*\s*ADR-(\d{4})", text)
+        if m and f"Superseded by ADR-{num}" not in adrs.get(m.group(1), ""):
+            errors.append(f"ADR-{num} supersedes ADR-{m.group(1)}, which is not marked Superseded by ADR-{num}")
     return errors
 
-with tempfile.TemporaryDirectory() as d:
-    Path(d, "0007-hosted-model-api.md").write_text(
-        "# ADR-0007\n**Status:** Accepted (2026-03-12)  **Supersedes:** none\n")
-    Path(d, "0019-self-host-chat-model.md").write_text(
-        "# ADR-0019\n**Status:** Accepted (2026-09-30)  **Supersedes:** ADR-0007\n")
-    print(lint(d))
+print(lint({
+    "0007": "**Status:** Accepted (2026-03-12)  **Supersedes:** none",
+    "0019": "**Status:** Accepted (2026-09-30)  **Supersedes:** ADR-0007",
+}))
 # ['ADR-0019 supersedes ADR-0007, which is not marked Superseded by ADR-0019']
 ```
 
@@ -373,6 +318,8 @@ The triggers make the review a checklist instead of a debate. Observed values ar
 - **Quarterly review of agent decisions.** Use for model, vendor, framework and retrieval ADRs. Walk each
   record's dated assumptions and triggers, re-run the agent golden set where needed, and either note
   "still holds" in the review log or open a superseding ADR.
+- **Confirm a gateway ADR twice.** Pair the import rule with secret scoping, so provider keys exist only
+  in the gateway's secret scope, and add contract tests against the gateway interface.
 
 ## Trade-offs
 - **An hour or two of writing vs repeated re-litigation.** The ADR saves debating the same choice again;

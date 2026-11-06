@@ -309,41 +309,24 @@ A small, runnable version of the frontier step for the first step of a support a
 ticket. The measurements are illustrative numbers, not benchmarks; the structure is what matters.
 
 ```python
-from dataclasses import dataclass
-
-@dataclass
-class Config:
-    name: str
-    quality: float        # pass rate on the task's golden set, 0..1
-    p95_ms: int           # end-to-end p95 on a traffic replay
-    cost_per_task: float  # USD per successful task, retries and judge calls included
-
+# (name, quality = golden-set pass rate, p95_ms on a traffic replay, USD per successful task)
 configs = [
-    Config("large, long prompt",     0.94, 3800, 0.0180),
-    Config("large, trimmed prompt",  0.93, 2900, 0.0110),
-    Config("small, trimmed prompt",  0.86,  900, 0.0012),
-    Config("small, fine-tuned",      0.92,  950, 0.0014),
-    Config("small -> large cascade", 0.93, 1400, 0.0038),
-    Config("medium, trimmed prompt", 0.90, 1700, 0.0045),
+    ("large, long prompt",     0.94, 3800, 0.0180),
+    ("large, trimmed prompt",  0.93, 2900, 0.0110),
+    ("small, trimmed prompt",  0.86,  900, 0.0012),
+    ("small, fine-tuned",      0.92,  950, 0.0014),
+    ("small -> large cascade", 0.93, 1400, 0.0038),
+    ("medium, trimmed prompt", 0.90, 1700, 0.0045),
 ]
 
-def dominated(c, others):  # B dominates A: no worse on all three, strictly better on one
-    return any(o.quality >= c.quality and o.p95_ms <= c.p95_ms
-               and o.cost_per_task <= c.cost_per_task
-               and (o.quality > c.quality or o.p95_ms < c.p95_ms
-                    or o.cost_per_task < c.cost_per_task) for o in others)
+def dominated(c, others):  # some o no worse on all three axes and strictly better on one
+    return any(o[1] >= c[1] and o[2] <= c[2] and o[3] <= c[3] and o[1:] != c[1:] for o in others)
 
 frontier = [c for c in configs if not dominated(c, configs)]
-feasible = [c for c in frontier if c.quality >= 0.90 and c.p95_ms <= 2000]
-best = min(feasible, key=lambda c: c.cost_per_task)
-for c in frontier:
-    print(f"{c.name:<24} q={c.quality:.2f}  p95={c.p95_ms:>5} ms  ${c.cost_per_task:.4f}/task")
-print("choose:", best.name)
-# large, long prompt       q=0.94  p95= 3800 ms  $0.0180/task
-# small, trimmed prompt    q=0.86  p95=  900 ms  $0.0012/task
-# small, fine-tuned        q=0.92  p95=  950 ms  $0.0014/task
-# small -> large cascade   q=0.93  p95= 1400 ms  $0.0038/task
-# choose: small, fine-tuned
+feasible = [c for c in frontier if c[1] >= 0.90 and c[2] <= 2000]
+print([c[0] for c in frontier])
+# ['large, long prompt', 'small, trimmed prompt', 'small, fine-tuned', 'small -> large cascade']
+print("choose:", min(feasible, key=lambda c: c[3])[0])   # choose: small, fine-tuned
 ```
 
 - **Two configurations vanish immediately.** The trimmed large model is dominated by the cascade (same
@@ -361,23 +344,6 @@ print("choose:", best.name)
 Cascade cost per task is `s + e·l` (small cost *s*, large cost *l*, escalation rate *e*), so it beats the
 large model alone only while `e < 1 − s/l`. The same holds for one agent step routed small-first.
 Illustrative prices:
-
-```python
-def cascade_cost(s, l, e):
-    return s + e * l                 # every request pays s; escalated ones also pay l
-
-def break_even_escalation(s, l):
-    return 1 - s / l                 # cascade wins while e is below this
-
-for s, l in [(0.001, 0.010), (0.005, 0.010)]:   # 10x and 2x price gaps
-    print(f"gap {l/s:.0f}x  break-even e < {break_even_escalation(s, l):.0%}")
-    for e in (0.1, 0.3, 0.6):
-        c = cascade_cost(s, l, e)
-        print(f"   e={e:.0%}  cascade ${c:.4f}  vs large ${l:.4f}  -> {'cascade' if c < l else 'large'}")
-# output, condensed to one line per gap:
-# gap 10x  break-even e < 90%   (e=10%: $0.0020, e=30%: $0.0040, e=60%: $0.0070 -> cascade)
-# gap 2x   break-even e < 50%   (e=10%: $0.0060, e=30%: $0.0080 -> cascade; e=60%: $0.0110 -> large)
-```
 
 | Price gap | Break-even escalation | At 30% escalation | At 60% escalation |
 |---|---|---|---|

@@ -154,60 +154,63 @@ flowchart TD
 ```
 
 ## Examples
-### Core skeleton: bounded loop with scoped tools
-A minimal version using the Anthropic Messages API; the same shape works with any tool-calling API.
-Set the model id from the provider's current model list.
+### Scoped tool executor: the rules live in code
+The model picks tools; this function decides what they may do. It runs on its own with no API key.
 
 ```python
-import anthropic, json
-
-client = anthropic.Anthropic()
-MODEL = "YOUR_MODEL_ID"          # check the current docs for model ids
 REFUND_LIMIT = 50.0
 ORDERS = {"A1": {"customer": "c42", "total": 30.0}, "B7": {"customer": "c99", "total": 400.0}}
 
-TOOLS = [
-    {"name": "get_order", "description": "Look up one of the current customer's orders.",
-     "input_schema": {"type": "object", "properties": {"order_id": {"type": "string"}},
-                      "required": ["order_id"]}},
-    {"name": "issue_refund", "description": "Refund an order. Large refunds need human approval.",
-     "input_schema": {"type": "object", "properties": {
-         "order_id": {"type": "string"}, "amount": {"type": "number"}, "reason": {"type": "string"}},
-         "required": ["order_id", "amount", "reason"]}},
-    {"name": "escalate", "description": "Hand the conversation to a human with a summary.",
-     "input_schema": {"type": "object", "properties": {"summary": {"type": "string"}},
-                      "required": ["summary"]}},
-]
-
-def run_tool(name, args, customer_id, audit):
+def run_tool(name: str, args: dict, customer_id: str) -> dict:
+    if name == "escalate":
+        return {"status": "ticket_created"}
+    if name not in ("get_order", "issue_refund"):       # the model can hallucinate a tool name
+        return {"error": f"unknown tool {name}"}
     order = ORDERS.get(args.get("order_id", ""))
-    if name in ("get_order", "issue_refund") and (not order or order["customer"] != customer_id):
-        result = {"error": "order not found"}            # same answer for "not yours" and "missing"
-    elif name == "get_order":
-        result = order
-    elif name == "issue_refund":
-        if not 0 < args["amount"] <= order["total"]:
-            result = {"error": "amount must be between 0 and the order total"}
-        else:
-            ok = args["amount"] <= REFUND_LIMIT
-            result = {"status": "refunded" if ok else "pending_approval"}
-    else:
-        result = {"status": "ticket_created"}
-    audit.append({"customer": customer_id, "tool": name, "args": args, "result": result})
-    return result
+    if not order or order["customer"] != customer_id:   # customer id comes from the session, not the model
+        return {"error": "order not found"}             # same answer for "not yours" and "missing"
+    if name == "get_order":
+        return order
+    if not 0 < args["amount"] <= order["total"]:
+        return {"error": "amount must be between 0 and the order total"}
+    return {"status": "refunded" if args["amount"] <= REFUND_LIMIT else "pending_approval"}
 
-def support_turn(messages, customer_id, audit, max_steps=8) -> str:
+print(run_tool("issue_refund", {"order_id": "A1", "amount": 20}, "c42"))    # {'status': 'refunded'}
+print(run_tool("issue_refund", {"order_id": "B7", "amount": 120}, "c99"))   # {'status': 'pending_approval'}
+print(run_tool("get_order", {"order_id": "B7"}, "c42"))                     # {'error': 'order not found'}
+```
+
+### Bounded loop with the Anthropic Messages API
+The same shape works with any tool-calling API. Set the model id from the provider's current model list;
+`run_tool` is the executor above.
+
+```python
+import json, anthropic
+
+client = anthropic.Anthropic()
+MODEL = "YOUR_MODEL_ID"          # check the current docs for model ids
+
+def tool(name, description, **props):   # every property is a required string or number
+    return {"name": name, "description": description, "input_schema": {"type": "object",
+            "properties": {k: {"type": t} for k, t in props.items()}, "required": list(props)}}
+
+TOOLS = [tool("get_order", "Look up one of the current customer's orders.", order_id="string"),
+         tool("issue_refund", "Refund an order. Large refunds need human approval.",
+              order_id="string", amount="number"),
+         tool("escalate", "Hand the conversation to a human with a summary.", summary="string")]
+
+def support_turn(messages: list, customer_id: str, max_steps: int = 8) -> str:
     for _ in range(max_steps):
         resp = client.messages.create(model=MODEL, max_tokens=1024, tools=TOOLS, messages=messages,
                                       system="You are a support agent. Use tools; never guess policy.")
         messages.append({"role": "assistant", "content": resp.content})
         if resp.stop_reason != "tool_use":
             return "".join(b.text for b in resp.content if b.type == "text")
-        results = [{"type": "tool_result", "tool_use_id": b.id,
-                    "content": json.dumps(run_tool(b.name, b.input, customer_id, audit))}
-                   for b in resp.content if b.type == "tool_use"]
-        messages.append({"role": "user", "content": results})
-    run_tool("escalate", {"summary": "step limit reached"}, customer_id, audit)
+        messages.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": b.id,
+             "content": json.dumps(run_tool(b.name, b.input, customer_id))}
+            for b in resp.content if b.type == "tool_use"]})
+    run_tool("escalate", {"summary": "step limit reached"}, customer_id)
     return "I have passed this to a colleague, who will reply here."
 ```
 
@@ -239,6 +242,8 @@ string. Targets below are illustrative starting points to tune with the business
   code; alert when a conversation hits a cap, because it usually means a loop or a confused model.
 - **PII hygiene in traces.** Redact emails, addresses and card fragments before export, and set trace
   retention to match the support data policy.
+- **Audit every tool call.** Append customer id, tool, arguments and result to the audit log on each
+  execution, denials included, and require a `reason` argument on refunds so the record explains itself.
 
 ## Trade-offs
 - **Autonomy vs safety.** Letting the agent refund small amounts raises resolution rate, but every

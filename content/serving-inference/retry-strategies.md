@@ -181,42 +181,38 @@ flowchart TD
   blind retry fails identically and the model can change the call.
 
 ## Examples
-### Retry helper with full jitter, Retry-After and a budget
+### Retry helper with full jitter, Retry-After and a deadline
 The helper decides by status code, prefers the server's `Retry-After`, otherwise sleeps with full jitter
-under a cap, refuses to exceed the request's deadline, and consults a process-wide retry budget so an
-incident cannot multiply load. In an async service replace `time.sleep` with `await asyncio.sleep`.
+under a cap, and refuses a wait that would overrun the request's deadline. In an async service replace
+`time.sleep` with `await asyncio.sleep`.
 
 ```python
 import random, time
 
 RETRYABLE = {408, 429, 500, 502, 503, 504, 529}
-BASE_S, CAP_S, MAX_ATTEMPTS, DEADLINE_S = 0.5, 8.0, 3, 30.0
 
-class RetryBudget:
-    """Process-wide: retries may not exceed `ratio` of recent requests (use a sliding window in prod)."""
-    def __init__(self, ratio=0.1): self.ratio, self.requests, self.retries = ratio, 0, 0
-    def allow(self): return self.retries < self.ratio * max(self.requests, 10)
+class ApiError(Exception):
+    def __init__(self, status, retry_after=None): self.status, self.retry_after = status, retry_after
 
-budget = RetryBudget()
-
-def call_with_retry(send):
-    deadline = time.monotonic() + DEADLINE_S
-    budget.requests += 1
-    for attempt in range(MAX_ATTEMPTS):
+def call_with_retry(send, attempts=3, base=0.5, cap=8.0, deadline_s=30.0):
+    deadline = time.monotonic() + deadline_s
+    for attempt in range(attempts):
         try:
-            return send()                                   # raises ApiError(status, retry_after)
+            return send()
         except ApiError as e:
-            last_try = attempt == MAX_ATTEMPTS - 1
-            if e.status not in RETRYABLE or last_try or not budget.allow():
+            if e.status not in RETRYABLE or attempt == attempts - 1:
                 raise
-            if e.retry_after is not None:                   # the server knows when capacity returns
-                delay = min(float(e.retry_after), CAP_S * 4)
-            else:
-                delay = random.uniform(0, min(CAP_S, BASE_S * 2 ** attempt))   # full jitter
+            delay = (float(e.retry_after) if e.retry_after is not None        # server's schedule first
+                     else random.uniform(0, min(cap, base * 2 ** attempt)))   # full jitter
             if time.monotonic() + delay > deadline:
-                raise                                       # a retry that cannot finish in time is waste
-            budget.retries += 1
+                raise                                   # a retry that cannot finish in time is waste
             time.sleep(delay)
+
+failures = [ApiError(503), ApiError(429, retry_after=0.2)]
+def send():
+    if failures: raise failures.pop(0)
+    return "ok"
+print(call_with_retry(send))   # ok  (after one jittered wait and one 0.2 s Retry-After wait)
 ```
 
 - **`retry_after` is assumed to be seconds already.** If the header carries the HTTP-date form, convert
@@ -233,13 +229,12 @@ class TokenBucketBudget:
     def on_success(self):
         self.tokens = min(self.capacity, self.tokens + self.deposit)
     def try_retry(self):
-        if self.tokens >= 1:
-            self.tokens -= 1
-            return True
-        return False
+        if self.tokens < 1:
+            return False
+        self.tokens -= 1
+        return True
 
-b = TokenBucketBudget()
-calls = 0
+b, calls = TokenBucketBudget(), 0
 for _ in range(200):                 # 200 requests while the provider is fully down
     calls += 1                       # first attempt always goes out
     for _ in range(2):               # up to 2 retries per request
@@ -267,31 +262,18 @@ the tool result. `ToolHTTPError` and `send_email_api` stand in for your tool cli
 import random, time
 
 TRANSIENT = {408, 429, 500, 502, 503, 504}
-
-class RunBudget:
-    """Caps every call a run makes, retries included."""
-    def __init__(self, max_calls=40): self.left = max_calls
-    def spend(self):
-        self.left -= 1
-        if self.left < 0:
-            raise RuntimeError("run budget exhausted: stop and report")
-
-def call_tool(fn, args, key, budget, attempts=3, base=0.5, cap=4.0):
+def call_tool(fn, args, key, attempts=3):
     """Returns a tool-result dict the agent appends to its transcript."""
     for attempt in range(attempts):
-        budget.spend()                                  # every attempt counts against the run
         try:
             return {"ok": True, "result": fn(**args, idempotency_key=key)}   # same key on every attempt
         except ToolHTTPError as e:
             if e.status in TRANSIENT and attempt < attempts - 1:
-                time.sleep(random.uniform(0, min(cap, base * 2 ** attempt)))  # full jitter
+                time.sleep(random.uniform(0, min(4.0, 0.5 * 2 ** attempt)))  # full jitter
                 continue
-            # Semantic error, or retries exhausted: let the model decide what to do next.
-            return {"ok": False, "error": f"{e.status}: {e.message}", "retryable": e.status in TRANSIENT}
+            return {"ok": False, "error": f"{e.status}: {e.message}"}       # the model decides next
 
-run_budget = RunBudget(max_calls=40)                  # shared by every model and tool call in this run
-result = call_tool(send_email_api, {"to": "a@example.com", "body": "..."},
-                   key=f"{run_id}:step4:email", budget=run_budget)
+result = call_tool(send_email_api, {"to": "a@example.com", "body": "..."}, key=f"{run_id}:step4:email")
 ```
 
 ### Worked scenario: layered retries in a 10-step agent during a provider blip
@@ -319,6 +301,8 @@ Illustrative: the provider fails every attempt for 20 seconds; the agent is at s
 - **Batch jobs retry through the queue.** For pipelines, cap backoff in minutes and re-enqueue with a
   delay instead of sleeping in a worker, with an idempotency key per item. Monitor retries per job and
   dead-letter queue depth.
+- **Every tool attempt spends the run budget.** Charge each attempt, retries included, against one per-run
+  cap on model and tool calls (for example 40), so a retry loop stops with "budget exhausted" instead of running on.
 
 ## Trade-offs
 - **Success rate vs amplification.** Retries raise success rates when failures are independent but

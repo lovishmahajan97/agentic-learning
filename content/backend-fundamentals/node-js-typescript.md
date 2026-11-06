@@ -350,14 +350,37 @@ sequenceDiagram
 ```
 
 ## Examples
-### Streaming gateway with backpressure, cancellation and Zod
+### Streaming gateway with backpressure and cancellation
 A minimal Node gateway that relays a streaming agent response from the Python core, honours backpressure,
-cancels the upstream run when the client disconnects, and validates a model-produced tool call at
-runtime with a Zod schema that also provides the static type for free.
+and cancels the upstream run when the client disconnects. The upstream body is a fixed prompt to keep it
+short; forwarding the client's body as a stream is covered in Production patterns.
 
 ```ts
 import http from "node:http";
-import { Readable } from "node:stream";
+
+http.createServer(async (req, res) => {
+  const ac = new AbortController();               // client hangs up -> cancel upstream generation
+  res.on("close", () => { if (!res.writableFinished) ac.abort(); });
+  try {
+    const upstream = await fetch("http://python-core:8000/v1/chat", { method: "POST", signal: ac.signal,
+      headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt: "hi" }) });
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    const reader = upstream.body!.getReader();
+    for (let r = await reader.read(); !r.done; r = await reader.read()) {  // yields the loop per chunk
+      if (!res.write(r.value))                     // buffer past high-water mark: client is slow
+        await new Promise((ok) => { res.once("drain", ok); res.once("close", ok); });
+    }
+    res.end();
+  } catch (e) { if (!ac.signal.aborted) res.destroy(e as Error); } // abort is expected, not an error
+}).listen(3000);
+```
+
+### A tool dispatcher that validates every model tool call
+In a TypeScript agent loop, each tool call the model emits is parsed against a Zod schema before it runs;
+a failure goes back to the model as a tool result instead of throwing. The schema also provides the
+static type for free.
+
+```ts
 import { z } from "zod";
 
 const ToolCall = z.object({                       // runtime schema: TS types vanish at runtime
@@ -366,68 +389,20 @@ const ToolCall = z.object({                       // runtime schema: TS types va
 });
 type ToolCall = z.infer<typeof ToolCall>;        // static type derived from the runtime schema
 
-async function* relay(upstream: Response): AsyncGenerator<string> {
-  const reader = upstream.body!.getReader();
-  const dec = new TextDecoder();
-  for (;;) {
-    const { value, done } = await reader.read();  // yields the event loop between chunks
-    if (done) return;
-    yield dec.decode(value, { stream: true });
-  }
-}
+const lookupOrder = async (a: ToolCall["arguments"]) => ({ status: "shipped", orderId: a.orderId });
 
-http.createServer(async (req, res) => {
-  const ac = new AbortController();               // client hangs up -> cancel upstream generation
-  res.on("close", () => { if (!res.writableFinished) ac.abort(); });
-  try {
-    const upstream = await fetch("http://python-core:8000/v1/chat", {
-      method: "POST", headers: { "content-type": "application/json" }, signal: ac.signal,
-      body: Readable.toWeb(req) as ReadableStream, // forward the client body without buffering it
-      duplex: "half",
-    } as RequestInit);
-    res.writeHead(200, { "content-type": "text/event-stream" });
-    for await (const chunk of relay(upstream)) {
-      if (!res.write(chunk))                       // buffer past high-water mark: client is slow
-        await new Promise((r) => { res.once("drain", r); res.once("close", r); });
-    }
-    res.end();
-  } catch (e) { if (!ac.signal.aborted) res.destroy(e as Error); } // abort is expected, not an error
-}).listen(3000);
-
-const parsed = ToolCall.safeParse(JSON.parse('{"name":"lookup_order","arguments":{"orderId":"ord_42x"}}'));
-if (!parsed.success) console.error(parsed.error.issues);   // never trust model output structurally
-```
-
-### A tool dispatcher that validates every model tool call
-In a TypeScript agent loop, each tool call the model emits is parsed against its schema before it runs;
-a failure goes back to the model as a tool result instead of throwing.
-
-```ts
-import { z } from "zod";
-
-const tools = {
-  lookup_order: {
-    args: z.object({ orderId: z.string().regex(/^ord_[a-z0-9]+$/) }),
-    run: async (a: { orderId: string }) => ({ status: "shipped", orderId: a.orderId }),
-  },
-  refund: {
-    args: z.object({ orderId: z.string(), amountCents: z.number().int().positive().max(50_000) }),
-    run: async (a: { orderId: string; amountCents: number }) => ({ queued: true, ...a }),
-  },
-} as const;
-
-type ToolName = keyof typeof tools;
-
-export async function dispatch(name: string, rawArgs: string, signal: AbortSignal) {
-  if (!Object.hasOwn(tools, name)) return { error: `unknown tool ${name}` }; // invented tool; `in` would accept "toString"
-  const tool = tools[name as ToolName];
+export async function dispatch(raw: string, signal: AbortSignal) {
   let json: unknown;
-  try { json = JSON.parse(rawArgs); } catch { return { error: "arguments were not valid JSON" }; }
-  const parsed = tool.args.safeParse(json);
-  if (!parsed.success) return { error: parsed.error.issues };           // let the model repair it
-  if (signal.aborted) return { error: "run cancelled" };                // user left: do not act
-  return tool.run(parsed.data as never);
+  try { json = JSON.parse(raw); } catch { return { error: "arguments were not valid JSON" }; }
+  const parsed = ToolCall.safeParse(json);
+  if (!parsed.success) return { error: parsed.error.issues };   // let the model repair it
+  if (signal.aborted) return { error: "run cancelled" };        // user left: do not act
+  return lookupOrder(parsed.data.arguments);
 }
+
+const live = new AbortController().signal;
+console.log(await dispatch('{"name":"lookup_order","arguments":{"orderId":"ord_42x"}}', live));
+// { status: 'shipped', orderId: 'ord_42x' }; an orderId of "42" returns { error: [ ...issues ] }
 ```
 
 ### Measuring a blocked event loop, and the worker fix
@@ -440,25 +415,21 @@ import { Worker } from "node:worker_threads";
 
 const h = monitorEventLoopDelay({ resolution: 10 });     // sample loop delay every 10 ms
 h.enable();
-
-const busy = (ms) => { const end = Date.now() + ms; while (Date.now() < end); }; // sync CPU work
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const CPU = "const end = Date.now() + 500; while (Date.now() < end);";   // 500 ms of sync CPU work
 
 async function phase(name, work) {
-  h.reset();
-  await new Promise((r) => setTimeout(r, 50));             // first sample after reset is a baseline
+  h.reset(); await sleep(50);                           // first sample after reset is a baseline
   await work();
-  await new Promise((r) => setTimeout(r, 200));            // let the histogram take samples
+  await sleep(200);                                      // let the histogram take samples
   console.log(`${name}: max loop delay ${(h.max / 1e6).toFixed(0)} ms`); // histogram is in ns
 }
 
-await phase("idle", async () => {});
-await phase("500 ms of CPU on the main thread", async () => busy(500));
-await phase("same 500 ms in a worker thread", () => new Promise((resolve) => {
-  const src = `const end = Date.now() + 500; while (Date.now() < end);
-               require("node:worker_threads").parentPort.postMessage("done");`;
-  new Worker(src, { eval: true }).once("message", resolve); // main loop stays free meanwhile
-}));
-// idle: ~11 ms   main thread: ~507 ms   worker thread: ~11 ms
+await phase("main thread", async () => new Function(CPU)());
+await phase("worker thread", () => new Promise((done) =>
+  new Worker(CPU + 'require("node:worker_threads").parentPort.postMessage(0);', { eval: true })
+    .once("message", done)));                            // main loop stays free meanwhile
+// main thread: ~507 ms   worker thread: ~11 ms
 ```
 
 ### Worked scenario: why the agent gateway's memory climbed
@@ -491,6 +462,11 @@ reads ~10. Figures are illustrative.
   error instead of a silent `undefined`.
 - **Keep long agent runs off short-lived functions.** Serverless routes start or stream short runs; runs
   that loop for minutes go to a long-lived server or a queue, because platform timeouts cut them mid-step.
+- **Forward request bodies as streams.** To relay the client's body upstream without buffering it, pass
+  `Readable.toWeb(req)` as the `fetch` body with `duplex: "half"`, which Node's `fetch` requires for a
+  streaming request body.
+- **Look tools up with `Object.hasOwn`.** In a multi-tool registry, check the model's tool name with
+  `Object.hasOwn(tools, name)`, because `name in tools` accepts inherited keys such as `"toString"`.
 
 ## Trade-offs
 - **One language vs a split ecosystem.** One language from browser to agent gateway cuts translation and

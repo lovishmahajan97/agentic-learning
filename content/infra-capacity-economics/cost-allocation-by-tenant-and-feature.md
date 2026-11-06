@@ -196,22 +196,16 @@ import asyncio, contextvars
 TAGS = contextvars.ContextVar("cost_tags", default=None)   # tenant, feature, run id
 LEDGER = []
 
-def record(kind, cost_usd):
-    tags = TAGS.get() or {"tenant_id": "UNATTRIBUTED", "feature": "UNATTRIBUTED"}
-    LEDGER.append({**tags, "kind": kind, "cost_usd": cost_usd})
+def record(kind, cost_usd):                # stand-in for the gateway's metering
+    tenant = (TAGS.get() or {"tenant_id": "UNATTRIBUTED"})["tenant_id"]
+    LEDGER.append((tenant, kind, cost_usd))
 
-async def call_model(step, cost):          # stand-in for the gateway client
-    record(f"model:{step}", cost)
-
-async def web_search(q):                   # tool that itself calls a model to summarise
-    record("tool:web_search", 0.005)
-    await call_model("summarise_results", 0.02)
+async def web_search(q): record("model:summarise_results", 0.02)   # a tool that calls a model
 
 async def run_agent(tenant_id, feature, run_id):
     TAGS.set({"tenant_id": tenant_id, "feature": feature, "run_id": run_id})
-    await call_model("plan", 0.03)
+    record("model:plan", 0.03)
     await asyncio.gather(web_search("a"), web_search("b"))  # tasks copy the context
-    await call_model("answer", 0.04)
     return {"job": "reembed", **TAGS.get()}                 # copy tags into job payloads
 
 def run_job(payload):                      # queue worker: restore tags from the payload
@@ -219,13 +213,10 @@ def run_job(payload):                      # queue worker: restore tags from the
     record("model:reembed", 0.08)
 
 job = asyncio.run(run_agent("acme", "research-agent", "r-17"))
-record("model:background_job_without_tags", 0.08)          # a hop that lost the context
-run_job(job)                                               # the same job, tags carried over
-for row in LEDGER:
-    print(row["tenant_id"], row["kind"], row["cost_usd"])
-# acme model:plan 0.03 ... acme model:answer 0.04
-# UNATTRIBUTED model:background_job_without_tags 0.08
-# acme model:reembed 0.08
+record("model:job_without_tags", 0.08)     # a hop that lost the context
+run_job(job)                               # the same job, tags carried over
+print(*LEDGER, sep="\n")
+# acme rows for plan and both summaries, then UNATTRIBUTED job_without_tags, then acme reembed
 ```
 
 ### Worked scenario: where an agent run's spend goes missing
@@ -244,36 +235,28 @@ tags.
   model client without the run's context.
 
 ### Monthly allocation in SQL
-A month of usage: hosted API calls priced at the gateway, plus a shared GPU fleet and vector store
-billed as lump sums (PostgreSQL; numeric columns).
+A month of usage: hosted API calls priced at the gateway, plus a shared GPU fleet billed as a lump sum
+and split by GPU-seconds (PostgreSQL; numeric columns). Other pools, such as a vector store, are one
+more invoice joined and split by their own driver.
 
 ```sql
 WITH usage AS (
   SELECT COALESCE(tenant_id, 'UNATTRIBUTED') AS tenant_id,
          COALESCE(feature,   'UNATTRIBUTED') AS feature,
          COALESCE(SUM(api_cost_usd), 0)::numeric AS direct_usd,  -- priced per call at the gateway
-         SUM(gpu_seconds)::numeric       AS gpu_s,       -- self-hosted calls
-         SUM(retrieval_queries)::numeric AS rq
-  FROM usage_events
-  WHERE ts >= DATE '2026-09-01' AND ts < DATE '2026-10-01'
+         SUM(gpu_seconds)::numeric AS gpu_s                      -- driver for the shared fleet
+  FROM usage_events WHERE ts >= DATE '2026-09-01' AND ts < DATE '2026-10-01'
   GROUP BY 1, 2
 ),
-pools AS (
-  SELECT SUM(amount_usd) FILTER (WHERE pool = 'gpu_fleet')    AS gpu_usd,
-         SUM(amount_usd) FILTER (WHERE pool = 'vector_store') AS vec_usd
-  FROM shared_invoices WHERE month = DATE '2026-09-01'
-),
 alloc AS (
-  SELECT u.tenant_id, u.feature, u.direct_usd,
-         COALESCE(p.gpu_usd * u.gpu_s / NULLIF(SUM(u.gpu_s) OVER (), 0), 0) AS gpu_usd,
-         COALESCE(p.vec_usd * u.rq / NULLIF(SUM(u.rq) OVER (), 0), 0)       AS vector_usd
-  FROM usage u CROSS JOIN pools p
+  SELECT u.*, COALESCE(i.gpu_usd * u.gpu_s / NULLIF(SUM(u.gpu_s) OVER (), 0), 0) AS gpu_usd
+  FROM usage u
+  CROSS JOIN (SELECT SUM(amount_usd) AS gpu_usd FROM shared_invoices
+              WHERE pool = 'gpu_fleet' AND month = DATE '2026-09-01') i
 )
-SELECT tenant_id, feature,
-       ROUND(direct_usd, 2) AS direct, ROUND(gpu_usd, 2) AS gpu, ROUND(vector_usd, 2) AS vector,
-       ROUND(direct_usd + gpu_usd + vector_usd, 2) AS total
-FROM alloc
-ORDER BY total DESC;
+SELECT tenant_id, feature, ROUND(direct_usd, 2) AS direct, ROUND(gpu_usd, 2) AS gpu,
+       ROUND(direct_usd + gpu_usd, 2) AS total
+FROM alloc ORDER BY total DESC;
 ```
 
 - **The `UNATTRIBUTED` row should be small;** if it is 15% of spend, fix tagging before trusting any
@@ -299,28 +282,18 @@ A versioned price table means a provider price change never rewrites last quarte
 ```python
 from datetime import date
 
-# $ per million tokens, illustrative. Rows are appended, never edited.
-PRICES = [
+PRICES = [  # $ per million tokens, illustrative; rows are appended, never edited
     ("large", date(2026, 1, 1), {"in": 3.00, "cached": 0.30, "out": 15.00}),
     ("large", date(2026, 9, 15), {"in": 2.50, "cached": 0.25, "out": 12.50}),
 ]
 
-def price_for(model, day):
-    rows = [(start, p) for m, start, p in PRICES if m == model and start <= day]
-    if not rows:
-        raise LookupError(f"no price for {model} on {day}")
-    return max(rows, key=lambda r: r[0])
-
 def priced_event(call):
-    for tag in ("tenant_id", "feature", "trace_id"):
-        if not call.get(tag):
-            raise ValueError(f"untagged model call: missing {tag}")   # or flag as UNATTRIBUTED
-    start, p = price_for(call["model"], call["day"])
-    cost = (call["fresh_in"] * p["in"] + call["cached_in"] * p["cached"]
-            + call["out"] * p["out"]) / 1e6
+    start, p = max(((s, p) for m, s, p in PRICES if m == call["model"] and s <= call["day"]),
+                   key=lambda r: r[0])                 # latest row in force on that day
+    cost = (call["fresh_in"] * p["in"] + call["cached_in"] * p["cached"] + call["out"] * p["out"]) / 1e6
     return {**call, "price_version": start.isoformat(), "api_cost_usd": round(cost, 6)}
 
-call = dict(tenant_id="acme", feature="contract-review", trace_id="t-91", model="large",
+call = dict(tenant_id="acme", feature="contract-review", model="large",
             day=date(2026, 9, 10), fresh_in=12_000, cached_in=2_000, out=800)
 print(priced_event(call)["api_cost_usd"])                                 # 0.0486, old price
 print(priced_event({**call, "day": date(2026, 9, 20)})["api_cost_usd"])   # 0.0405, new price
@@ -344,6 +317,8 @@ print(priced_event({**call, "day": date(2026, 9, 20)})["api_cost_usd"])   # 0.04
 - **Cost-versus-revenue alerts per tenant.** Join allocated cost with contract revenue and flag tenants
   whose cost exceeds a set share of revenue. Monitor the count of negative-margin tenants and feed it to
   pricing, quotas and isolation decisions.
+- **Fail loudly on a missing price.** If no price row covers a call's model and day, raise or flag the
+  event instead of pricing it at zero. Monitor events without a price version.
 
 ## Trade-offs
 - **Fine-grained drivers vs effort.** GPU-seconds by phase and per-query vector cost are fairer, but cost

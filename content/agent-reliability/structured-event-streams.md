@@ -384,25 +384,20 @@ flowchart TD
 ```
 
 ## Examples
-### Typed stream, fold and SSE framing
-A minimal typed stream: a discriminated union of events, a single-writer emitter, a pure fold that
-rebuilds state, and SSE framing for the UI. The same list feeds persistence, replay and evaluation.
+### Typed events and SSE framing
+A minimal typed stream: a discriminated union of events with a shared envelope, `seq` assigned by a
+single writer, and SSE framing for the UI. The same list feeds persistence, replay and evaluation.
 Needs Python 3.10+ for `str | None`; checked with pydantic 2.14.
 
 ```python
+import itertools
 from typing import Literal, Union
 from pydantic import BaseModel
-import json, itertools
 
 class Base(BaseModel):
     run_id: str
     seq: int
-    version: int = 1
-
-class LLMResponse(Base):
-    type: Literal["llm.response"] = "llm.response"
-    text: str = ""
-    tool_calls: list[dict] = []
+    version: int = 1                              # bump and upcast when a payload shape changes
 
 class ToolRequested(Base):
     type: Literal["tool.call.requested"] = "tool.call.requested"
@@ -412,54 +407,32 @@ class ToolResult(Base):
     type: Literal["tool.call.result"] = "tool.call.result"
     call_id: str; ok: bool; error: str | None = None; result_ref: str | None = None
 
-class RunCompleted(Base):
-    type: Literal["run.completed"] = "run.completed"
-    answer: str
-
-Event = Union[LLMResponse, ToolRequested, ToolResult, RunCompleted]
-
-def emit(run_id: str, counter: itertools.count, cls, **payload) -> Event:
-    return cls(run_id=run_id, seq=next(counter), **payload)        # single writer assigns seq
-
-def apply(state: dict, ev: Event) -> dict:
-    """Deterministic fold, no I/O; it mutates only the accumulator. state = reduce(apply, events)."""
-    if ev.type == "llm.response":
-        state["messages"].append({"role": "assistant", "content": ev.text, "tool_calls": ev.tool_calls})
-    elif ev.type == "tool.call.requested":
-        state["pending"][ev.call_id] = ev.name
-    elif ev.type == "tool.call.result":
-        state["pending"].pop(ev.call_id, None)
-        state["messages"].append({"role": "tool", "call_id": ev.call_id, "ok": ev.ok, "ref": ev.result_ref})
-    elif ev.type == "run.completed":
-        state["done"], state["answer"] = True, ev.answer
-    return state
-
-def rebuild(events: list[Event]) -> dict:
-    state = {"messages": [], "pending": {}, "done": False}
-    for ev in sorted(events, key=lambda e: e.seq):                   # order by seq, never by timestamp
-        state = apply(state, ev)
-    return state
+Event = Union[ToolRequested, ToolResult]
 
 def to_sse(ev: Event) -> str:                     # UI transport; client resends last seq on reconnect
-    return f"id: {ev.seq}\nevent: {ev.type}\ndata: {json.dumps(ev.model_dump())}\n\n"
+    return f"id: {ev.seq}\nevent: {ev.type}\ndata: {ev.model_dump_json()}\n\n"
+
+seq = itertools.count(1)                          # single writer assigns seq
+req = ToolRequested(run_id="r1", seq=next(seq), call_id="c1", name="search", arguments={"q": "x"})
+res = ToolResult(run_id="r1", seq=next(seq), call_id="c1", ok=True, result_ref="blob://r1/c1")
+print(to_sse(res), end="")        # id: 2 / event: tool.call.result / data: {"run_id":"r1","seq":2,...}
 ```
 
-### Clock skew, a crash and a checkpoint (runnable, stdlib only)
+### Fold, clock skew, a crash and a checkpoint (runnable, stdlib only)
 A worker's clock runs 0.3 s behind the orchestrator's, and the process crashes after requesting a second
-call. Sorting by `ts` inverts the first pair; folding by `seq` exposes the ambiguous pending call.
+call. Sorting by `ts` inverts the first pair; a pure fold by `seq` exposes the ambiguous pending call.
 
 ```python
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import reduce
 
 @dataclass
 class Ev:
-    run_id: str
     seq: int          # assigned by the single writer
     ts: float         # stamped by whichever host saw it: for humans only
     type: str
-    payload: dict = field(default_factory=dict)
+    payload: dict
 
 def apply(state: dict, ev: Ev) -> dict:          # pure: reads only state and event
     if ev.type == "tool.call.requested":
@@ -468,18 +441,16 @@ def apply(state: dict, ev: Ev) -> dict:          # pure: reads only state and ev
         state["pending"].pop(ev.payload["call_id"], None)
     return state
 
-events = [
-    Ev("r1", 7, 100.00, "tool.call.requested", {"call_id": "c1", "idem_key": "r1:s3:c1"}),
-    Ev("r1", 8, 99.70, "tool.call.result", {"call_id": "c1"}),      # worker clock 0.3 s behind
-    Ev("r1", 9, 100.10, "tool.call.requested", {"call_id": "c2", "idem_key": "r1:s3:c2"}),
-]                                                                     # crash here: did c2 run?
-
+events = [Ev(7, 100.00, "tool.call.requested", {"call_id": "c1", "idem_key": "r1:s3:c1"}),
+          Ev(8, 99.70, "tool.call.result", {"call_id": "c1"}),       # worker clock 0.3 s behind
+          Ev(9, 100.10, "tool.call.requested", {"call_id": "c2", "idem_key": "r1:s3:c2"})]
+                                                                      # crash here: did c2 run?
 print([e.type for e in sorted(events, key=lambda e: e.ts)][0])       # tool.call.result: inverted
 state = reduce(apply, sorted(events, key=lambda e: e.seq), {"pending": {}})
 print(state["pending"])                  # {'c2': 'r1:s3:c2'}: re-issue with this key, never assume
 
-ckpt_seq, ckpt = 8, reduce(apply, [e for e in events if e.seq <= 8], {"pending": {}})
-resumed = reduce(apply, [e for e in events if e.seq > ckpt_seq], copy.deepcopy(ckpt))
+ckpt = reduce(apply, [e for e in events if e.seq <= 8], {"pending": {}})
+resumed = reduce(apply, [e for e in events if e.seq > 8], copy.deepcopy(ckpt))
 assert resumed == state                  # checkpoint + tail == full fold
 ```
 

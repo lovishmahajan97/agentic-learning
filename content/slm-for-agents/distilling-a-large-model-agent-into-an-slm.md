@@ -159,18 +159,14 @@ from openai import OpenAI
 
 client = OpenAI()                       # set OPENAI_API_KEY, or base_url for another compatible provider
 TEACHER = os.environ["TEACHER_MODEL"]   # read the current model id from the provider's docs
-TOOLS = [{"type": "function", "function": {
-    "name": "get_order", "description": "Look up an order by id",
-    "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
-                   "required": ["order_id"]}}}]
+TOOLS = [{"type": "function", "function": {"name": "get_order", "parameters": {"type": "object",
+          "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}}]
 ORDERS = {"A17": "shipped", "B22": "refunded"}          # sandboxed fixture, not production
 
 def run_teacher(question, max_steps=4):
-    msgs = [{"role": "system", "content": "You are an order-support agent. Use tools."},
-            {"role": "user", "content": question}]
+    msgs = [{"role": "user", "content": question}]
     for _ in range(max_steps):
-        r = client.chat.completions.create(model=TEACHER, messages=msgs, tools=TOOLS)
-        m = r.choices[0].message
+        m = client.chat.completions.create(model=TEACHER, messages=msgs, tools=TOOLS).choices[0].message
         msgs.append(m.model_dump(exclude_none=True))
         if not m.tool_calls:
             return msgs
@@ -179,14 +175,10 @@ def run_teacher(question, max_steps=4):
             msgs.append({"role": "tool", "tool_call_id": c.id, "content": ORDERS.get(oid, "not found")})
     return None                                          # hit the step budget: treat as failure
 
-def verified(msgs, expected):
-    return msgs is not None and expected in (msgs[-1].get("content") or "").lower()
-
-cases = [("Where is order A17?", "shipped"), ("What happened to B22?", "refunded")]
 with open("distill.jsonl", "w") as f:
-    for q, want in cases:
+    for q, want in [("Where is order A17?", "shipped"), ("What happened to B22?", "refunded")]:
         traj = run_teacher(q)
-        if verified(traj, want):
+        if traj and want in (traj[-1].get("content") or "").lower():   # verifier: keep successes only
             f.write(json.dumps({"messages": traj, "tools": TOOLS}) + "\n")
 ```
 

@@ -427,57 +427,35 @@ flowchart TD
 ```
 
 ## Examples
-### Keyset endpoint with an opaque cursor, plus a client-side TPM bucket
-The bucket is in-process; with several workers the same logic moves into Redis. `db` is an asyncpg pool
-created at startup.
+### Keyset endpoint with an opaque cursor
+`db` is an asyncpg pool created at startup. The cursor encodes the last row's sort key; the query seeks
+past it instead of skipping rows.
 
 ```python
-import asyncio, base64, json, time
+import base64, json
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query
 
 app = FastAPI()
 
 def encode_cursor(created_at: datetime, id_: int) -> str:
     return base64.urlsafe_b64encode(json.dumps([created_at.isoformat(), id_]).encode()).decode()
 
-def decode_cursor(cursor: str) -> tuple[datetime, int]:
-    try:
-        ts, id_ = json.loads(base64.urlsafe_b64decode(cursor))
-        return datetime.fromisoformat(ts), int(id_)
-    except (ValueError, TypeError):
-        raise HTTPException(400, "invalid cursor")             # opaque: clients never build or parse it
+def decode_cursor(cursor: str) -> tuple[datetime, int]:     # opaque: clients never build or parse it
+    ts, id_ = json.loads(base64.urlsafe_b64decode(cursor))
+    return datetime.fromisoformat(ts), int(id_)
 
 @app.get("/documents")
 async def list_documents(limit: int = Query(20, ge=1, le=100), cursor: str | None = None):
     sql, args = "SELECT id, created_at, title FROM documents", []
     if cursor:
-        last_ts, last_id = decode_cursor(cursor)
         sql += " WHERE (created_at, id) < ($1, $2)"             # keyset: seek to position, never skip rows
-        args = [last_ts, last_id]
+        args = list(decode_cursor(cursor))
     sql += f" ORDER BY created_at DESC, id DESC LIMIT {limit + 1}"  # +1 row answers has_more without COUNT(*)
     rows = await db.fetch(sql, *args)                           # needs an index on (created_at, id)
     page, has_more = rows[:limit], len(rows) > limit
     next_cursor = encode_cursor(page[-1]["created_at"], page[-1]["id"]) if has_more else None
     return {"data": [dict(r) for r in page], "next_cursor": next_cursor, "has_more": has_more}
-
-class TokenBucket:
-    """Client-side limiter: queue locally instead of collecting 429s from the provider."""
-    def __init__(self, rate_per_sec: float, capacity: float):
-        self.rate, self.capacity = rate_per_sec, capacity
-        self.tokens, self.last = capacity, time.monotonic()
-    async def acquire(self, n: float) -> None:
-        if n > self.capacity:
-            raise ValueError("request larger than bucket capacity would wait forever")
-        while True:
-            now = time.monotonic()
-            self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate); self.last = now
-            if self.tokens >= n:
-                self.tokens -= n; return                        # no await between check and debit: safe in asyncio
-            await asyncio.sleep((n - self.tokens) / self.rate)  # sleep exactly the refill time we need
-
-tpm_bucket = TokenBucket(rate_per_sec=200_000 / 60, capacity=200_000)   # illustrative 200k TPM limit
-# before each model call: await tpm_bucket.acquire(prompt_token_estimate + max_tokens)
 ```
 
 ### A paginated agent tool with a per-run page budget
@@ -489,23 +467,14 @@ import httpx
 
 MAX_PAGES_PER_RUN = 5
 
-async def list_documents_tool(client: httpx.AsyncClient, run_state: dict,
-                              cursor: str | None = None, limit: int = 20) -> dict:
-    used = run_state.setdefault("pages_used", 0)
-    if used >= MAX_PAGES_PER_RUN:
+async def list_documents_tool(client: httpx.AsyncClient, run_state: dict, cursor: str | None = None) -> dict:
+    run_state["pages_used"] = run_state.get("pages_used", 0) + 1   # count before awaiting
+    if run_state["pages_used"] > MAX_PAGES_PER_RUN:
         return {"error": f"page budget of {MAX_PAGES_PER_RUN} reached; narrow the search instead"}
-    run_state["pages_used"] = used + 1                     # count before awaiting: parallel calls can't overshoot
-    params = {"limit": min(limit, 50)}                     # the tool's cap sits below the API's 100
-    if cursor:
-        params["cursor"] = cursor                          # opaque: the model passes it back verbatim
-    r = await client.get("/documents", params=params)
-    r.raise_for_status()
-    body = r.json()
-    return {
-        "items": [{"id": d["id"], "title": d["title"][:120]} for d in body["data"]],  # compact rows
-        "has_more": body["has_more"],
-        "next_cursor": body["next_cursor"],                # model calls again with this if it needs more
-    }
+    params = {"limit": 20} | ({"cursor": cursor} if cursor else {})   # model passes the cursor back verbatim
+    body = (await client.get("/documents", params=params)).json()
+    return {"items": [{"id": d["id"], "title": d["title"][:120]} for d in body["data"]],  # compact rows
+            "has_more": body["has_more"], "next_cursor": body["next_cursor"]}
 ```
 
 ### Atomic fixed-window counter in Redis
@@ -576,6 +545,11 @@ A support agent averages 8 steps per run; its prompt grows from 6,000 to about 2
 - **Bounded pages everywhere, including agent tools.** Enforce a default and maximum `limit`, return
   `next_cursor` and `has_more`, and never return totals by `COUNT(*)` on hot paths. Monitor p95 page
   latency by depth, the largest page sizes requested and pages fetched per agent run.
+- **Reject bad cursors and cap tool pages.** Return 400 for a cursor that fails to decode, cap an agent
+  tool's `limit` below the API maximum (for example 50 under 100), and count a tool's page before
+  awaiting the request so parallel calls cannot overshoot the per-run budget.
+- **Client-side bucket details.** Run the TPM bucket in-process for one worker and move it into Redis
+  for several; reject a request larger than the bucket capacity, which would otherwise wait forever.
 
 ## Trade-offs
 - **Keyset/cursor vs page numbers.** They cost the same at page 1 and page 10,000 and stay stable under

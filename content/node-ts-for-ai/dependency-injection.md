@@ -346,99 +346,40 @@ The loop takes the model and the tools as parameters. The test scripts the model
 tool, then answer), so the whole run is deterministic, free and offline.
 
 ```ts
-// agent.ts — depends only on capabilities
-type ToolCall = { name: string; args: unknown };
-type Turn = { text?: string; toolCalls: ToolCall[]; inputTokens: number; outputTokens: number };
+type Turn = { text?: string; toolCalls: { name: string; args: unknown }[] };
 export interface AgentLLM { next(messages: unknown[]): Promise<Turn> }
-export interface Tool { name: string; run(args: unknown): Promise<string> }
-export interface AgentDeps { llm: AgentLLM; tools: Map<string, Tool>; now: () => Date; maxSteps: number }
+export interface Tool { run(args: unknown): Promise<string> }
+export interface AgentDeps { llm: AgentLLM; tools: Map<string, Tool>; maxSteps: number }
 
-export async function runAgent({ llm, tools, now, maxSteps }: AgentDeps, task: string) {
-  const messages: unknown[] = [{ role: "system", content: `Today is ${now().toISOString()}` }, { role: "user", content: task }];
+export async function runAgent({ llm, tools, maxSteps }: AgentDeps, task: string) {
+  const messages: unknown[] = [{ role: "user", content: task }];
   for (let step = 0; step < maxSteps; step++) {
     const turn = await llm.next(messages);
     if (turn.toolCalls.length === 0) return { answer: turn.text ?? "", steps: step + 1 };
     for (const c of turn.toolCalls) {
-      const tool = tools.get(c.name);
-      const result = tool ? await tool.run(c.args) : `unknown tool ${c.name}`;
+      const result = (await tools.get(c.name)?.run(c.args)) ?? `unknown tool ${c.name}`;
       messages.push({ role: "tool", name: c.name, content: result });
     }
   }
   throw new Error("step budget exhausted");
 }
 
-// agent.test.ts — scripted model, fake tool, fixed clock
-const script: Turn[] = [
-  { toolCalls: [{ name: "lookup_order", args: { id: "A1" } }], inputTokens: 120, outputTokens: 12 },
-  { text: "Order A1 shipped.", toolCalls: [], inputTokens: 160, outputTokens: 6 },
-];
-const seen: unknown[] = [];
-const deps: AgentDeps = {
-  llm: { next: async () => script.shift()! },
-  tools: new Map([["lookup_order", { name: "lookup_order", run: async (a) => { seen.push(a); return "shipped" } }]]),
-  now: () => new Date("2026-01-01T00:00:00Z"),
-  maxSteps: 5,
-};
-// expect(await runAgent(deps, "where is A1?")).toEqual({ answer: "Order A1 shipped.", steps: 2 });
-// expect(seen).toEqual([{ id: "A1" }]);
+// test: scripted model and a fake tool, no network
+const script: Turn[] = [{ toolCalls: [{ name: "lookup_order", args: { id: "A1" } }] },
+                        { text: "Order A1 shipped.", toolCalls: [] }];
+const llm: AgentLLM = { next: async () => script.shift()! };
+const tools = new Map([["lookup_order", { run: async () => "shipped" }]]);
+console.log(await runAgent({ llm, tools, maxSteps: 5 }, "where is A1?"));
+// { answer: 'Order A1 shipped.', steps: 2 }
 ```
 
-### Interface, service, root and test
-Three files compressed into one listing: a capability interface, a service that depends only on it, the
-composition root that knows about vendors, and a test that swaps in a fake. The service never imports a
-vendor SDK, so the test runs with no network and no API key.
+### A fallback decorator, wired at the composition root
+`withFallback` satisfies `LLM`, so callers cannot tell it apart from one provider. Only rate limits and
+server errors fall back; a 400 is the caller's bug and must surface. The root is the only place that
+imports a vendor SDK.
 
 ```ts
-// llm.ts — the capability, not the vendor
-export interface LLM { complete(p: { system: string; user: string; maxTokens: number }): Promise<{ text: string; inputTokens: number; outputTokens: number }> }
-
-// chat-service.ts — depends only on interfaces
-export interface Deps { llm: LLM; db: { saveUsage(tenant: string, tokens: number): Promise<void> }; now: () => Date }
-export function createChatService({ llm, db, now }: Deps) {
-  return {
-    async answer(tenant: string, question: string) {
-      const r = await llm.complete({ system: `Today is ${now().toISOString()}`, user: question, maxTokens: 512 });
-      await db.saveUsage(tenant, r.inputTokens + r.outputTokens);
-      return r.text;
-    },
-  };
-}
-
-// main.ts — the composition root: the only place that knows about vendors
-import OpenAI from "openai";
-import { Pool } from "pg";
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const openai = new OpenAI();                                  // reads OPENAI_API_KEY here, nowhere else
-const llm: LLM = {
-  async complete({ system, user, maxTokens }) {
-    const res = await openai.chat.completions.create({ model: process.env.MODEL ?? "gpt-4o-mini", max_completion_tokens: maxTokens,
-      messages: [{ role: "system", content: system }, { role: "user", content: user }] });
-    return { text: res.choices[0].message.content ?? "", inputTokens: res.usage?.prompt_tokens ?? 0, outputTokens: res.usage?.completion_tokens ?? 0 };
-  },
-};
-const db = { saveUsage: async (t: string, n: number) => { await pool.query("insert into usage(tenant, tokens) values ($1, $2)", [t, n]); } };
-export const chat = createChatService({ llm, db, now: () => new Date() });
-
-// chat-service.test.ts — no network, no mocking of module paths
-const calls: string[] = [];
-const svc = createChatService({
-  llm: { complete: async (p) => { calls.push(p.user); return { text: "42", inputTokens: 10, outputTokens: 1 }; } },
-  db: { saveUsage: async () => {} },
-  now: () => new Date("2026-01-01T00:00:00Z"),
-});
-// expect(await svc.answer("acme", "meaning?")).toBe("42"); expect(calls).toEqual(["meaning?"]);
-```
-
-### A fallback decorator and the test that proves it
-The decorator satisfies `LLM`, so the agent cannot tell it apart from a single provider. Only rate limits
-and server errors fall back; a 400 is the caller's bug and must surface.
-
-- **Caveat on network errors.** SDK connection errors and timeouts carry no `.status`, so this predicate
-  does not fall back on them; extend it if an unreachable provider should also trigger the secondary.
-
-```ts
-// with-fallback.ts — composes two LLMs behind one interface
-import type { LLM } from "./llm";
+export interface LLM { complete(user: string): Promise<string> }
 
 const retryable = (e: unknown) => {
   const status = (e as { status?: number }).status;   // OpenAI and Anthropic SDK errors carry .status
@@ -447,24 +388,22 @@ const retryable = (e: unknown) => {
 
 export function withFallback(primary: LLM, secondary: LLM, shouldFallBack = retryable): LLM {
   return {
-    async complete(p) {
-      try {
-        return await primary.complete(p);
-      } catch (e) {
-        if (!shouldFallBack(e)) throw e;               // 400s, auth errors: do not hide them
-        return secondary.complete(p);
-      }
+    async complete(user) {
+      try { return await primary.complete(user); }
+      catch (e) { if (!shouldFallBack(e)) throw e; return secondary.complete(user); }  // 400s surface
     },
   };
 }
 
-// with-fallback.test.ts — fakes that fail on demand, no network
+// main.ts (root): import OpenAI from "openai"; const openai = new OpenAI();  // reads OPENAI_API_KEY here only
+// const llm = withFallback(openaiAdapter(openai), anthropicAdapter(anthropic));
+
+// test: fakes that fail on demand
 const rateLimited: LLM = { complete: async () => { throw Object.assign(new Error("rate limited"), { status: 429 }); } };
 const badRequest: LLM = { complete: async () => { throw Object.assign(new Error("bad"), { status: 400 }); } };
-const backup: LLM = { complete: async () => ({ text: "from backup", inputTokens: 5, outputTokens: 2 }) };
-const req = { system: "", user: "hi", maxTokens: 16 };
-// expect((await withFallback(rateLimited, backup).complete(req)).text).toBe("from backup");
-// await expect(withFallback(badRequest, backup).complete(req)).rejects.toThrow("bad");
+const backup: LLM = { complete: async () => "from backup" };
+console.log(await withFallback(rateLimited, backup).complete("hi"));               // from backup
+console.log(await withFallback(badRequest, backup).complete("hi").catch((e) => e.message));  // bad
 ```
 
 ### Worked scenario: one enterprise tenant needs Azure for its agent
@@ -500,6 +439,13 @@ The same change request, with and without injection.
 - **Ban infrastructure imports outside the root.** An ESLint `no-restricted-imports` rule that forbids
   `openai`, `@anthropic-ai/sdk` and `pg` in agent and service folders keeps the seam honest. Monitor CI
   lint failures.
+- **Inject the clock too.** Pass `now: () => Date` alongside the model and database, so a prompt that
+  includes today's date is deterministic in tests (`now: () => new Date("2026-01-01T00:00:00Z")`).
+- **Fallback on network errors explicitly.** SDK connection errors and timeouts carry no `.status`, so a
+  status-only fallback predicate ignores them; extend it if an unreachable provider should switch over.
+- **Adapters return usage.** Map the SDK response to your interface in the root adapter, including token
+  counts (`usage.prompt_tokens`, `usage.completion_tokens`), so services can record usage per tenant
+  without importing the SDK.
 
 ## Trade-offs
 - **Explicit wiring vs boilerplate.** Every dependency is visible and testable, but signatures and the

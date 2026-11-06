@@ -280,66 +280,60 @@ flowchart TD
 ```
 
 ## Examples
-### Starter code: schema, validator and reader with retries
-The client is passed in so tests can use a fake. Model IDs change often, so the model comes from an
-environment variable; check your provider's docs for image input limits and pricing.
+### Starter code: an arithmetic validator that catches a misread total
+The receipt checks itself: if the printed subtotal is missing, the item sum is the base, so the total is
+always checked. This runs offline.
 
 ```python
-import base64, io, json, os
-from datetime import date
 from decimal import Decimal
 from typing import List, Optional
-from pydantic import BaseModel, Field, ValidationError, model_validator
-
-TOL = Decimal("0.02")
+from pydantic import BaseModel, ValidationError, model_validator
 
 class LineItem(BaseModel):
     description: str
-    quantity: Decimal = Decimal("1")
-    amount: Decimal                                   # line total as printed
+    amount: Decimal                                   # Decimal, never float, for money
 
 class Receipt(BaseModel):
     merchant: str
-    purchase_date: Optional[date] = None
-    currency: str = Field(pattern=r"^[A-Z]{3}$")      # ISO 4217, e.g. EUR
     items: List[LineItem]
     subtotal: Optional[Decimal] = None
-    discount: Decimal = Decimal("0")
     tax: Decimal = Decimal("0")
-    tip: Decimal = Decimal("0")
     total: Decimal
 
     @model_validator(mode="after")
     def totals_add_up(self):
-        items_sum = sum((i.amount for i in self.items), Decimal("0"))
-        base = self.subtotal if self.subtotal is not None else items_sum
-        if self.items and abs(items_sum - base) > TOL:
-            raise ValueError(f"line items sum to {items_sum}, subtotal is {base}")
-        if abs(base - self.discount + self.tax + self.tip - self.total) > TOL:
-            raise ValueError(f"subtotal - discount + tax + tip != total {self.total}")
+        base = self.subtotal if self.subtotal is not None else sum(i.amount for i in self.items)
+        if abs(base + self.tax - self.total) > Decimal("0.02"):
+            raise ValueError(f"subtotal + tax = {base + self.tax}, total is {self.total}")
         return self
 
-PROMPT = ("Extract the receipt as JSON matching this schema. Copy amounts exactly as printed. "
-          "Use null for anything you cannot read; never guess. Schema: ")
+misread = ('{"merchant": "FreshMart", "total": "18.40", "items": [{"description": "apples", '
+           '"amount": "5.00"}, {"description": "coffee beans", "amount": "8.40"}]}')
+try:
+    Receipt.model_validate_json(misread)
+except ValidationError as e:
+    print(e.errors()[0]["msg"])   # Value error, subtotal + tax = 13.40, total is 18.40
+```
 
-def to_data_url(path, max_side=1600):
-    from PIL import Image
-    img = Image.open(path).convert("RGB")
-    img.thumbnail((max_side, max_side))                # fewer image tokens, text stays legible
-    buf = io.BytesIO(); img.save(buf, format="JPEG", quality=90)
-    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+### Starter code: retry with the errors, then route to review
+The client is passed in so tests can use a fake. Model IDs change often, so pass the model in; check your
+provider's docs for image input limits and pricing.
 
-def read_receipt(client, path, model=os.environ.get("VLM_MODEL", "set-me"), retries=2):
-    messages = [{"role": "system", "content": PROMPT + json.dumps(Receipt.model_json_schema())},
-                {"role": "user", "content": [{"type": "text", "text": "Extract this receipt."},
-                                             {"type": "image_url", "image_url": {"url": to_data_url(path)}}]}]
+```python
+import json
+from pydantic import ValidationError
+
+def read_receipt(client, model, data_url, retries=2):
+    messages = [{"role": "system", "content": "Extract the receipt as JSON matching this schema. "
+                 "Copy amounts exactly; never guess. Schema: " + json.dumps(Receipt.model_json_schema())},
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": data_url}}]}]
     for _ in range(retries + 1):
         r = client.chat.completions.create(model=model, messages=messages,
                                            response_format={"type": "json_object"})
         raw = r.choices[0].message.content
         try:
             return Receipt.model_validate_json(raw), "ok"
-        except ValidationError as e:                    # feed the exact errors back once or twice
+        except ValidationError as e:                    # feed the exact errors back
             messages += [{"role": "assistant", "content": raw},
                          {"role": "user", "content": f"Fix these problems and return the full JSON: {e}"}]
     return None, "needs_review"                         # route to a human queue, never guess
@@ -377,6 +371,9 @@ The review share rose, and that is the point: errors moved from silent to visibl
   set a retention period for images and avoid sending more fields than needed to the model.
 - **Portfolio polish.** A README with the per-field eval table, a demo of a corrected and an approved
   receipt, unit tests for validators and the retry loop, and a note on data handling.
+- **Resize before sending.** `Image.thumbnail((1600, 1600))` and a JPEG at quality 90, sent as a base64
+  data URL, keeps receipt text legible with far fewer image tokens; real receipts also need date,
+  currency, discount and tip fields so honest totals close.
 
 ## Trade-offs
 - **VLM vs OCR plus a text model.** A VLM reads layout and handwriting in one call; OCR plus a text LLM is

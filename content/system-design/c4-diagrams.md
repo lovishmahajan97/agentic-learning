@@ -195,115 +195,42 @@ flowchart TD
 
 ## Examples
 ### Structurizr DSL: an agent with tools, a sandbox and a Dynamic view of one run
-The Context view shows three arrows leaving the system: model provider, CRM (read and write) and email.
-The Dynamic view numbers one run; Structurizr checks each step against the model, so deleting a
-relationship breaks the build instead of leaving a stale story.
+One model, two views. The Container view shows the two arrows that leave the system: to the model
+provider and to the CRM. The Dynamic view numbers one run; Structurizr checks each step against the
+model, so deleting a relationship breaks the build instead of leaving a stale story.
+
+Adding `systemContext agentSys "Context"` with `include *` gives the stakeholder view from the same model.
 
 The DSL is line-based: an opening `{` ends its line and every closing `}` sits on a line of its own.
 
 ```
 workspace "Refund Agent" "Investigates and resolves refund tickets" {
     model {
-        rep     = person "Support Rep" "Approves refunds the agent proposes"
-        crm     = softwareSystem "CRM" "Tickets and orders" "External"
-        email   = softwareSystem "Email Service" "Sends customer emails" "External"
-        llm     = softwareSystem "Model Provider" "Hosted LLM API" "External"
+        rep      = person "Support Rep" "Approves refunds the agent proposes"
+        crm      = softwareSystem "CRM" "Tickets and orders" "External"
+        llm      = softwareSystem "Model Provider" "Hosted LLM API" "External"
         agentSys = softwareSystem "Refund Agent" "Tool-calling agent" {
-            api     = container "Agent API" "Starts runs, streams progress, approval step" "FastAPI"
+            api     = container "Agent API" "Starts runs, approval step" "FastAPI"
             runner  = container "Run Worker" "Agent loop, step budget, tool dispatch" "Python"
             sandbox = container "Code Sandbox" "Runs agent-written analysis code" "Isolated container"
-            gateway = container "LLM Gateway" "Routing, quotas, token metering" "Python"
-            store   = container "Run and Memory Store" "Transcripts, checkpoints, memory" "PostgreSQL" "Database"
         }
-        rep     -> api     "Starts runs and approves actions in" "HTTPS"
-        api     -> store   "Creates runs and reads progress from" "SQL"
-        runner  -> store   "Checkpoints each step to" "SQL"
-        runner  -> gateway "Requests next action from" "HTTPS"
-        gateway -> llm     "Sends transcripts containing ticket text to" "HTTPS"
-        runner  -> crm     "Reads orders from and updates tickets in" "REST, tenant token"
-        runner  -> sandbox "Executes analysis code in" "gRPC"
-        runner  -> email   "Sends approved customer emails via" "REST"
+        rep    -> api     "Starts runs and approves actions in" "HTTPS"
+        runner -> llm     "Sends transcripts containing ticket text to" "HTTPS"
+        runner -> crm     "Reads orders from and updates tickets in" "REST, tenant token"
+        runner -> sandbox "Executes analysis code in" "gRPC"
     }
     views {
-        systemContext agentSys "Context" {
-            include *
-            autolayout lr
-        }
         container agentSys "Containers" {
             include *
             autolayout lr
         }
         dynamic agentSys "OneRun" "One refund run" {
             rep -> api "Starts a run for ticket 4812"
-            runner -> gateway "Asks for the next action"
+            runner -> llm "Asks the model for the next action"
             runner -> crm "Reads the order (tool call)"
             runner -> sandbox "Runs refund eligibility check (tool call)"
-            runner -> store "Checkpoints step and pauses for approval"
             rep -> api "Approves the proposed refund"
-            runner -> email "Sends the approved reply"
             autolayout lr
-        }
-        styles {
-            element "External" {
-                background #999999
-                color #ffffff
-            }
-            element "Database" {
-                shape Cylinder
-            }
-        }
-    }
-}
-```
-
-### Structurizr DSL: one model, three views
-- **Three views, one model:** the Context diagram for stakeholders, the Container diagram for engineers and
-  the Dynamic view of one request cannot disagree.
-- **Labelling:** the model provider is external, the vector-capable database is tagged to render as a
-  cylinder, and every relationship states intent and protocol.
-- **Self-checking story:** the dynamic view numbers the steps of one reply, and Structurizr checks each
-  step against the model's relationships. Delete the `api -> gateway` arrow and the workspace fails to
-  build, instead of the request story silently going stale.
-- **What the rendered Context view reveals:** two arrows leave the system, to the CRM and to the model
-  provider. The second is the data egress a privacy review asks about first.
-- **Compressed for the page:** the one-line `{ include * autolayout lr }` and style blocks below save
-  space; the real DSL needs each statement on its own line and each `}` alone, as in the example above.
-
-```
-workspace "Support Copilot" "Drafts ticket replies grounded in the knowledge base" {
-    model {
-        agent   = person "Support Agent" "Answers customer tickets"
-        crm     = softwareSystem "CRM" "System of record for tickets and articles" "External"
-        llm     = softwareSystem "Model Provider" "Hosted LLM API" "External"
-        copilot = softwareSystem "Support Copilot" "Suggests grounded replies" {
-            web     = container "Web App" "Agent-facing UI" "React"
-            api     = container "API" "Auth, tenancy, orchestration, guardrails" "FastAPI"
-            worker  = container "Ingestion Worker" "Chunks and embeds articles" "Python"
-            gateway = container "LLM Gateway" "Routing, quotas, prompt cache" "Python"
-            db      = container "Database" "Tenants, chunks, embeddings, feedback" "PostgreSQL + pgvector" "Database"
-        }
-        agent   -> web     "Uses"
-        web     -> api     "Sends chat requests to" "HTTPS/JSON"
-        api     -> db      "Reads and writes" "SQL"
-        api     -> gateway "Requests completions from" "HTTPS"
-        gateway -> llm     "Sends prompts and receives completions" "HTTPS"
-        worker  -> crm     "Pulls articles from" "REST"
-        worker  -> db      "Writes chunks and embeddings to" "SQL"
-    }
-    views {
-        systemContext copilot "Context"    { include * autolayout lr }
-        container     copilot "Containers" { include * autolayout lr }
-        dynamic copilot "DraftReply" "One grounded reply" {
-            agent -> web "Opens a ticket and asks for a draft"
-            web -> api "Sends ticket text"
-            api -> db "Fetches top-8 chunks for this tenant"
-            api -> gateway "Requests a draft grounded in the chunks"
-            gateway -> llm "Forwards prompt; streams completion"
-            autolayout lr
-        }
-        styles {
-            element "External" { background #999999 color #ffffff }
-            element "Database" { shape Cylinder }
         }
     }
 }
@@ -319,11 +246,8 @@ the customer's environment is labelled with what it carries.
 title Deployment: Support Copilot pilot in customer VPC
 
 Deployment_Node(cust, "Customer VPC", "Customer cloud account") {
-    Deployment_Node(k8s, "Kubernetes cluster", "Customer-managed") {
-        Container(api, "API", "FastAPI", "Auth, tenancy, orchestration")
-        Container(worker, "Ingestion Worker", "Python", "Chunks and embeds articles")
-        ContainerDb(db, "Database", "PostgreSQL + pgvector", "Chunks, embeddings")
-    }
+    Container(api, "API", "FastAPI", "Auth, tenancy, orchestration")
+    ContainerDb(db, "Database", "PostgreSQL + pgvector", "Chunks, embeddings")
 }
 Deployment_Node(vendor, "Vendor cloud", "Vendor account") {
     Container(gateway, "LLM Gateway", "Python", "Routing, quotas")
@@ -331,7 +255,6 @@ Deployment_Node(vendor, "Vendor cloud", "Vendor account") {
 System_Ext(llm, "Model Provider", "Hosted LLM API")
 
 Rel(api, db, "Reads and writes", "SQL")
-Rel(worker, db, "Writes chunks and embeddings to", "SQL")
 Rel(api, gateway, "Sends prompts containing ticket text", "HTTPS")
 Rel(gateway, llm, "Forwards prompts", "HTTPS")
 SHOW_LEGEND()

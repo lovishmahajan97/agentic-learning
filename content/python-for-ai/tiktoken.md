@@ -306,41 +306,6 @@ flowchart TD
 ```
 
 ## Examples
-### Agent context manager: trim history before each step
-Before every model call, estimate the request and drop the oldest tool results (keeping the system
-prompt, tool schemas and the latest turns) until it fits.
-
-```python
-import json, tiktoken
-
-enc = tiktoken.encoding_for_model("gpt-4o")          # resolves to o200k_base
-WINDOW, RESERVED_OUTPUT, PER_MSG = 128_000, 4_000, 4  # PER_MSG: rough allowance for role markers
-
-def n(s: str) -> int:
-    return len(enc.encode(s, disallowed_special=()))  # tool results are untrusted text
-
-def estimate(messages: list[dict], tools: list[dict]) -> int:
-    body = sum(n(m.get("content") or "") + n(json.dumps(m.get("tool_calls", ""))) + PER_MSG
-               for m in messages)
-    return body + n(json.dumps(tools))                # estimate: provider renders tools its own way
-
-def fit(messages: list[dict], tools: list[dict], keep_last: int = 6) -> list[dict]:
-    msgs = list(messages)
-    budget = WINDOW - RESERVED_OUTPUT
-    while estimate(msgs, tools) > budget:
-        old = [i for i, m in enumerate(msgs[1:-keep_last], 1) if m["role"] == "tool"
-               and m["content"] != "[result elided]"]
-        if not old:
-            raise ValueError("cannot fit: compact history or shrink tool schemas")
-        msgs[old[0]] = {**msgs[old[0]], "content": "[result elided]"}  # keep tool_call_id pairing
-    return msgs
-```
-
-- **Elide, do not delete, tool messages.** Providers require every tool call to have a matching result,
-  so replace the content and keep the message and its id.
-- **Trim at a boundary.** Each edit to earlier turns breaks provider prompt caching from that point, so
-  compact in larger steps rather than a little on every call.
-
 ### Budgeting a RAG prompt so chunks never crowd out the answer
 ```python
 import tiktoken
@@ -447,6 +412,10 @@ Capping or summarising tool results is usually a bigger lever than trimming the 
   content.
 - **Batch corpus counting.** Use `enc.encode_batch(texts)` when chunking or costing large corpora, and load
   the encoding once at module level rather than per request. Monitor chunking throughput.
+- **Elide, do not delete, old tool results.** Providers require every tool call to have a matching result,
+  so replace the content (for example with `"[result elided]"`) and keep the message and its id.
+- **Trim history at a boundary.** Each edit to earlier turns breaks provider prompt caching from that
+  point, so compact in larger steps rather than a little on every call.
 
 ## Trade-offs
 - **Exact and free vs OpenAI-only.** Local counts are fast and exact for OpenAI models, but only

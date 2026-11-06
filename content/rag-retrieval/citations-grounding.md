@@ -163,64 +163,39 @@ flowchart TD
 ## Examples
 ### Agent loop: run-level source registry and a verified final answer
 Every retrieval tool registers its results, so IDs are stable for the whole run. The agent ends by
-calling `submit_answer`; failed claims go back as a tool error for one repair attempt.
+calling `submit_answer`, and `verify` checks each claim's IDs and quote before anything ships.
 
 ```python
 import re
 
-class SourceRegistry:
-    def __init__(self):
-        self.by_id = {}                                  # "S3" -> {"doc_id", "version", "text"}
-    def add(self, chunk):
-        sid = f"S{len(self.by_id) + 1}"
-        self.by_id[sid] = chunk
-        return sid
+registry = {}                                            # run-level: "S3" -> chunk, stable across tool calls
 
-def format_results(registry, chunks):                    # what the search tool returns to the model
-    return "\n\n".join(f"[{registry.add(c)}] ({c['title']}, {c['date']})\n{c['text']}" for c in chunks)
+def format_results(chunks):                              # what the search tool returns to the model
+    out = []
+    for c in chunks:
+        sid = f"S{len(registry) + 1}"
+        registry[sid] = c
+        out.append(f"[{sid}] ({c['title']})\n{c['text']}")
+    return "\n\n".join(out)
 
-def norm(s):
-    return re.sub(r"\s+", " ", s).strip().lower()
+norm = lambda s: re.sub(r"\s+", " ", s).strip().lower()
 
-def verify(answer, registry):                            # answer = submit_answer tool arguments
+def verify(claims):                                      # claims = submit_answer tool arguments
     problems = []
-    if answer.get("answerable") and not answer["claims"]:
-        problems.append((None, "marked answerable but made no claims"))
-    for n, cl in enumerate(answer["claims"]):
-        if not cl.get("source_ids"):
-            problems.append((n, "uncited claim"))
-            continue
-        bad = [s for s in cl["source_ids"] if s not in registry.by_id]
-        if bad:
-            problems.append((n, f"unknown source {bad}"))
-            continue
-        quote = norm(cl.get("quote") or "")              # an empty quote would match any chunk
-        if not quote or not any(quote in norm(registry.by_id[s]["text"]) for s in cl["source_ids"]):
+    for n, cl in enumerate(claims):
+        ids, quote = cl.get("source_ids") or [], norm(cl.get("quote") or "")   # empty quote matches anything
+        if not ids or any(s not in registry for s in ids):
+            problems.append((n, "uncited claim or unknown source"))
+        elif not quote or not any(quote in norm(registry[s]["text"]) for s in ids):
             problems.append((n, "quote missing or not found in cited sources"))
     return problems
 
-def on_submit_answer(answer, registry, attempts):
-    problems = verify(answer, registry)
-    if not problems:
-        return {"done": True, "answer": answer}
-    if attempts == 0:                                    # one repair turn, then drop failing claims
-        return {"done": False, "tool_error": f"Fix or remove these claims: {problems}"}
-    bad = {n for n, _ in problems if n is not None}
-    answer["claims"] = [c for i, c in enumerate(answer["claims"]) if i not in bad]
-    answer["answerable"] = bool(answer["claims"])        # nothing verified left: abstain, never ship empty
-    return {"done": True, "answer": answer, "dropped": sorted(bad)}
-
-reg = SourceRegistry()                                   # replay the refund-window scenario below
-print(format_results(reg, [{"title": t, "date": "2025-01", "text": x} for t, x in [
-    ("Billing FAQ", "Monthly plans renew automatically."),
-    ("Refund policy", "Annual plans may be refunded within 30 days of purchase."),
-    ("Plans", "Annual plans are billed once a year.")]])[:40])
-ans = {"answerable": True, "claims": [
-    {"text": "Annual plans are refundable within 30 days.", "source_ids": ["S2"],
-     "quote": "Annual plans may be  refunded within 30 days"},
-    {"text": "Partial refunds are prorated.", "source_ids": ["S3"], "quote": "refunds are prorated"}]}
-print(on_submit_answer(ans, reg, attempts=0))   # tool_error naming claim 1
-print(on_submit_answer(ans, reg, attempts=1))   # claim 1 dropped, claim 0 kept
+format_results([{"title": "Billing FAQ", "text": "Monthly plans renew automatically."},
+                {"title": "Refund policy", "text": "Annual plans may be refunded within 30 days of purchase."},
+                {"title": "Plans", "text": "Annual plans are billed once a year."}])
+print(verify([{"source_ids": ["S2"], "quote": "Annual plans may be  refunded within 30 days"},
+              {"source_ids": ["S3"], "quote": "refunds are prorated"}]))
+# [(1, 'quote missing or not found in cited sources')]: claim 0 passes despite the double space
 ```
 
 ### Worked scenario: catching a fabricated quote
@@ -284,6 +259,9 @@ print(resolve_span("partial refunds are prorated", chunk))                  # No
   low-risk ones mark them "unverified". Judge a daily sample of claim and quote pairs (NLI or LLM, humans on
   disagreements), alert when abstention on an unanswerable probe set drops, and track support rate, not
   citation rate.
+- **One repair turn, then drop.** Return failed claims to the model once as a `submit_answer` tool error;
+  on the second failure drop those claims, and if none remain set `answerable` to false rather than ship
+  an empty answer. Also reject an answer marked answerable that makes no claims.
 
 ## Trade-offs
 - **Per-claim citations: trust vs friction.** Trust and auditability, but choppier prose, more output

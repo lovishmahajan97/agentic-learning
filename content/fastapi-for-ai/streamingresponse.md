@@ -323,69 +323,43 @@ sequenceDiagram
 
 ## Examples
 ### Agent run streamed as typed NDJSON events
-A tool-calling loop emits step, tool and delta records. Validation runs before the response object
-exists, the loop stops when the client has gone, and a failure after the first byte (a tool raising
-mid-run) becomes a typed error line instead of a truncated body.
+A tool-calling loop emits tool and delta records. The loop stops when the client has gone, and a failure
+after the first byte (a tool raising mid-run) becomes a typed error line instead of a truncated body.
 
 ```python
 import asyncio, json
-from contextlib import aclosing                           # Python 3.10+
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 
 app = FastAPI()
-MAX_STEPS = 8
 
-class Ask(BaseModel):
-    prompt: str
-
-async def search_orders(q: str) -> str:                   # a tool; real ones hit a DB or an API
-    await asyncio.sleep(0.5)
-    return "order 1042: shipped"
-
-async def agent_loop(prompt: str):
-    # Stand-in for your loop over an async SDK stream (or a framework's streaming iterator).
-    for step in range(1, MAX_STEPS + 1):
-        yield {"type": "step", "n": step}
-        if step == 1:                                     # model asked for a tool
-            yield {"type": "tool_call", "name": "search_orders"}
-            result = await search_orders(prompt)
-            yield {"type": "tool_result", "name": "search_orders", "summary": result[:80]}
-            continue
-        for word in "Your order 1042 has shipped.".split():  # final answer, token by token
-            await asyncio.sleep(0.05)
-            yield {"type": "delta", "text": word + " "}
-        return
+async def agent_loop(prompt: str):                  # stand-in for your agent's async event stream
+    yield {"type": "tool_call", "name": "search_orders"}
+    await asyncio.sleep(0.5)                        # the tool runs
+    for word in "Your order 1042 has shipped.".split():
+        await asyncio.sleep(0.05)                   # final answer, token by token
+        yield {"type": "delta", "text": word + " "}
 
 @app.post("/agent/run")
-async def run(body: Ask, request: Request):
-    if len(body.prompt) > 8000:
-        raise HTTPException(413, "prompt too long")      # fail BEFORE any byte of the stream is sent
-
+async def run(body: dict, request: Request):
     async def ndjson():
         try:
-            # aclosing() closes the loop (and its upstream model stream) when we stop early
-            async with aclosing(agent_loop(body.prompt)) as events:
-                async for ev in events:
-                    if await request.is_disconnected():
-                        return                            # stop paying for steps nobody will read
-                    yield json.dumps(ev) + "\n"
+            async for ev in agent_loop(body["prompt"]):
+                if await request.is_disconnected():
+                    return                          # stop paying for steps nobody will read
+                yield json.dumps(ev) + "\n"
             yield json.dumps({"type": "done"}) + "\n"
-        except Exception as exc:                          # headers are gone: signal the error in-band
+        except Exception as exc:                    # headers are gone: signal the error in-band
             yield json.dumps({"type": "error", "error": type(exc).__name__}) + "\n"
 
     return StreamingResponse(ndjson(), media_type="application/x-ndjson",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-# Check it really streams through your ingress, not just locally:
-#   curl -N -X POST http://localhost:8000/agent/run -H 'content-type: application/json' -d '{"prompt":"hi"}'
+                             headers={"X-Accel-Buffering": "no"})
 ```
 
 ### A client that survives framing
 The consumer side (a UI backend, an eval harness, or a supervisor agent calling this one as a tool):
 `httpx` reads the body as it arrives and `aiter_lines()` re-splits on newlines, so glued or split chunks
-still yield whole NDJSON records.
+still yield whole NDJSON records. Run the app above with `uvicorn app:app` first.
 
 ```python
 import asyncio, json
@@ -396,22 +370,18 @@ async def consume(prompt: str) -> str:
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream("POST", "http://localhost:8000/agent/run",
                                  json={"prompt": prompt}) as r:
-            r.raise_for_status()                    # only pre-stream failures (e.g. 413) land here
+            r.raise_for_status()                    # only pre-stream failures land here
             async for line in r.aiter_lines():      # buffers until "\n", so TCP boundaries do not matter
-                if not line:
-                    continue
                 msg = json.loads(line)
                 if msg["type"] == "error":
                     raise RuntimeError(f"agent run failed mid-way: {msg['error']}")
                 if msg["type"] == "done":
                     return "".join(text)
-                if msg["type"] == "tool_call":
-                    print(f"[tool] {msg['name']}")    # progress, not answer text
-                elif msg["type"] == "delta":
+                if msg["type"] == "delta":
                     text.append(msg["text"])
     raise RuntimeError("stream ended without a done record")  # truncation detected in-band
 
-print(asyncio.run(consume("hi")))
+print(asyncio.run(consume("hi")))                   # Your order 1042 has shipped.
 ```
 
 ### Worked scenario: buffered vs streamed agent run
@@ -451,6 +421,10 @@ balancer with an illustrative 60-second idle timeout (all figures illustrative).
 - **Cap concurrent streams, not request rate.** Bound open streams per worker (uvicorn's
   `--limit-concurrency` returns 503 beyond the limit) and size workers by expected concurrent streams.
   Monitor an open-streams gauge and thread-pool saturation if any sync generators remain.
+- **Validate before the stream starts.** Run request checks (for example a 413 for a prompt over 8,000
+  characters) before returning the `StreamingResponse`, because once the first byte is sent the status
+  can no longer change. Send `Cache-Control: no-cache` on streaming routes, and test with
+  `curl -N` through the real ingress, not only locally.
 
 ## Trade-offs
 - **Lower first-token latency vs longer-held connections.** Latency drops to the model's own TTFT, but

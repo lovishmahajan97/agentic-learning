@@ -212,113 +212,57 @@ flowchart TD
 
 ## Examples
 ### A small graph executor with an approval interrupt
-Typed state, nodes as functions, a static edge, a code router, a model-driven node, a checkpoint after
-every node, and an interrupt resumed by calling `run` again with the same id. `call_model`, `mail` and
-`store` are stand-ins.
+State as a dict, nodes as functions, a static edge, a code router, a checkpoint after every node, and an
+interrupt resumed by calling `run` again with the same id. The grader is a scripted stand-in for a model
+call. Runs as-is.
 
 ```python
-from dataclasses import dataclass, field, asdict
+scores = iter([0.55, 0.82])                        # stand-in for a grading model call
 
-@dataclass
-class State:
-    ticket: str
-    draft: str = ""
-    score: float = 0.0
-    critique: str = ""
-    approved: bool | None = None
-    step: int = 0
-    status: str = "running"
-    history: list = field(default_factory=list)
-
-def draft_reply(s):
-    s.draft = call_model(f"Draft a reply to: {s.ticket}\nFix these issues if any: {s.critique}").text; return s
-def grade(s):        # evaluator: structured output, so the router can branch on a number
-    g = call_model(f"Policy compliance of this draft as JSON {{score: 0-1, critique}}:\n{s.draft}").json
-    s.score, s.critique = float(g["score"]), g["critique"]; return s
-def approval(s):     # interrupt node: nothing to compute until a human acts
-    if s.approved is None: s.status = "waiting_approval"
-    elif not s.approved:   s.status = "rejected"
-    return s
-def send(s):         mail.send_idempotent(key=f"{s.ticket}:send", body=s.draft); s.status = "done"; return s
+def draft_reply(s): s["draft"] = f"draft from step {s['step']}"
+def grade(s):       s["score"] = next(scores)      # evaluator returns a number the router can use
+def approval(s):    s["status"] = {None: "waiting_approval", True: "running", False: "rejected"}[s["approved"]]
+def send(s):        print("sent:", s["draft"]); s["status"] = "done"  # real code: key f"{run_id}:send"
 
 NODES = {"draft_reply": draft_reply, "grade": grade, "approval": approval, "send": send}
-EDGES = {"draft_reply": "grade",                                                          # static edge
-         "grade": lambda s: "draft_reply" if s.score < 0.7 and s.step < 6 else "approval",  # code router
-         "approval": lambda s: "send" if s.approved else None,
-         "send": None}
+EDGES = {"draft_reply": lambda s: "grade",                                                    # static edge
+         "grade": lambda s: "draft_reply" if s["score"] < 0.7 and s["step"] < 6 else "approval",  # router
+         "approval": lambda s: "send"}
 
 def run(run_id, store, max_steps=10):
-    s = store.load(run_id) or State(ticket=store.task(run_id))
-    node = store.cursor(run_id) or "draft_reply"
-    while node and s.step < max_steps:
-        s = NODES[node](s); s.step += 1; s.history.append(node)
-        if s.status != "running":                                   # interrupted, rejected or done
-            store.save(run_id, asdict(s), cursor=node); break
-        edge = EDGES[node]; node = edge(s) if callable(edge) else edge
-        store.save(run_id, asdict(s), cursor=node)                  # checkpoint after every node
-        emit(run_id, node=s.history[-1], score=s.score)
+    saved, node = store.get(run_id, (None, "draft_reply"))
+    s = dict(saved or {"draft": "", "score": 0.0, "approved": None, "step": 0, "status": "running"})
+    while node and s["status"] == "running" and s["step"] < max_steps:
+        NODES[node](s); s["step"] += 1
+        if s["status"] == "running":
+            node = EDGES[node](s)                  # interrupted or done: the cursor stays on this node
+        store[run_id] = (dict(s), node)            # checkpoint after every node
     return s
+
+store = {}
+print(run("t1", store)["status"])                        # waiting_approval
+store["t1"][0].update(approved=True, status="running")   # approval service, hours later
+print(run("t1", store)["status"])                        # sent: draft from step 2, then done
 ```
 
 ### Tracing one ticket through it
 | Step | Node | What happens |
 |---|---|---|
 | 1 | `draft_reply` | first draft |
-| 2 | `grade` | returns 0.55 with the critique "promises a refund date"; router loops back |
-| 3 | `draft_reply` | redrafts using the critique |
+| 2 | `grade` | returns 0.55; router loops back |
+| 3 | `draft_reply` | redrafts |
 | 4 | `grade` | returns 0.82; router goes to `approval` |
 | 5 | `approval` | finds `approved is None`, sets `waiting_approval`; run returns with cursor on `approval`, no worker held |
 | — | (hours later) | approval service writes `approved=True, status="running"` and calls `run` again |
 | 6–7 | `approval` → `send` | loads the checkpoint, re-enters `approval`, routes to `send`, finishes |
 
-- **Crash after `send` sends but before its checkpoint:** resume re-runs `send`, and the idempotency key
-  `ticket:send` turns the second send into a no-op.
-- **Key choice in the sketch:** `f"{s.ticket}:send"` is built from the ticket text, so two tickets with
-  identical text would collide. In production derive it from the run id (`f"{run_id}:send"`).
-- **Two independent bounds on the revise cycle, one per level:** the `s.step < 6` guard in the router and
-  `max_steps` in the loop.
-
-### The same graph in LangGraph
-The hand-rolled executor above, expressed with LangGraph's primitives. `call_model` and `mail` are still
-stand-ins. Check names against the LangGraph version you install: older releases call the in-memory
-checkpointer `MemorySaver`.
-
-```python
-from typing import TypedDict
-from langgraph.graph import StateGraph, START, END
-from langgraph.types import interrupt, Command
-from langgraph.checkpoint.memory import InMemorySaver   # tutorials only; use a Postgres checkpointer in production
-
-class S(TypedDict, total=False):
-    ticket: str
-    draft: str
-    score: float
-    step: int
-    approved: bool
-
-def draft_reply(s): return {"draft": call_model(f"Draft a reply to: {s['ticket']}").text, "step": s.get("step", 0) + 1}
-def grade(s):       return {"score": float(call_model(f"Score 0-1 as JSON: {s['draft']}").json["score"])}
-def approval(s):    return {"approved": interrupt({"draft": s["draft"]})}   # pauses; resume value lands here
-def send(s):        mail.send_idempotent(key=f"{s['ticket']}:send", body=s["draft"]); return {}
-
-g = StateGraph(S)
-for name, fn in [("draft_reply", draft_reply), ("grade", grade), ("approval", approval), ("send", send)]:
-    g.add_node(name, fn)
-g.add_edge(START, "draft_reply")
-g.add_edge("draft_reply", "grade")
-g.add_conditional_edges("grade", lambda s: "draft_reply" if s["score"] < 0.7 and s["step"] < 6 else "approval",
-                        ["draft_reply", "approval"])
-g.add_conditional_edges("approval", lambda s: "send" if s["approved"] else END, ["send", END])
-g.add_edge("send", END)
-app = g.compile(checkpointer=InMemorySaver())
-
-cfg = {"configurable": {"thread_id": "run-42"}}
-app.invoke({"ticket": "Where is my refund?"}, cfg)   # runs until the interrupt, then returns
-app.invoke(Command(resume=True), cfg)                 # hours later: approval node re-runs and gets True
-```
-
-- **The interrupted node re-runs from its start on resume,** with `interrupt()` returning the resume
-  value, so keep side effects out of code before the `interrupt()` call.
+- **Crash after `send` sends but before its checkpoint:** resume re-runs `send`, and an idempotency key
+  derived from the run id (`f"{run_id}:send"`) turns the second send into a no-op.
+- **Two independent bounds on the revise cycle, one per level:** the `s["step"] < 6` guard in the router
+  and `max_steps` in the loop.
+- **In LangGraph** the same shape is `StateGraph` with `add_edge` and `add_conditional_edges`, an
+  `interrupt()` call in the approval node, and `app.invoke(Command(resume=True), cfg)` on the same
+  `thread_id` to resume.
 
 ### Runnable: why parallel branches need a reducer
 Pure Python. Three branches finish in random order and merge into one state field.
@@ -364,6 +308,10 @@ print(len(asyncio.run(fan_out(append_reducer))["findings"]))    # 3
 - **Per-run event stream to clients and traces.** Stream node started, tool result, waiting and done
   events to the UI (for example over server-sent events) and to tracing under the run id. Alert on
   running runs whose last event is older than a threshold you set: they are stuck.
+- **LangGraph interrupt and checkpointer details.** On resume the interrupted node re-runs from its
+  start with `interrupt()` returning the resume value, so keep side effects out of code before the
+  `interrupt()` call. `InMemorySaver` is for tutorials only (older releases call it `MemorySaver`); check
+  names against the LangGraph version you install.
 
 ## Trade-offs
 - **Explicit graphs vs adaptability.** Graphs make paths enumerable and testable, but every new

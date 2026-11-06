@@ -346,8 +346,6 @@ AI SDK 5 naming (v7 renames are listed under "Runtime fit and versions").
 import { streamText, generateObject, tool, stepCountIs, convertToModelMessages } from "ai";
 import { anthropic } from "@ai-sdk/anthropic";
 import { z } from "zod";
-import { db } from "./db";
-
 const model = anthropic(process.env.MODEL_ID ?? "claude-opus-5-5");   // swap for openai("...") to compare
 
 export async function chatHandler(req: Request): Promise<Response> {
@@ -360,22 +358,17 @@ export async function chatHandler(req: Request): Promise<Response> {
       lookupOrder: tool({
         description: "Fetch an order by its id",
         inputSchema: z.object({ orderId: z.string().regex(/^ord_\w+$/) }),
-        execute: async ({ orderId }) => (await db.orders.find(orderId)) ?? { error: "not found" },
+        execute: async ({ orderId }) => ({ orderId, status: "shipped" }),   // your database read goes here
       }),
     },
     stopWhen: stepCountIs(4),          // at most 4 model/tool rounds per request
     abortSignal: req.signal,           // client disconnect stops generation and further billing
-    onFinish: ({ totalUsage, steps }) =>   // v5: `usage` is the last step, totalUsage sums all; v7: both sum
-      console.log({ totalUsage, steps: steps.length, toolCalls: steps.flatMap((s) => s.toolCalls).length }),
+    onFinish: ({ totalUsage, steps }) => console.log({ totalUsage, steps: steps.length }),  // v5: usage = last step only
   });
   return result.toUIMessageStreamResponse();   // tokens, tool state and data to the browser
 }
 
-const Intent = z.object({
-  intent: z.enum(["refund", "shipping", "other"]),
-  confidence: z.number().min(0).max(1),
-});
-
+const Intent = z.object({ intent: z.enum(["refund", "shipping", "other"]), confidence: z.number().min(0).max(1) });
 export async function classify(text: string) {
   const { object } = await generateObject({ model, schema: Intent, prompt: `Classify:\n${text}` });
   return object;                       // typed { intent, confidence }, validated against Intent
@@ -451,6 +444,8 @@ export async function classifySafe(text: string) {
 - **Per-step agent traces.** Use the `onStepFinish` callback (or the `steps` array in `onFinish`) to log
   each step's tool calls, results, finish reason and usage under one run id. Monitor steps per run, tool
   error rate per tool, and runs that hit the step budget instead of finishing.
+- **Count tool calls per request.** In `onFinish`, log `steps.flatMap((s) => s.toolCalls).length` next to
+  `totalUsage` and the step count, so a tool loop shows up as a number, not a bill.
 
 ## Trade-offs
 - **One call shape vs newest features.** Comparisons and fallbacks get cheap, but the newest

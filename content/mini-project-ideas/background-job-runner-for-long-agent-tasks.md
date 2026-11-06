@@ -328,99 +328,57 @@ stateDiagram-v2
 ```
 
 ## Examples
-### Starter code: job store, leases, checkpoints and the worker loop
+### Starter code: atomic claim with a lease, checkpoint per step
 SQLite (3.35 or newer, for `RETURNING`) runs each `UPDATE ... RETURNING` atomically, which is enough for a
 few workers on one machine; in Postgres the claim subquery uses `FOR UPDATE SKIP LOCKED` so many workers
-never take the same job.
+never take the same job. Save as `jobs.py`.
 
 ```python
-import json, sqlite3, time, uuid
+import json, sqlite3, time
 
-SCHEMA = """CREATE TABLE IF NOT EXISTS jobs(
-  id TEXT PRIMARY KEY, idem_key TEXT UNIQUE, status TEXT, payload TEXT, checkpoint TEXT,
-  attempts INTEGER DEFAULT 0, lease_until REAL DEFAULT 0, run_after REAL DEFAULT 0,
-  cancel INTEGER DEFAULT 0, result TEXT, error TEXT, created REAL)"""
+db = sqlite3.connect(":memory:", isolation_level=None)       # autocommit; each UPDATE is atomic
+db.execute("CREATE TABLE jobs(id TEXT PRIMARY KEY, idem_key TEXT UNIQUE, status TEXT,"
+           " checkpoint TEXT DEFAULT '{}', lease_until REAL DEFAULT 0, created REAL)")
 
-class JobStore:
-    def __init__(self, path, lease_s=30, max_attempts=3):
-        self.db = sqlite3.connect(path, isolation_level=None)       # autocommit; each UPDATE is atomic
-        self.db.execute(SCHEMA)
-        self.lease_s, self.max_attempts = lease_s, max_attempts
+def submit(jid, idem_key):
+    db.execute("INSERT OR IGNORE INTO jobs(id, idem_key, status, created) VALUES (?,?,'queued',?)",
+               (jid, idem_key, time.time()))
+    return db.execute("SELECT id FROM jobs WHERE idem_key=?", (idem_key,)).fetchone()[0]
 
-    def submit(self, payload, idem_key):
-        self.db.execute("INSERT OR IGNORE INTO jobs(id, idem_key, status, payload, checkpoint, created) "
-                        "VALUES (?,?,?,?,?,?)", (str(uuid.uuid4()), idem_key, "queued", json.dumps(payload), "{}", time.time()))
-        return self.db.execute("SELECT id FROM jobs WHERE idem_key=?", (idem_key,)).fetchone()[0]
+def claim(lease_s):
+    """Take a queued job, or a running job whose worker stopped renewing its lease."""
+    now = time.time()
+    return db.execute("UPDATE jobs SET status='running', lease_until=? WHERE id=(SELECT id FROM jobs WHERE"
+                      " status='queued' OR (status='running' AND lease_until<?) ORDER BY created LIMIT 1)"
+                      " RETURNING id, checkpoint", (now + lease_s, now)).fetchone()
 
-    def claim(self):
-        """Take one queued job, or a running job whose worker stopped renewing its lease."""
-        now = time.time()
-        return self.db.execute(
-            "UPDATE jobs SET status='running', attempts=attempts+1, lease_until=? WHERE id=("
-            " SELECT id FROM jobs WHERE (status='queued' AND run_after<=?) OR (status='running' AND lease_until<?)"
-            " ORDER BY created LIMIT 1) RETURNING id, payload, checkpoint, attempts",
-            (now + self.lease_s, now, now)).fetchone()
-
-    def checkpoint(self, jid, state):
-        """Save progress and renew the lease; returns True if cancellation was requested."""
-        self.db.execute("UPDATE jobs SET checkpoint=?, lease_until=? WHERE id=?",
-                        (json.dumps(state), time.time() + self.lease_s, jid))
-        return bool(self.db.execute("SELECT cancel FROM jobs WHERE id=?", (jid,)).fetchone()[0])
-
-    def finish(self, jid, status, result=None, error=None):
-        self.db.execute("UPDATE jobs SET status=?, result=?, error=? WHERE id=?",
-                        (status, json.dumps(result), error, jid))
-
-    def retry_or_dead(self, jid, attempts, error):
-        if attempts >= self.max_attempts:
-            return self.finish(jid, "dead", error=error)                # dead-letter: a human looks
-        self.db.execute("UPDATE jobs SET status='queued', run_after=?, error=? WHERE id=?",
-                        (time.time() + 2 ** attempts, error, jid))      # exponential backoff
-
-    def get(self, jid):
-        cols = ("status", "checkpoint", "attempts", "result", "error")
-        return dict(zip(cols, self.db.execute(f"SELECT {', '.join(cols)} FROM jobs WHERE id=?", (jid,)).fetchone()))
-
-def work_once(store, steps):
-    """Run one job step by step, resuming from its checkpoint. `steps` are idempotent functions."""
-    job = store.claim()
-    if job is None:
-        return False
-    jid, payload, ckpt, attempts = job
-    state = json.loads(ckpt) or {"step": 0, "input": json.loads(payload), "notes": []}
-    try:
-        while state["step"] < len(steps):
-            state = steps[state["step"]](state)
-            state["step"] += 1
-            if store.checkpoint(jid, state):
-                store.finish(jid, "cancelled", result=state); return True
-        store.finish(jid, "succeeded", result=state)
-    except Exception as e:
-        store.retry_or_dead(jid, attempts, repr(e))
-    return True
+def work_once(steps, lease_s=30):
+    jid, ckpt = claim(lease_s)
+    state = json.loads(ckpt) or {"step": 0, "notes": []}
+    while state["step"] < len(steps):                        # resume from the last finished step
+        steps[state["step"]](state)
+        state["step"] += 1
+        db.execute("UPDATE jobs SET checkpoint=?, lease_until=? WHERE id=?",
+                   (json.dumps(state), time.time() + lease_s, jid))   # save progress, renew the lease
+    db.execute("UPDATE jobs SET status='succeeded' WHERE id=?", (jid,))
+    return state["notes"]
 ```
 
-### Starter test: crash recovery without repeating a step
-A negative lease makes every lease expire at once, which simulates a worker that died after its last
-checkpoint.
+### Crash recovery without repeating a step
+Append to `jobs.py`. A negative lease makes the lease expire at once, which simulates a worker that died
+after its last checkpoint.
 
 ```python
-from jobs import JobStore, work_once
+def step_a(s): s["notes"].append("a")
+def step_b(s): s["notes"].append("b")
+def crash(s): raise SystemExit("worker killed")
 
-def step_a(s): s["notes"].append("a"); return s
-def step_b(s): s["notes"].append("b"); return s
-
-def test_resume_after_crash():
-    st = JobStore(":memory:", lease_s=-1)        # leases expire instantly, like a dead worker
-    jid = st.submit({}, "k")
-    def crash(s): raise SystemExit("worker killed")
-    try:
-        work_once(st, [step_a, crash])
-    except SystemExit:
-        pass
-    assert st.get(jid)["status"] == "running"     # lease expired, so another worker may take it
-    work_once(st, [step_a, step_b])
-    assert '"notes": ["a", "b"]' in st.get(jid)["result"]   # step a was not repeated
+print(submit("job1", "key-1"), submit("job2", "key-1"))   # job1 job1: a retried POST makes one job
+try:
+    work_once([step_a, crash], lease_s=-1)                 # dies after checkpointing step a
+except SystemExit:
+    pass
+print(work_once([step_a, step_b]))                         # ['a', 'b']: step a was not repeated
 ```
 
 ### Milestones, time estimates and done-when checks
@@ -447,6 +405,9 @@ def test_resume_after_crash():
   count and retries per job, because a stuck queue looks healthy from inside a worker.
 - **Portfolio polish.** A README with the state diagram and the API, the crash and duplicate tests in CI,
   a demo of `kill -9` mid-job, and traces linking each job to its agent steps.
+- **Bound retries and honour cancel at checkpoints.** On an exception requeue with exponential backoff
+  (`run_after = now + 2 ** attempts`) and mark the job `dead` after 3 attempts; read a `cancel` flag at
+  each checkpoint and stop with status `cancelled`. The Examples starter leaves both to the Lab.
 
 ## Trade-offs
 - **Database-backed queue vs a broker.** A jobs table gives transactions, easy inspection and one fewer

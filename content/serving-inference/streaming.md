@@ -192,54 +192,33 @@ sequenceDiagram
   disconnect and cancels the producer and the provider stream; otherwise you keep paying for tokens.
 
 ## Examples
-### SSE endpoint with heartbeats, in-band errors and disconnect handling
+### SSE endpoint with in-band errors and disconnect handling
 A minimal SSE endpoint that forwards an engine's tokens with correct framing, a connect comment that
-forces intermediaries to commit to the response, heartbeats on idle, in-band errors and a stop on
-client disconnect. The token source is a stand-in for an engine or provider stream.
+forces intermediaries to commit to the response, in-band errors and a stop on client disconnect. The
+fixed token tuple is a stand-in for an engine or provider stream.
+- **Heartbeats are left out here.** A `: keep-alive` comment every 15 s of silence needs a queue between
+  producer and response; see Production patterns.
 
 ```python
 import asyncio, json
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
-
 app = FastAPI()
-
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"      # blank line terminates the event
 
-async def token_source(prompt: str):                             # stand-in for an engine stream
-    for i, tok in enumerate(("Stream", "ing", " works", ".")):
-        await asyncio.sleep(0.3); yield i, tok
-
 @app.post("/v1/answer")
 async def answer(req: Request):
-    body = await req.json()
-    q: asyncio.Queue = asyncio.Queue()
-
-    async def pump():                                            # engine -> queue, errors in-band
-        n = 0
-        try:
-            async for i, tok in token_source(body["prompt"]):
-                await q.put(("delta", {"i": i, "text": tok})); n += 1
-            await q.put(("done", {"output_tokens": n}))
-        except Exception as e:
-            await q.put(("error", {"message": str(e)}))          # status is already 200
-
     async def gen():
-        task = asyncio.create_task(pump())
         yield ": connected\n\n"                                  # comment: flushes proxies, no client event
         try:
-            while True:
-                try:
-                    ev, data = await asyncio.wait_for(q.get(), timeout=15)
-                except asyncio.TimeoutError:
-                    yield ": keep-alive\n\n"; continue           # heartbeat beats idle timeouts
-                if await req.is_disconnected(): break            # client left: stop forwarding
-                yield sse(ev, data)
-                if ev in ("done", "error"): break
-        finally:
-            task.cancel()                                        # propagate the stop upstream
-
+            for tok in ("Stream", "ing", " works", "."):         # stand-in for an engine stream
+                await asyncio.sleep(0.3)
+                if await req.is_disconnected(): return           # client left: stop generating
+                yield sse("delta", {"text": tok})
+            yield sse("done", {})
+        except Exception as e:
+            yield sse("error", {"message": str(e)})              # status is already 200
     return StreamingResponse(gen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 ```
@@ -247,28 +226,22 @@ async def answer(req: Request):
 ### A client parser that survives split reads
 Runnable without a server: the wire bytes are cut into 11-byte reads, which splits events and the
 two-byte `é` across reads. Decoding incrementally and buffering to the blank line still yields clean
-events. (This sketch handles LF line endings only; a full parser also accepts CRLF and CR.)
+events. (This sketch assumes `field: value` with one space and LF line endings; a full parser also
+accepts no space, CRLF and CR.)
 
 ```python
 import codecs, json
-
 def parse_sse(chunks):
-    dec = codecs.getincrementaldecoder("utf-8")()   # keeps half a character between reads
-    buf = ""
+    dec, buf = codecs.getincrementaldecoder("utf-8")(), ""   # decoder keeps half a character between reads
     for chunk in chunks:
         buf += dec.decode(chunk)
         while "\n\n" in buf:                        # an event ends at a blank line, not a read
             raw, buf = buf.split("\n\n", 1)
             event, data = "message", []
-            for line in raw.split("\n"):
-                if not line or line.startswith(":"):
-                    continue                        # comments and heartbeats
-                field, _, value = line.partition(":")
-                value = value[1:] if value.startswith(" ") else value
-                if field == "event":
-                    event = value
-                elif field == "data":
-                    data.append(value)
+            for line in raw.split("\n"):            # ": keep-alive" comments match neither field
+                field, _, value = line.partition(": ")
+                if field == "event": event = value
+                elif field == "data": data.append(value)
             if data:
                 yield event, "\n".join(data)
 
@@ -294,47 +267,27 @@ The third row is why "all events arrived within the last 100 ms of the response"
 generation ran at normal speed, but an intermediary held the bytes.
 
 ### Agent scenario: assembling a streamed tool call
-The agent forwards text at once but executes a tool only after its argument JSON is complete. The
-events are a hand-written stand-in shaped like the Anthropic Messages API stream.
+The agent executes a tool only after its argument JSON is complete. The events are a hand-written
+stand-in shaped like the Anthropic Messages API stream.
 
 ```python
 import json
-
+D = "content_block_delta"
 events = [  # stand-in for a provider stream; shapes follow the Messages API event types
-    {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
-    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Checking "}},
-    {"type": "content_block_stop", "index": 0},
-    {"type": "content_block_start", "index": 1,
-     "content_block": {"type": "tool_use", "id": "tu_1", "name": "search_orders"}},
-    {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": '{"order_'}},
-    {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": 'id": "A-17"}'}},
+    {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "name": "search_orders"}},
+    {"type": D, "index": 1, "delta": {"type": "input_json_delta", "partial_json": '{"order_'}},
+    {"type": D, "index": 1, "delta": {"type": "input_json_delta", "partial_json": 'id": "A-17"}'}},
     {"type": "content_block_stop", "index": 1},
-    {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 31}},
 ]
-
-def run_step(stream, emit):
-    blocks, calls = {}, []
-    for ev in stream:
-        if ev["type"] == "content_block_start":
-            blocks[ev["index"]] = {**ev["content_block"], "buf": ""}
-        elif ev["type"] == "content_block_delta":
-            d = ev["delta"]
-            if d["type"] == "text_delta":
-                emit("delta", {"text": d["text"]})               # forward text immediately
-            else:
-                blocks[ev["index"]]["buf"] += d["partial_json"]   # never parse a fragment
-        elif ev["type"] == "content_block_stop":
-            b = blocks[ev["index"]]
-            if b["type"] == "tool_use":
-                calls.append((b["name"], json.loads(b["buf"])))   # complete JSON only here
-                emit("tool_start", {"name": b["name"]})
-        elif ev["type"] == "message_delta":
-            return ev["delta"]["stop_reason"], calls, ev["usage"]
-
-print(run_step(events, lambda e, d: print("emit", e, d)))
-# emit delta {'text': 'Checking '}
-# emit tool_start {'name': 'search_orders'}
-# ('tool_use', [('search_orders', {'order_id': 'A-17'})], {'output_tokens': 31})
+name, buf = None, ""     # one tool block here; key both by event "index" when several stream
+for ev in events:
+    if ev["type"] == "content_block_start":
+        name = ev["content_block"]["name"]
+    elif ev["type"] == D:
+        buf += ev["delta"]["partial_json"]          # never parse a fragment
+    elif ev["type"] == "content_block_stop":
+        print(name, json.loads(buf))                # complete JSON only here
+# search_orders {'order_id': 'A-17'}
 ```
 
 ### Worked scenario: a three-step agent with and without streaming
@@ -371,6 +324,9 @@ Illustrative numbers: two tool calls, then a 400-token answer at 20 ms per token
   provider or engine stream. Monitor tokens generated after disconnect and spend versus active streams.
 - **Coalesce at the edge on busy servers.** Batch tokens into one event every few tens of milliseconds
   when frame or render overhead shows up. Monitor events per second and inter-event gap distribution.
+- **Heartbeats need a producer queue.** Run the engine stream in a task that feeds an `asyncio.Queue`,
+  wait on it with a timeout (15 s), send `: keep-alive` on each timeout, and cancel the task when the
+  response ends.
 
 ## Trade-offs
 - **Perceived latency vs total time.** Perceived latency drops to TTFT, but completion time does not

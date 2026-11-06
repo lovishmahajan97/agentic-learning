@@ -195,33 +195,27 @@ def call_model(prompt: str) -> str:          # replace with a verifier from a di
                            {"claim": "I issued your refund", "action": "refund"}])
     return "SUPPORTED"
 
-ACTIONS = {"refund": "issue_refund", "cancel": "cancel_order", "email": "send_email"}
-CLASSIFY = ("Split the agent's final message into atomic claims. For each, return "
-            '{{"claim": str, "action": one of {acts} or null}}. JSON list only.\n\n{text}')
-VERIFY = ("Tool results:\n{evidence}\n\nClaim: {claim}\nAnswer with exactly one word: "
-          "SUPPORTED, CONTRADICTED or UNVERIFIABLE.")
+ACTIONS = {"refund": "issue_refund", "cancel": "cancel_order"}   # claimed action -> tool that proves it
 
 def score_agent_answer(final_text: str, trace: list[dict]) -> dict:
     ok_calls = {s["tool"] for s in trace if s["type"] == "tool_call" and s["status"] == "ok"}
-    evidence = "\n---\n".join(json.dumps(s["output"]) for s in trace if s["type"] == "tool_result")
-    claims = json.loads(call_model(CLASSIFY.format(acts=list(ACTIONS), text=final_text)))
+    evidence = json.dumps([s["output"] for s in trace if s["type"] == "tool_result"])
+    claims = json.loads(call_model(f"Split into atomic claims, tag actions {list(ACTIONS)}:\n{final_text}"))
     labels = []
     for c in claims:
         if c["action"]:                          # deterministic: did the call actually succeed?
             labels.append("SUPPORTED" if ACTIONS.get(c["action"]) in ok_calls else "CONTRADICTED")
         else:
-            labels.append(call_model(VERIFY.format(evidence=evidence, claim=c["claim"])).strip(" .\n").upper())
-    n = len(labels)
-    return {"n_claims": n,
-            "claim_precision": labels.count("SUPPORTED") / n if n else None,
-            "hallucinated": "CONTRADICTED" in labels,
+            q = f"Tool results: {evidence}\nClaim: {c['claim']}\nOne word: SUPPORTED, CONTRADICTED or UNVERIFIABLE"
+            labels.append(call_model(q).strip().upper())
+    return {"claim_precision": labels.count("SUPPORTED") / len(labels),
             "action_hallucination": any(c["action"] and l == "CONTRADICTED" for c, l in zip(claims, labels))}
 
 trace = [{"type": "tool_call", "tool": "lookup_order", "status": "ok"},
          {"type": "tool_result", "output": {"order": 123, "shipped": "May 3"}},
          {"type": "tool_call", "tool": "issue_refund", "status": "error"}]
 print(score_agent_answer("Order 123 shipped on May 3. I issued your refund.", trace))
-# {'n_claims': 2, 'claim_precision': 0.5, 'hallucinated': True, 'action_hallucination': True}
+# {'claim_precision': 0.5, 'action_hallucination': True}
 ```
 
 Illustrative run on 300 support-agent traces (not a benchmark), before and after making the final-answer
@@ -236,42 +230,17 @@ step quote tool results:
 - **Action hallucinations are the headline.** Nine customers told a refund happened when it did not is
   a support incident, which is why they get their own count and a zero-tolerance alert.
 
-### Claim-level pipeline against a trusted corpus
-`call_model` is any chat model (not the one that wrote the responses) and `search` retrieves from your
-own knowledge source, not the open web. The output separates claim precision, response-level rate,
-fabrication on unanswerable items and false abstention.
+### Rolling claim labels up into four numbers
+Each item carries the verifier's per-response scores (from a pipeline like the one above, run against
+your versioned corpus). The roll-up separates claim precision, response-level rate, fabrication on
+unanswerable items and false abstention.
 
 ```python
-import json
-from collections import Counter
-
-def call_model(prompt: str) -> str: ...                 # a different model family from the generator
-def search(claim: str, k: int = 3) -> list[str]: ...    # trusted corpus, versioned
-def is_abstention(text: str) -> bool: ...               # small classifier or judge: "says it cannot answer"
-
-DECOMPOSE = ("Split the text into atomic, self-contained factual claims. Resolve pronouns. "
-             "Return a JSON list of strings.\n\nTEXT:\n{text}")
-VERIFY = ("Evidence:\n{evidence}\n\nClaim: {claim}\nAnswer with exactly one word: "
-          "SUPPORTED, CONTRADICTED or UNVERIFIABLE.")
-
-def score_response(text: str) -> dict:
-    claims = json.loads(call_model(DECOMPOSE.format(text=text)))
-    labels = Counter()
-    for c in claims:
-        evidence = "\n---\n".join(search(c))
-        labels[call_model(VERIFY.format(evidence=evidence, claim=c)).strip(" .\n").upper()] += 1
-    n = len(claims)                     # an abstention has no claims: precision is undefined, not 0
-    return {"n_claims": n, "abstained": is_abstention(text),
-            "claim_precision": labels["SUPPORTED"] / n if n else None,
-            "hallucinated": labels["CONTRADICTED"] > 0,
-            "unsupported_rate": (labels["CONTRADICTED"] + labels["UNVERIFIABLE"]) / n if n else None}
-
 def mean(rows: list[dict], key: str) -> float:     # skips undefined values; bools count as 0/1
-    vals = [float(r[key]) for r in rows if r.get(key) is not None]
+    vals = [float(r[key]) for r in rows if r[key] is not None]
     return sum(vals) / len(vals) if vals else float("nan")
 
-def evaluate(items: list[dict]) -> dict:   # item: {"question", "answerable": bool, "response"}
-    rows = [{**it, **score_response(it["response"])} for it in items]
+def evaluate(rows: list[dict]) -> dict:
     ans = [r for r in rows if r["answerable"]]
     answered = [r for r in ans if not r["abstained"]]   # abstentions would dilute the rate toward 0
     unans = [r for r in rows if not r["answerable"]]
@@ -279,6 +248,14 @@ def evaluate(items: list[dict]) -> dict:   # item: {"question", "answerable": bo
             "response_hallucination_rate": mean(answered, "hallucinated"),
             "false_abstention": mean(ans, "abstained"),
             "fabrication_on_unanswerable": 1 - mean(unans, "abstained")}
+
+rows = [  # an abstention has no claims: precision is None (undefined), not 0
+    {"answerable": True, "abstained": False, "claim_precision": 1.0, "hallucinated": False},
+    {"answerable": True, "abstained": False, "claim_precision": 0.5, "hallucinated": True},
+    {"answerable": True, "abstained": True, "claim_precision": None, "hallucinated": False},
+    {"answerable": False, "abstained": False, "claim_precision": 0.0, "hallucinated": True}]
+print(evaluate(rows))
+# {'claim_precision': 0.75, 'response_hallucination_rate': 0.5, 'false_abstention': 0.333..., 'fabrication_on_unanswerable': 1.0}
 ```
 
 ### Reading the output: prompt A vs prompt B
@@ -338,6 +315,9 @@ for n in (50, 100, 400):
 - **Versioned reference corpus.** Record the corpus snapshot in every eval report, so a stale KB that
   turns correct new answers into "contradicted" is visible. Monitor contradicted labels that trace to
   documents older than the latest snapshot.
+- **Corpus retrieval and abstention detection.** For corpus-grounded checks, retrieve evidence per claim
+  from your own versioned knowledge source, not the open web, and detect abstentions with a small
+  classifier or judge rather than string matching. Monitor the abstention detector's agreement with humans.
 
 ## Trade-offs
 - **Precision of claim decomposition vs cost.** Precise, actionable numbers, but several model calls per

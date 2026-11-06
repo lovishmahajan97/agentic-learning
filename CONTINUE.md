@@ -1,5 +1,16 @@
 # Continuing the lesson build (handoff)
 
+## Status 2026-11-06: examples simplified
+
+- 479 lessons had bloated Examples (a block over 30 lines or over 60 example lines per lesson). Each was
+  trimmed to minimal runnable examples, one idea each, then independently verified (153 fixes).
+- Limits, enforced by `scripts/check_simplify.py` against tag `pre-simplify`: 30 lines per block, 60 per
+  lesson; only Examples and Production patterns may change; Production patterns bullets only grow.
+- Cut production facts moved to Production patterns: 434 bullets in 293 lessons. Lab starters untouched.
+- Example code 42,448 to 31,055 lines; block median 25 to 21. Checks: 677/677 valid.
+- New lessons should meet the same limits: run check_simplify.py on them.
+
+
 ## Status 2026-11-05: tool coverage audit applied
 
 - Audit report: `docs/tool-coverage-audit-2026-11.md` (inventory in `docs/tool-inventory-2026-11.json`).

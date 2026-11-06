@@ -350,145 +350,56 @@ flowchart TD
 ```
 
 ## Examples
-### Port, adapter, fake and composition root
-`Summarizer` and the `Completer` protocol import nothing from any SDK, the vendor import is deferred into
-the root, and the test needs no network.
+### Port, adapter and composition root
+`Summarizer` and the `Completer` protocol import nothing from any SDK; the adapter translates the vendor
+reply into your own `Completion`, and the vendor import is deferred into the root.
 
 ```python
 from dataclasses import dataclass
 from typing import Protocol
 
 @dataclass(frozen=True)
-class Completion:
+class Completion:                                # your type, not the vendor's
     text: str
     input_tokens: int
-    output_tokens: int
 
 class Completer(Protocol):                       # the port: your vocabulary, your types
-    def complete(self, system: str, user: str, *, max_tokens: int) -> Completion: ...
+    def complete(self, system: str, user: str) -> Completion: ...
 
 class OpenAICompleter:                           # the adapter: the only file that imports the SDK
     def __init__(self, client, model: str) -> None:
         self._client, self._model = client, model
-    def complete(self, system, user, *, max_tokens):
-        r = self._client.chat.completions.create(
-            model=self._model, max_tokens=max_tokens,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}])
-        return Completion(r.choices[0].message.content or "",
-                          r.usage.prompt_tokens, r.usage.completion_tokens)
-
-class FakeCompleter:                             # test double: scripted answers, records calls
-    def __init__(self, answers: list[str]) -> None:
-        self.answers, self.calls = list(answers), []
-    def complete(self, system, user, *, max_tokens):
-        self.calls.append((system, user, max_tokens))
-        return Completion(self.answers.pop(0), 10, 5)
+    def complete(self, system: str, user: str) -> Completion:
+        r = self._client.chat.completions.create(model=self._model, messages=[
+            {"role": "system", "content": system}, {"role": "user", "content": user}])
+        return Completion(r.choices[0].message.content or "", r.usage.prompt_tokens)
 
 class Summarizer:                                # domain service: knows nothing about vendors
-    def __init__(self, completer: Completer, max_tokens: int = 200) -> None:
-        self._c, self._max = completer, max_tokens
+    def __init__(self, completer: Completer) -> None:
+        self._c = completer
     def summarize(self, doc: str) -> str:
-        return self._c.complete("Summarize in two sentences.", doc, max_tokens=self._max).text
+        return self._c.complete("Summarize in two sentences.", doc).text
 
 def build_summarizer() -> Summarizer:            # composition root: the one place real things are chosen
     from openai import OpenAI
     return Summarizer(OpenAICompleter(OpenAI(), model="gpt-4o-mini"))
-
-def test_summarizer_passes_document_through():
-    fake = FakeCompleter(["Short summary."])
-    assert Summarizer(fake).summarize("long text") == "Short summary."
-    assert fake.calls[0][1] == "long text" and fake.calls[0][2] == 200
 ```
 
-### Agent scenario: testing a tool-calling loop with a scripted model
-The loop depends on two ports: a model that returns either a tool call or a final answer, and a dict of
-tools. The test scripts a two-step run and checks routing, arguments and the step budget, with no
-network. Standard library only.
+### A scripted fake through the same port
+The test hands `Summarizer` a dumb fake: no key, no network, and the recorded call proves the document
+went through.
 
 ```python
-from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Callable, Protocol
+class FakeCompleter:                             # test double: scripted answer, records calls
+    def __init__(self, answer: str) -> None:
+        self.answer, self.calls = answer, []
+    def complete(self, system: str, user: str) -> Completion:
+        self.calls.append(user)
+        return Completion(self.answer, 10)
 
-@dataclass(frozen=True)
-class ToolCall:
-    name: str
-    args: dict
-
-@dataclass(frozen=True)
-class Step:                                      # your type: adapters translate vendor tool calls into it
-    text: str = ""
-    tool_call: ToolCall | None = None
-
-class Model(Protocol):
-    def next_step(self, transcript: list[dict]) -> Step: ...
-
-class Agent:
-    def __init__(self, model: Model, tools: dict[str, Callable[..., str]], max_steps: int = 8):
-        self._model, self._tools, self._max = model, tools, max_steps
-    def run(self, task: str) -> str:
-        transcript = [{"role": "user", "content": task}]
-        for _ in range(self._max):
-            step = self._model.next_step(transcript)
-            if step.tool_call is None:
-                return step.text
-            result = self._tools[step.tool_call.name](**step.tool_call.args)
-            transcript.append({"role": "tool", "name": step.tool_call.name, "content": result})
-        raise RuntimeError("step budget exhausted")
-
-@dataclass
-class ScriptedModel:                             # dumb fake: replays steps, records what it saw
-    steps: list[Step]
-    seen: list[int] = field(default_factory=list)
-    def next_step(self, transcript):
-        self.seen.append(len(transcript))
-        return self.steps.pop(0)
-
-calls = []
-def lookup_order(order_id: str) -> str:
-    calls.append(order_id)
-    return "shipped"
-
-model = ScriptedModel([Step(tool_call=ToolCall("lookup_order", {"order_id": "A17"})),
-                       Step(text="Your order A17 has shipped.")])
-assert Agent(model, {"lookup_order": lookup_order}).run("Where is A17?") == "Your order A17 has shipped."
-assert calls == ["A17"] and model.seen == [1, 2]   # the tool result reached the second model call
-```
-
-### Injecting the clock and translating errors at the edge
-A rate-limited retry wrapper that depends only on your exception and an injected `sleep`, so the test
-runs instantly and works for every vendor adapter. Runnable with the standard library alone.
-
-```python
-from typing import Callable
-
-class ProviderRateLimited(Exception):            # your error type, raised by every adapter
-    pass
-
-class RetryingCompleter:
-    def __init__(self, inner, sleep: Callable[[float], None], attempts: int = 3) -> None:
-        self._inner, self._sleep, self._attempts = inner, sleep, attempts
-    def complete(self, system, user, *, max_tokens):
-        for i in range(self._attempts):
-            try:
-                return self._inner.complete(system, user, max_tokens=max_tokens)
-            except ProviderRateLimited:
-                if i == self._attempts - 1:
-                    raise
-                self._sleep(2 ** i)               # 1s, 2s ... in production; recorded in tests
-
-class FlakyFake:
-    def __init__(self, failures: int) -> None:
-        self.failures = failures
-    def complete(self, system, user, *, max_tokens):
-        if self.failures:
-            self.failures -= 1
-            raise ProviderRateLimited()
-        return "ok"
-
-slept: list[float] = []
-c = RetryingCompleter(FlakyFake(failures=2), sleep=slept.append)
-assert c.complete("s", "u", max_tokens=10) == "ok" and slept == [1, 2]
+fake = FakeCompleter("Short summary.")
+print(Summarizer(fake).summarize("long text"))   # Short summary.
+print(fake.calls)                                # ['long text']
 ```
 
 ### Worked scenario: adding a provider to a live agent, before and after
@@ -521,6 +432,9 @@ hosted model.
   since that is the drift your fakes cannot see.
 - **Shared resources injected, never re-created.** One `httpx.AsyncClient` and one loaded embedding model
   per process, passed to every consumer, including tools. Monitor open connections and process memory.
+- **Inject `sleep` into retry wrappers.** A retry adapter that catches your own `ProviderRateLimited`
+  and takes `sleep` as a constructor argument works for every vendor, and its test records the backoff
+  waits (1 s, 2 s, ...) instead of sleeping through them.
 
 ## Trade-offs
 - **Testability and swappability vs an extra file and hop per boundary.** Flips for a 200-line script with

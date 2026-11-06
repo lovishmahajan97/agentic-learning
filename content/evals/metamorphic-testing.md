@@ -176,28 +176,23 @@ import random
 from statistics import mean
 
 def first_tool_call(request: str, tools: list[dict]) -> tuple[str, dict]:  # replace with your agent
-    words = set(request.lower().strip("?").split())
+    words = set(request.lower().split())
     for t in tools:                       # position-biased: the first overlapping description wins
         if words & set(t["description"].lower().rstrip(".").split()):
             return t["name"], {}
     return "none", {}
 
-DECOY = {"name": "get_weather", "description": "Current weather for a city.",
-         "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
-
 AGENT_RELATIONS = {
     "identity":     lambda r, t: (r, t),                                  # noise floor
     "tool_order":   lambda r, t: (r, random.Random(0).sample(t, len(t))), # fixed shuffle
-    "decoy_tool":   lambda r, t: (r, t + [DECOY]),
+    "decoy_tool":   lambda r, t: (r, t + [{"name": "get_weather", "description": "Weather for a city."}]),
     "polite_frame": lambda r, t: ("Hi! Quick question. " + r + " Thanks!", t),
 }
 
 def tool_choice_violations(requests: list[str], tools: list[dict]) -> dict[str, float]:
     base = {r: first_tool_call(r, tools) for r in requests}   # compute once, reuse per relation
-    rates = {}
-    for name, transform in AGENT_RELATIONS.items():
-        rates[name] = mean(first_tool_call(*transform(r, tools)) != base[r] for r in requests)
-    return rates
+    return {name: mean(first_tool_call(*f(r, tools)) != base[r] for r in requests)
+            for name, f in AGENT_RELATIONS.items()}
 
 TOOLS = [{"name": "get_order", "description": "Order status and details."},
          {"name": "track_parcel", "description": "Parcel tracking for an order."},
@@ -225,40 +220,26 @@ compared against it.
 
 ```python
 import re
-from statistics import mean
 
 def rag_answer(question: str, docs: list[str]) -> str: ...     # system under test
 def same_meaning(a: str, b: str) -> bool: ...                    # agreement comparator, not a correctness judge
 
 NOISE_DOC = "Office newsletter: plants were watered on Tuesday. Parking lot B is closed this week."
 
-def paraphrase(q: str) -> str:   # cheap and deterministic; a model paraphraser works too
-    for a, b in [("What is", "Tell me"), ("How do I", "What's the way to"), ("?", ", please?")]:
-        q = q.replace(a, b, 1)
-    return q
-
 RELATIONS = {
     "identity":   lambda q, d: (q, d),                               # noise floor
-    "paraphrase": lambda q, d: (paraphrase(q), d),
+    "paraphrase": lambda q, d: (q.replace("What is", "Tell me", 1), d),  # a model paraphraser works too
     "noise_doc":  lambda q, d: (q, d + [NOISE_DOC]),
     "doc_order":  lambda q, d: (q, list(reversed(d))),
     "whitespace": lambda q, d: (re.sub(r"\s+", "  ", q) + "\n", d),
 }
 
 def violation_rates(cases: list[tuple[str, list[str]]]) -> dict[str, float]:
-    rates = {}
-    for name, transform in RELATIONS.items():
-        violations = []
-        for q, docs in cases:
-            base = rag_answer(q, docs)
-            q2, docs2 = transform(q, docs)
-            violations.append(not same_meaning(base, rag_answer(q2, docs2)))
-        rates[name] = mean(violations)
-    return rates
-
-# Read the table against "identity": a relation whose rate sits well above it is a real sensitivity.
-# A high doc_order rate in RAG usually points at position effects in the context window.
+    return {name: sum(not same_meaning(rag_answer(q, d), rag_answer(*t(q, d))) for q, d in cases) / len(cases)
+            for name, t in RELATIONS.items()}
 ```
+
+- **Read the rates against "identity":** a relation whose rate sits well above it is a real sensitivity.
 
 ### Reading an illustrative run on 300 support questions
 Made-up numbers, chosen to show how to read the table.

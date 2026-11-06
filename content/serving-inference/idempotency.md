@@ -163,45 +163,35 @@ flowchart TD
 ### Minimal idempotency layer
 Claim first, fingerprint check, replay on completion, 409 on a racing duplicate, release on transient
 failure so the client can retry. In production the dictionary is a Redis `SET NX PX` or a table with a
-unique index, and `claim` is a single atomic operation.
+unique index, and the claim is a single atomic operation.
 
 ```python
-import hashlib, json, time
+import hashlib, json
 
-class IdempotencyStore:
-    """In production: Redis SET NX PX, or a table with a unique index on key."""
-    def __init__(self, ttl_s=86_400, lease_s=120):
-        self.rows, self.ttl_s, self.lease_s = {}, ttl_s, lease_s
-    def claim(self, key, fingerprint):
-        row = self.rows.get(key)
-        if row and row["expires"] > time.monotonic():
-            if row["fp"] != fingerprint:
-                return "mismatch", None
-            return row["status"], row.get("response")      # "in_progress" or "done"
-        self.rows[key] = {"fp": fingerprint, "status": "in_progress",
-                          "expires": time.monotonic() + self.lease_s}   # short lease while running
-        return "claimed", None
-    def complete(self, key, response):
-        self.rows[key].update(status="done", response=response, expires=time.monotonic() + self.ttl_s)
-    def release(self, key):
-        self.rows.pop(key, None)
+rows = {}            # in production: Redis SET NX PX, or a table with a unique index on key
 
-store = IdempotencyStore()
-
-def handle_generate(idem_key: str, tenant: str, body: dict):
-    key = f"{tenant}:{idem_key}"                              # scope keys per caller
+def handle(tenant, idem_key, body, generate):
+    key = f"{tenant}:{idem_key}"                       # scope keys per caller
     fp = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
-    status, saved = store.claim(key, fp)
-    if status == "mismatch":    return 422, {"error": "idempotency key reused with a different body"}
-    if status == "done":        return 200, saved             # replay: no second generation, no second bill
-    if status == "in_progress": return 409, {"error": "already in flight; retry shortly"}
-    try:
-        resp = llm.generate(**body)       # expensive, non-deterministic; must finish within lease_s
-    except TransientError:
-        store.release(key)                                    # let the client retry with the same key
-        raise                             # a permanent error could be stored and replayed instead
-    store.complete(key, resp)
-    return 200, resp
+    row = rows.get(key)
+    if row is None:
+        rows[key] = {"fp": fp, "status": "in_progress"}   # the claim: first write, before any work
+        try:
+            resp = generate(body)
+        except TimeoutError:
+            del rows[key]                              # transient: release so a retry can run
+            raise
+        rows[key].update(status="done", response=resp)
+        return 200, resp
+    if row["fp"] != fp:          return 422, "key reused with a different body"
+    if row["status"] == "done":  return 200, row["response"]   # replay: no second generation
+    return 409, "already in flight"
+
+calls = []
+gen = lambda body: calls.append(body) or f"reply {len(calls)}"
+print(handle("t1", "msg-1", {"q": "hi"}, gen))    # (200, 'reply 1')
+print(handle("t1", "msg-1", {"q": "hi"}, gen))    # (200, 'reply 1')  replayed, len(calls) == 1
+print(handle("t1", "msg-1", {"q": "yo"}, gen))    # (422, 'key reused with a different body')
 ```
 
 ### Postgres claim with a lease and attempt id
@@ -210,13 +200,9 @@ matching fingerprint; the completing write succeeds only for the attempt that ho
 
 ```sql
 CREATE TABLE idempotency_keys (
-  scope       text        NOT NULL,           -- tenant or API key
-  key         text        NOT NULL,
-  fingerprint text        NOT NULL,
-  status      text        NOT NULL DEFAULT 'in_progress',
-  attempt_id  uuid        NOT NULL,
-  lease_until timestamptz NOT NULL,
-  response    jsonb,
+  scope text NOT NULL, key text NOT NULL, fingerprint text NOT NULL,
+  status text NOT NULL DEFAULT 'in_progress', attempt_id uuid NOT NULL,
+  lease_until timestamptz NOT NULL, response jsonb,
   PRIMARY KEY (scope, key)
 );
 
@@ -231,11 +217,8 @@ ON CONFLICT (scope, key) DO UPDATE
 RETURNING attempt_id;
 -- No row returned: SELECT the existing row and answer 422, replay, or 409.
 
--- Heartbeat during long work, and completion: both only for the lease holder.
--- (Each statement numbers its own parameters: $1 scope, $2 key, $3 this attempt's id.)
-UPDATE idempotency_keys SET lease_until = now() + interval '120 seconds'
-WHERE scope = $1 AND key = $2 AND attempt_id = $3 AND status = 'in_progress';
-
+-- Completion, only for the lease holder ($3 = this attempt's id). A heartbeat is the same
+-- WHERE clause with SET lease_until = now() + interval '120 seconds'.
 UPDATE idempotency_keys SET status = 'completed', response = $4
 WHERE scope = $1 AND key = $2 AND attempt_id = $3 AND status = 'in_progress';
 -- 0 rows updated: the lease was lost, so another attempt owns the outcome.
@@ -253,44 +236,10 @@ A tool call that takes 150 s against a 120 s lease, without a heartbeat (illustr
 
 With a heartbeat every 30 s, B keeps getting 409 until A completes, then gets the replay.
 
-### Agent tool wrapper keyed on run and step
-A decorator for side-effecting tools: the key comes from the run, the step and the effect-defining
-arguments, so a retried, regenerated or resumed step returns the stored result. `store` is the
-`IdempotencyStore` above; `billing.create_invoice` stands in for your external API.
-
-```python
-import hashlib, json, functools
-
-def idempotent_tool(effect_args):
-    def wrap(fn):
-        @functools.wraps(fn)
-        def tool(ctx, **kwargs):
-            effect = {k: kwargs[k] for k in effect_args}
-            digest = hashlib.sha256(json.dumps(effect, sort_keys=True).encode()).hexdigest()[:16]
-            key = f"{ctx.tenant}:{ctx.run_id}:{ctx.step}:{fn.__name__}:{digest}"
-            status, saved = store.claim(key, digest)
-            if status == "done":
-                return saved                                   # replay: no second invoice
-            if status == "in_progress":
-                return {"error": "already running, check back"}   # observation for the model
-            try:
-                result = fn(ctx, idem_key=key, **kwargs)
-            except TransientError:
-                store.release(key)
-                raise
-            store.complete(key, result)
-            return result
-        return tool
-    return wrap
-
-@idempotent_tool(effect_args=["customer_id", "amount_cents"])
-def create_invoice(ctx, idem_key, customer_id, amount_cents, memo=""):
-    return billing.create_invoice(customer_id, amount_cents, memo, idempotency_key=idem_key)
-```
-
 ### Worked scenario: one timeout, three layers of duplicates
 A support agent's step calls `create_invoice` (invoice 1), then the model call that reads the result
-times out and the step fails.
+times out and the step fails. With keys, the tool key is `tenant:run_id:step:tool:hash(customer_id,
+amount)`, and the tool forwards it to the billing API as its idempotency key.
 
 | Event | Without keys | With run-and-step keys |
 |---|---|---|
@@ -301,7 +250,6 @@ times out and the step fails.
 
 - **A plain SDK retry of the model call is not the danger here,** because it re-sends a transcript that
   already holds the tool result; duplicates come from layers that re-run the step itself.
-
 - **Regenerate the text, not the effect.** "Regenerate" gets a new key for the model's reply (the user
   wants a different answer), while tool effects inside the step keep their run-and-step keys.
 
@@ -325,6 +273,9 @@ times out and the step fails.
 - **Reconciliation job for cross-system effects.** Periodically compare external records (invoices,
   tickets) against recorded steps, because the key store and the external system share no transaction.
   Monitor mismatches found per run.
+- **Tell the model, not the stack, about an in-flight duplicate.** When a tool's claim finds the key
+  still `in_progress`, return an observation such as "already running, check back" to the model instead
+  of raising, so the loop waits rather than retrying the effect.
 
 ## Trade-offs
 - **Key store vs natural id.** A key store adds a write and a read to every request and a dependency on

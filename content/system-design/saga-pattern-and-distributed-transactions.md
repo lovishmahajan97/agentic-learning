@@ -249,100 +249,49 @@ flowchart TD
 ```
 
 ## Examples
-### Orchestrator with compensations and a pivot
-Steps run forward, each with an idempotency key derived from the saga id and step name, and committed
-steps are compensated in reverse on failure. The persisted log is a list here; in production it is a table
-or a durable-execution engine's history.
+### Runnable: orchestrator with reverse, idempotent compensation
+Each step gets an idempotency key derived from the saga id and step name; on a business failure the
+committed steps are undone in reverse. An undo of `None` marks the pivot: past it, the saga must retry
+forward.
+
+The fake provider and stock dict stand in for real services. Each undo runs twice to show that a retried
+compensation is safe.
 
 ```python
-import logging
-log = logging.getLogger("saga")
-NOOP = lambda ctx, idempotency_key: None      # step had no side effect worth undoing
-IRREVERSIBLE = None                            # step cannot be undone: this is the pivot
+class Payments:                                      # fake provider: keyed calls are idempotent
+    def __init__(self): self.charges, self.refunds = {}, {}
+    def charge(self, amount, key): self.charges.setdefault(key, amount); return key
+    def refund(self, charge_id, key): self.refunds.setdefault(key, self.charges[charge_id])
 
-class Step:
-    def __init__(self, name, action, compensate):
-        self.name, self.action, self.compensate = name, action, compensate
+pay, held = Payments(), {}
+def reserve(key): held[key] = "sku-1"; return key
+def ship(key): raise ValueError("address rejected")  # business failure, outcome known
 
-def run_saga(saga_id, steps, ctx, saga_log):
+def run_saga(saga_id, steps):
     done = []                                        # steps whose action committed
-    for step in steps:
-        key = f"{saga_id}:{step.name}"               # same key on every retry of this step
-        saga_log.append(("started", step.name))      # intent first: recovery sees in-flight steps
+    for name, action, undo in steps:
         try:
-            ctx[step.name] = step.action(ctx, idempotency_key=key)
-            saga_log.append(("done", step.name)); done.append(step)
-        except Exception as e:   # production: on a timeout, query the participant by key first
-            if any(s.compensate is IRREVERSIBLE for s in done):   # pivot passed
-                raise RuntimeError(f"cannot abandon saga; retry {step.name} forward") from e
-            log.warning("step %s failed: %s; compensating", step.name, e)
-            for prev in reversed(done):
-                prev.compensate(ctx, idempotency_key=f"{saga_id}:{prev.name}:undo")
-                saga_log.append(("undone", prev.name))
-            return "compensated"
+            done.append((name, action(f"{saga_id}:{name}"), undo))   # same key on every retry
+        except ValueError as e:
+            if any(u is None for _, _, u in done):   # pivot passed: nothing can be undone
+                raise RuntimeError(f"cannot abandon saga; retry {name} forward") from e
+            for prev, result, u in reversed(done):   # undo in reverse order
+                for _ in range(2):                   # a retried compensation: still one refund
+                    u(result, f"{saga_id}:{prev}:undo")
+            return f"compensated: {e}"
     return "completed"
 
-def fraud_check(ctx, idempotency_key):
-    if not fraud.passes(ctx["customer"]):            # flights, fraud, payments, hotel, mail: service clients
-        raise ValueError("declined")
-
-steps = [   # business failures first, the irreversible step as late as possible
-    Step("hold_seat",   lambda c, idempotency_key: flights.hold(c["flight"], key=idempotency_key),
-                        lambda c, idempotency_key: flights.release(c["hold_seat"], key=idempotency_key)),
-    Step("fraud_check", fraud_check, NOOP),
-    Step("charge_card", lambda c, idempotency_key: payments.charge(c["amount"], key=idempotency_key),
-                        lambda c, idempotency_key: payments.refund(c["charge_card"], key=idempotency_key)),
-    Step("book_hotel",  lambda c, idempotency_key: hotel.book(c["stay"], key=idempotency_key), IRREVERSIBLE),
-    Step("send_itinerary", lambda c, idempotency_key: mail.send(c["employee"], key=idempotency_key), NOOP),
-]
-```
-
-- **Declined charge:** if `charge_card` is declined, the seat hold is released and the saga ends as
-  `compensated`.
-- **Failure after the pivot:** if `send_itinerary` fails after the non-refundable hotel is booked, the
-  orchestrator refuses to compensate and the caller re-runs the saga from the log.
-- **Why the re-run is safe:** the idempotency keys make the hold, charge and booking no-ops on the second
-  pass, so only the email is actually retried.
-
-### Runnable: reverse compensation with idempotent undo
-Self-contained fakes for a payment provider and an inventory service. The shipment step fails for a
-business reason, and each compensation is deliberately run twice to show that keyed undo is safe to retry.
-
-```python
-class Payments:
-    def __init__(self): self.charges, self.refunds = {}, {}
-    def charge(self, amount, key):
-        self.charges.setdefault(key, amount)        # same key => same charge, no double charge
-        return key
-    def refund(self, charge_id, key):
-        self.refunds.setdefault(key, self.charges[charge_id])   # same key => one refund
-
-class Stock:
-    def __init__(self): self.held = {}
-    def reserve(self, sku, key): self.held[key] = sku; return key
-    def release(self, hold_id, key): self.held.pop(hold_id, None)
-
-def ship(order, key):
-    raise ValueError("address rejected")            # business failure, outcome known
-
-pay, stock = Payments(), Stock()
-saga, done = "order-42", []
-steps = [("reserve", lambda: stock.reserve("sku-1", f"{saga}:reserve"),
-                     lambda r: stock.release(r, f"{saga}:reserve:undo")),
-         ("charge",  lambda: pay.charge(30, f"{saga}:charge"),
-                     lambda r: pay.refund(r, f"{saga}:charge:undo")),
-         ("ship",    lambda: ship("order-42", f"{saga}:ship"), None)]
-try:
-    for name, act, comp in steps:
-        done.append((name, act(), comp))
-except ValueError as e:
-    for name, result, comp in reversed(done):      # undo in reverse order
-        comp(result); comp(result)                  # run twice: a retried compensation
-    print("compensated:", e)
-print(stock.held, pay.charges, pay.refunds)
+print(run_saga("order-42", [("reserve", reserve, lambda r, k: held.pop(r, None)),
+                            ("charge", lambda k: pay.charge(30, k), pay.refund),
+                            ("ship", ship, None)]))      # None: shipping is the pivot
+print(held, pay.charges, pay.refunds)
 # compensated: address rejected
 # {} {'order-42:charge': 30} {'order-42:charge:undo': 30}   one refund, not two
 ```
+
+- **Failure after the pivot:** if a step fails after a `None`-undo step (a non-refundable booking), the
+  orchestrator refuses to compensate and the caller re-runs the saga; the keys make the committed steps
+  no-ops on the second pass, so only the failed step is actually retried.
 
 ### Agent scenario: a tool layer that knows each tool's saga class
 The model proposes tool calls; the tool layer enforces the saga rules, so the guarantees do not depend on
@@ -371,8 +320,7 @@ def execute(run, call, impl, approve):
     run.log("done", call.name, out, key)
     if undo:
         run.push_compensation(undo, out, key + ":undo")
-    if cls == "pivot":
-        run.pivot_done = True
+    run.pivot_done |= cls == "pivot"
     return out
 ```
 
@@ -387,7 +335,8 @@ def execute(run, call, impl, approve):
   precede which, or it would never be allowed to send the email.
 
 ### Worked scenario: where the failure lands decides the outcome
-The travel saga above, failing at each step in turn.
+A travel saga (hold seat, fraud check, charge card, book a non-refundable hotel as the pivot, send the
+itinerary), failing at each step in turn.
 
 | Failure point | Committed so far | What the orchestrator does | Customer sees |
 |---|---|---|---|

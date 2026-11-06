@@ -188,61 +188,35 @@ re-hydration. The output shows what a regex layer catches and what it misses.
 
 ```python
 import re
-from dataclasses import dataclass, field
 
 EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-PHONE = re.compile(r"(?<!\d)(?:\+?\d[\d ()-]{8,}\d)(?!\d)")
 CARDISH = re.compile(r"(?<!\d)\d(?:[ -]?\d){12,18}(?!\d)")   # 13-19 digits, ends on a digit
 
 def luhn_ok(s: str) -> bool:                       # checksum: an order number is not a card
     d = [int(c) for c in s if c.isdigit()]
-    total = sum(d[-1::-2]) + sum(sum(divmod(2 * x, 10)) for x in d[-2::-2])
-    return len(d) >= 13 and total % 10 == 0
+    return (sum(d[-1::-2]) + sum(sum(divmod(2 * x, 10)) for x in d[-2::-2])) % 10 == 0
 
-@dataclass
-class Redactor:
-    vault: dict = field(default_factory=dict)      # placeholder -> original, lives for one request
-    counts: dict = field(default_factory=dict)
-
-    def _slot(self, kind: str, original: str) -> str:
-        for ph, val in self.vault.items():         # same value -> same placeholder (coreference)
-            if val == original:
+def redact(text: str, vault: dict) -> str:         # vault: placeholder -> original, one request
+    def slot(kind, m):
+        if kind == "CARD" and not luhn_ok(m[0]):
+            return m[0]
+        for ph, val in vault.items():              # same value -> same placeholder (coreference)
+            if val == m[0]:
                 return ph
-        self.counts[kind] = self.counts.get(kind, 0) + 1
-        ph = f"<{kind}_{self.counts[kind]}>"
-        self.vault[ph] = original
+        ph = f"<{kind}_{sum(k.startswith(f'<{kind}_') for k in vault) + 1}>"
+        vault[ph] = m[0]
         return ph
+    text = CARDISH.sub(lambda m: slot("CARD", m), text)
+    return EMAIL.sub(lambda m: slot("EMAIL", m), text)
 
-    def redact(self, text: str) -> str:
-        text = CARDISH.sub(lambda m: self._slot("CARD", m.group()) if luhn_ok(m.group()) else m.group(), text)
-        text = EMAIL.sub(lambda m: self._slot("EMAIL", m.group()), text)
-        text = PHONE.sub(lambda m: self._slot("PHONE", m.group()), text)
-        return text
-
-    def rehydrate(self, text: str) -> str:         # only for a viewer authorised to see the originals
-        for ph, val in self.vault.items():
-            text = text.replace(ph, val)
-        return text
-
-r = Redactor()
-msg = "Hi, I'm Dana (dana.k@example.com, +1 415 555 0134). Card 4111 1111 1111 1111 was charged twice."
-safe = r.redact(msg)
-print(safe)  # Hi, I'm Dana (<EMAIL_1>, <PHONE_1>). Card <CARD_1> was charged twice.
-# `safe` is what the model, the trace and the log see. The model answers "I'll refund <CARD_1>"
-# and r.rehydrate(reply) restores the value on the way back to the authorised user only.
-# "Dana" survived: names have no format, so they need an NER recognizer such as Presidio's.
-
-print(Redactor().redact("Order 1234567890123456 shipped 2026-09-30; call me on 07700 900123."))
-# Order <PHONE_1> shipped <PHONE_2>; call me on <PHONE_3>.
-# The Luhn check correctly refused to call the order number a card, but the loose phone pattern then
-# swallowed it and the date: precision failures that break a support workflow. Real phone detection
-# needs per-locale rules (or a library such as phonenumbers) plus context words, not one regex.
+vault = {}
+print(redact("I'm Dana (dana.k@example.com). Card 4111 1111 1111 1111, order 1234567890123456.", vault))
+# I'm Dana (<EMAIL_1>). Card <CARD_1>, order 1234567890123456.
+# Luhn left the order number alone; "Dana" survived: names need an NER recognizer such as Presidio's.
 ```
 
-### Presidio: a custom recognizer and per-entity recall on the fixtures
-The same two fixtures, plus one CRM line carrying the customer's own policy-id format, go through
-Presidio's `AnalyzerEngine` with a custom `PatternRecognizer`, then `AnonymizerEngine`. The script
-scores recall per entity type against hand labels, which is the number this lesson asks you to track.
+### Presidio: a custom recognizer for the customer's own format
+Presidio's `AnalyzerEngine` with a custom `PatternRecognizer`, then `AnonymizerEngine`.
 - **Checked against** presidio-analyzer and presidio-anonymizer 2.2.366 (Python 3.11+), spacy 3.8.18
   and en_core_web_sm 3.8.0 on Python 3.12, 2026-11. Install the spaCy model wheel yourself; the default
   configuration loads the larger en_core_web_lg.
@@ -260,83 +234,22 @@ analyzer.registry.add_recognizer(PatternRecognizer(          # the customer's ow
     supported_entity="POLICY_ID", context=["policy"],
     patterns=[Pattern("policy id", r"\bPOL-\d{8}\b", 0.6)]))
 
-ENTITIES = ["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "CREDIT_CARD", "POLICY_ID"]
-FIXTURES = [  # (text, hand labels as (entity, exact substring))
-    ("Hi, I'm Dana (dana.k@example.com, +1 415 555 0134). Card 4111 1111 1111 1111 was charged twice.",
-     [("PERSON", "Dana"), ("EMAIL_ADDRESS", "dana.k@example.com"),
-      ("PHONE_NUMBER", "+1 415 555 0134"), ("CREDIT_CARD", "4111 1111 1111 1111")]),
-    ("Order 1234567890123456 shipped 2026-09-30; call me on 07700 900123.",
-     [("PHONE_NUMBER", "07700 900123")]),
-    ("Claim on policy POL-20481193 filed by priya.n@example.org.",
-     [("POLICY_ID", "POL-20481193"), ("EMAIL_ADDRESS", "priya.n@example.org")]),
-]
-
-hits, totals = {}, {}
-for text, labels in FIXTURES:
-    found = analyzer.analyze(text, language="en", entities=ENTITIES, score_threshold=0.3)
-    for ent, value in labels:
-        start = text.index(value)
-        totals[ent] = totals.get(ent, 0) + 1
-        if any(r.entity_type == ent and r.start <= start and r.end >= start + len(value) for r in found):
-            hits[ent] = hits.get(ent, 0) + 1
-    print(AnonymizerEngine().anonymize(text=text, analyzer_results=found).text)
-
-for ent in ENTITIES:
-    print(f"{ent:<14} recall {hits.get(ent, 0)}/{totals[ent]}")
-# Hi, I'm <PERSON> (<EMAIL_ADDRESS>, <PHONE_NUMBER>). Card <CREDIT_CARD> was charged twice.
-# Order 1234567890123456 shipped 2026-09-30; call me on <PHONE_NUMBER>.
-# Claim on policy <POLICY_ID> filed by <EMAIL_ADDRESS>.
-# PERSON         recall 1/1
-# EMAIL_ADDRESS  recall 2/2
-# PHONE_NUMBER   recall 2/2
-# CREDIT_CARD    recall 1/1
-# POLICY_ID      recall 1/1
+text = "Dana filed a claim on policy POL-20481193 from priya.n@example.org."
+found = analyzer.analyze(text, language="en", score_threshold=0.3,
+                         entities=["PERSON", "EMAIL_ADDRESS", "POLICY_ID"])
+print(AnonymizerEngine().anonymize(text=text, analyzer_results=found).text)
+# <PERSON> filed a claim on policy <POLICY_ID> from <EMAIL_ADDRESS>.
 ```
 
-- **NER caught "Dana",** which the regex redactor missed, and the Luhn-checked card recognizer left
-  the order number alone.
-- **Thresholds are per entity in practice.** Both phones scored 0.4, so `score_threshold=0.5` drops
-  phone recall to 0/2 while every other type stays at full recall.
-- **The `entities=` list is a precision control.** Without it, this run also tagged "0134" and the
-  order number as DATE_TIME and the email as an ORGANIZATION.
+- **NER caught "Dana",** which the regex redactor missed.
+- **Thresholds are per entity in practice.** Phones scored 0.4 in a run on US and UK numbers, so
+  `score_threshold=0.5` dropped phone recall to 0/2 while every other type stayed at full recall.
+- **The `entities=` list is a precision control.** Without it, a run also tagged digit runs and an
+  order number as DATE_TIME and an email as an ORGANIZATION.
 - **The default operator writes `<PERSON>`,** with no number, so coreference needs a custom operator or
   the vault-based redactor above.
 - **For more name recall,** Presidio ships a `GLiNERRecognizer` (needs the `gliner` package); score it
-  on the same fixtures before switching.
-
-### Keyed pseudonyms and a streaming re-hydrator
-Standard library only. The HMAC pseudonym is stable for joins but cannot be reversed by enumerating
-phone numbers without the key; the re-hydrator buffers split placeholders and matches lenient spellings.
-
-```python
-import hmac, hashlib, re
-
-KEY = b"rotate-me-from-a-secrets-manager"      # never hard-code in real code
-
-def pseudonym(value: str, kind: str) -> str:
-    digest = hmac.new(KEY, value.encode(), hashlib.sha256).hexdigest()[:12]
-    return f"{kind}_{digest}"                  # stable across records, useless without the key
-
-print(pseudonym("+1 415 555 0134", "PHONE") == pseudonym("+1 415 555 0134", "PHONE"))  # True: joins work
-
-PH = re.compile(r"<\s*([A-Za-z]+)[ _](\d+)\s*>")   # lenient: <EMAIL_1>, <Email 1>
-
-def rehydrate_stream(chunks, vault):
-    buf = ""
-    for chunk in chunks:
-        buf += chunk
-        cut = buf.rfind("<")
-        if cut != -1 and ">" not in buf[cut:]:     # a placeholder may still be arriving
-            ready, buf = buf[:cut], buf[cut:]
-        else:
-            ready, buf = buf, ""
-        yield PH.sub(lambda m: vault.get(f"<{m[1].upper()}_{m[2]}>", m[0]), ready)
-    yield PH.sub(lambda m: vault.get(f"<{m[1].upper()}_{m[2]}>", m[0]), buf)
-
-vault = {"<EMAIL_1>": "dana.k@example.com"}
-print("".join(rehydrate_stream(["Sent to <EMA", "IL_1> and <Email 1>, not <PHONE_9>."], vault)))
-# Sent to dana.k@example.com and dana.k@example.com, not <PHONE_9>.   (unknown stays unresolved)
-```
+  on your labelled fixtures before switching.
 
 ### Agent scenario: re-hydrating placeholders only at the side effect
 The model and the trace see placeholders; the executor resolves them for the one tool that needs the
@@ -346,30 +259,20 @@ real value, and refuses placeholders it cannot resolve.
 import re
 
 PLACEHOLDER = re.compile(r"<([A-Z]+)_(\d+)>")
-NEEDS_REAL_VALUES = {"send_email"}               # tools whose side effect needs the original value
 
-def resolve_args(tool: str, args: dict, vault: dict) -> dict:
-    """Swap placeholders for originals just before the side effect; never log the result."""
-    if tool not in NEEDS_REAL_VALUES:
-        return args                              # read-only tools keep working on placeholders
-    def sub(v):
-        if not isinstance(v, str):
-            return v
-        def one(m):
-            if m[0] not in vault:
-                raise ValueError(f"unknown placeholder {m[0]}: refuse rather than guess")
-            return vault[m[0]]
-        return PLACEHOLDER.sub(one, v)
-    return {k: sub(v) for k, v in args.items()}
+def resolve(value: str, vault: dict) -> str:     # call only inside the executor; never log the result
+    def one(m):
+        if m[0] not in vault:
+            raise ValueError(f"unknown placeholder {m[0]}: refuse rather than guess")
+        return vault[m[0]]
+    return PLACEHOLDER.sub(one, value)
 
 vault = {"<EMAIL_1>": "dana.k@example.com"}       # per-session, TTL in minutes
-call = {"to": "<EMAIL_1>", "body": "Your refund for <CARD_1> is on its way."}
-print(call)                                       # what the transcript and the trace store
+print(resolve("<EMAIL_1>", vault))                # dana.k@example.com, for send_email only
 try:
-    resolve_args("send_email", call, vault)
+    resolve("Your refund for <CARD_1> is on its way.", vault)
 except ValueError as e:
-    print(e)                                      # <CARD_1> is not in this vault: the call is refused
-print(resolve_args("send_email", {"to": "<EMAIL_1>", "body": "Refund sent."}, vault)["to"])
+    print(e)                                      # unknown placeholder <CARD_1>: refuse rather than guess
 ```
 
 ### Worked scenario: what 99% recall means in practice
@@ -400,6 +303,12 @@ limit, and a nightly stricter-detector audit to estimate the real leak rate.
   Monitor unresolved-placeholder refusals per tool and raw identifiers found in agent traces by the audit.
 - **Eval and fine-tuning data only from the redacted path.** Build datasets from the redacted trace store,
   never from raw request logs, so the training corpus inherits redaction automatically.
+- **Phone detection needs per-locale rules.** One loose phone regex swallowed order numbers and dates
+  (`Order <PHONE_1> shipped <PHONE_2>`); use per-locale rules or a library such as `phonenumbers` plus
+  context words, and score precision as well as recall.
+- **Read-only tools keep working on placeholders.** Resolve placeholders only for the tools whose side
+  effect needs the real value (for example `send_email`), and match leniently (`<Email 1>`) when
+  re-hydrating model output.
 
 ## Trade-offs
 - **Recall vs utility.** Higher recall means more false positives: a travel assistant that redacts every

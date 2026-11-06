@@ -202,105 +202,84 @@ stateDiagram-v2
 ## Examples
 ### A gateway check against the registry
 The scenario: a team's code asks for `provider-x/large-latest`, an alias whose underlying snapshot the
-provider just changed.
+provider just changed. Model names are invented.
 
 ```python
 from datetime import date
-
-REGISTRY = {
-    "provider-x/large-2025-06-01": {
-        "approved_for": {"support-drafting": "medium"},  # use case -> max risk tier
-        "max_data_class": "CONFIDENTIAL",
-        "approval_expires": date(2026, 12, 31),
-        "evidence": ["evals/support-v14", "redteam/2025-07", "card/large-2025-06"],
-    },
-}
+REGISTRY = {"provider-x/large-2025-06-01": {
+    "approved_for": {"support-drafting": "medium"},   # use case -> max risk tier
+    "max_data_class": "CONFIDENTIAL",
+    "approval_expires": date(2026, 12, 31)}}
 TIER_RANK = {"low": 0, "medium": 1, "high": 2}
 CLASS_RANK = {"PUBLIC": 0, "INTERNAL": 1, "CONFIDENTIAL": 2, "RESTRICTED": 3}
 
-def authorise(model: str, use_case: str, tier: str, data_class: str, today: date) -> str:
+def authorise(model, use_case, tier, data_class, today):
     entry = REGISTRY.get(model)
     if entry is None:
-        return f"DENY: {model} not registered (aliases must resolve to a pinned snapshot)"
-    if use_case not in entry["approved_for"]:
-        return f"DENY: not approved for {use_case}"
-    if TIER_RANK[tier] > TIER_RANK[entry["approved_for"][use_case]]:
-        return f"DENY: approved up to {entry['approved_for'][use_case]} risk, request is {tier}"
+        return "DENY: not registered (aliases must resolve to a pinned snapshot)"
+    approved = entry["approved_for"].get(use_case)
+    if approved is None or TIER_RANK[tier] > TIER_RANK[approved]:
+        return f"DENY: not approved for {use_case} at {tier} risk"
     if CLASS_RANK[data_class] > CLASS_RANK[entry["max_data_class"]]:
         return "DENY: data class exceeds approval"
     if today > entry["approval_expires"]:
         return "DENY: approval expired, re-validation due"
     return "ALLOW"
 
-print(authorise("provider-x/large-latest", "support-drafting", "medium", "INTERNAL", date(2026, 10, 20)))
-print(authorise("provider-x/large-2025-06-01", "support-drafting", "medium", "INTERNAL", date(2026, 10, 20)))
-print(authorise("provider-x/large-2025-06-01", "claims-decisions", "high", "RESTRICTED", date(2026, 10, 20)))
+d = date(2026, 10, 20)   # review date
+print(authorise("provider-x/large-latest", "support-drafting", "medium", "INTERNAL", d))      # DENY: not registered ...
+print(authorise("provider-x/large-2025-06-01", "support-drafting", "medium", "INTERNAL", d))  # ALLOW
+print(authorise("provider-x/large-2025-06-01", "claims-decisions", "high", "RESTRICTED", d))  # DENY: not approved ...
 ```
 
 - **The alias is refused,** the pinned snapshot is allowed for its approved use, and reusing it for a
   high-risk claims decision is denied until that use case has its own evidence.
-- **Model names are invented.**
 
 ### Deciding which changes re-open approval
-The "what counts as a change" rule as a release check. The field lists and review steps are an example
-policy; the point is that every changed field is classified, and an unclassified one stops the release.
+The "what counts as a change" rule as a release check. Every changed field is classified, and an
+unclassified one stops the release. The lists are an example policy.
 
 ```python
-MATERIAL = {   # can change the output distribution, or which data the model may receive
-    "model_snapshot", "prompt", "retrieval_sources", "chunking", "tools",
-    "fine_tune", "provider_data_terms",
-}
+MATERIAL = {"model_snapshot", "prompt", "retrieval_sources", "chunking", "tools",
+            "fine_tune", "provider_data_terms"}   # can change outputs, or data the model receives
 OPERATIONAL = {"replicas", "timeout", "rate_limit", "log_level"}
-REVIEW_BY_TIER = {
-    "low": "rerun automated evals, owner sign-off",
-    "medium": "rerun evals plus red-team regression, owner sign-off",
-    "high": "rerun evals, red-team, independent validator sign-off, canary rollout",
-}
+REVIEW_BY_TIER = {"low": "rerun automated evals, owner sign-off",
+                  "medium": "rerun evals plus red-team regression, owner sign-off",
+                  "high": "rerun evals, red-team, independent validator sign-off, canary rollout"}
 
-def required_review(changed_fields: set, tier: str) -> str:
-    unknown = changed_fields - MATERIAL - OPERATIONAL
-    if unknown:
+def required_review(changed_fields, tier):
+    if unknown := changed_fields - MATERIAL - OPERATIONAL:
         return f"classify first: {sorted(unknown)} not on the list"   # no silent default
     if changed_fields & MATERIAL:
         return REVIEW_BY_TIER[tier]
     return "no re-approval; normal change control"
 
-print(required_review({"timeout", "replicas"}, "high"))
-print(required_review({"retrieval_sources"}, "high"))
-print(required_review({"prompt"}, "low"))
-print(required_review({"temperature"}, "medium"))
-# no re-approval; normal change control
-# rerun evals, red-team, independent validator sign-off, canary rollout
-# rerun automated evals, owner sign-off
-# classify first: ['temperature'] not on the list
+print(required_review({"timeout"}, "high"))        # no re-approval; normal change control
+print(required_review({"prompt"}, "low"))          # rerun automated evals, owner sign-off
+print(required_review({"temperature"}, "medium"))  # classify first: ['temperature'] not on the list
 ```
 
 ### Agent scenario: the governed unit is the whole agent
-An agent's behaviour comes from several models plus prompt, tools and retrieval, so the release check
-diffs an agent manifest and feeds the changed fields to `required_review` above. Here v15 adds a
-`send_letter` tool to a high-tier claims agent and raises a timeout. Model names are invented.
+An agent's behaviour comes from several models plus prompt and tools, so the release check diffs an
+agent manifest and feeds the changed fields to `required_review` above. Here v15 adds a `send_letter`
+tool to a high-tier claims agent and raises a timeout.
 
 ```python
 import hashlib
 
-def manifest(agent):                      # every field that can change what the agent does
-    return {
-        "model_snapshot": tuple(sorted(agent["models"].items())),   # planner and worker models
-        "prompt": hashlib.sha256(agent["system_prompt"].encode()).hexdigest()[:12],
-        "tools": tuple(sorted(agent["tools"])),
-        "retrieval_sources": tuple(sorted(agent["sources"])),
-        "timeout": agent["timeout_s"],
-    }
+def manifest(agent):   # every field that can change what the agent does
+    return {"model_snapshot": tuple(sorted(agent["models"].items())),   # planner and worker
+            "prompt": hashlib.sha256(agent["prompt"].encode()).hexdigest()[:12],
+            "tools": tuple(sorted(agent["tools"])),
+            "timeout": agent["timeout_s"]}
 
 def diff(old, new):
     a, b = manifest(old), manifest(new)
     return {k for k in a if a[k] != b[k]}
 
 v14 = {"models": {"planner": "provider-x/large-2025-06-01", "worker": "provider-x/small-2025-05-12"},
-       "system_prompt": "You are the claims assistant...", "tools": ["lookup_policy", "draft_letter"],
-       "sources": ["policy-docs-v3"], "timeout_s": 30}
-v15 = {**v14, "tools": ["lookup_policy", "draft_letter", "send_letter"], "timeout_s": 45}
-
+       "prompt": "You are the claims assistant...", "tools": ["lookup_policy", "draft_letter"], "timeout_s": 30}
+v15 = {**v14, "tools": v14["tools"] + ["send_letter"], "timeout_s": 45}
 changed = diff(v14, v15)
 print(sorted(changed), "->", required_review(changed, "high"))
 # ['timeout', 'tools'] -> rerun evals, red-team, independent validator sign-off, canary rollout

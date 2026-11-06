@@ -279,28 +279,20 @@ questions an agent team asks every week.
 import pandas as pd
 
 steps = pd.DataFrame({       # in practice: pd.read_json("traces.jsonl", lines=True)
-    "run_id":   ["r1", "r1", "r1", "r2", "r2", "r3", "r3", "r3", "r3"],
-    "step":     [1, 2, 3, 1, 2, 1, 2, 3, 4],
-    "tool":     ["search", "lookup_order", None, "search", None,
-                 "lookup_order", "lookup_order", "lookup_order", None],
-    "status":   ["ok", "error", "ok", "ok", "ok", "error", "error", "ok", "ok"],
-    "in_tokens":  [3000, 3600, 4100, 2900, 3400, 3100, 3700, 4300, 4900],
-    "out_tokens": [80, 60, 220, 70, 180, 50, 50, 60, 240],
-}).astype({"tool": "string", "status": "category"})
+    "run_id": ["r1", "r1", "r1", "r2", "r2", "r3", "r3", "r3", "r3"],
+    "tool":   ["search", "lookup_order", None, "search", None,
+               "lookup_order", "lookup_order", "lookup_order", None],
+    "status": ["ok", "error", "ok", "ok", "ok", "error", "error", "ok", "ok"],
+    "in_tokens": [3000, 3600, 4100, 2900, 3400, 3100, 3700, 4300, 4900],
+})
 
-per_tool = (steps.dropna(subset=["tool"])
-                 .groupby("tool")
-                 .agg(calls=("step", "size"),
-                      error_rate=("status", lambda s: (s == "error").mean()))
-                 .reset_index())
-
-per_run = (steps.groupby("run_id")
-                .agg(n_steps=("step", "max"), in_tokens=("in_tokens", "sum"),
-                     out_tokens=("out_tokens", "sum"))
-                .reset_index())
-per_run["cost_usd"] = (per_run["in_tokens"] / 1000 * 0.00015
-                       + per_run["out_tokens"] / 1000 * 0.0006)   # illustrative prices
-print(per_tool, per_run, sep="\n")
+per_tool = (steps.dropna(subset=["tool"]).groupby("tool")
+                 .agg(calls=("status", "size"),
+                      error_rate=("status", lambda s: (s == "error").mean())))
+per_run = steps.groupby("run_id").agg(n_steps=("tool", "size"),
+                                      in_tokens=("in_tokens", "sum"))
+print(per_tool)   # lookup_order: calls 4, error_rate 0.75; search: calls 2, error_rate 0.0
+print(per_run)    # r3: n_steps 4, in_tokens 16000
 ```
 
 | Finding | Number | Action |
@@ -310,13 +302,13 @@ print(per_tool, per_run, sep="\n")
 | Input tokens per step | grows ~500-600 per step | The transcript grows each step; see prompt caching |
 
 ### Eval summary per model and category
-Summarising an agent eval run: pass rate, tail latency and cost per model and category.
+Summarising an agent eval run: join a price table, then pass rate, tail latency and cost per model and
+category.
 
 ```python
 import pandas as pd
 
 df = pd.DataFrame({          # in practice: pd.read_json("results.jsonl", lines=True)
-    "case_id":    [1, 1, 2, 2, 3, 3],
     "model":      ["small", "large"] * 3,
     "category":   ["refund", "refund", "billing", "billing", "refund", "refund"],
     "passed":     [False, True, True, True, False, True],
@@ -329,18 +321,11 @@ price = pd.DataFrame({"model": ["small", "large"],
 df = df.merge(price, on="model", how="left", validate="many_to_one")
 df["cost_usd"] = df["out_tokens"] / 1000 * df["usd_per_1k_out"]   # column math, no loop
 
-summary = (df.groupby(["model", "category"])
-             .agg(pass_rate=("passed", "mean"),
-                  p95_ms=("latency_ms", lambda s: s.quantile(0.95)),
-                  cost_usd=("cost_usd", "sum"),
-                  n=("case_id", "size"))
-             .reset_index())
-print(summary)
-
-# Wrong: chained indexing may write into a temporary copy
-# df[df["model"] == "small"]["passed"] = True
-df.loc[df["model"] == "small", "reviewed"] = True             # right: one .loc call
-failures = df.loc[~df["passed"], ["case_id", "model", "category"]]
+summary = df.groupby(["model", "category"]).agg(
+    pass_rate=("passed", "mean"),
+    p95_ms=("latency_ms", lambda s: s.quantile(0.95)),
+    cost_usd=("cost_usd", "sum"))
+print(summary)    # large/refund: pass_rate 1.0, cost_usd 0.0038; small/refund: pass_rate 0.0
 ```
 
 | model | category | pass_rate | cost_usd |
@@ -351,7 +336,9 @@ failures = df.loc[~df["passed"], ["case_id", "model", "category"]]
 | large | billing | 1.0 | |
 
 That is the shape of a real model-choice discussion: the cheap model fails one category, so route that
-category to the large one.
+category to the large one. To write into a slice, use one `.loc` call
+(`df.loc[df["model"] == "small", "reviewed"] = True`), never chained indexing, which may write into a
+temporary copy.
 
 ### Worked scenario: loading a large usage log without exhausting memory
 A token-usage export from a busy agent fleet is too big to load with default dtypes. Read only needed
@@ -360,18 +347,14 @@ columns, pin compact dtypes, and aggregate chunk by chunk.
 ```python
 import pandas as pd
 
-cols = ["ts", "model", "route", "out_tokens", "latency_ms"]
-dtypes = {"model": "category", "route": "category",
-          "out_tokens": "int32", "latency_ms": "float32"}
+cols = ["model", "route", "out_tokens"]
+dtypes = {"model": "category", "route": "category", "out_tokens": "int32"}
 
-parts = []
-for chunk in pd.read_csv("usage.csv", usecols=cols, dtype=dtypes,
-                         parse_dates=["ts"], chunksize=1_000_000):
-    parts.append(chunk.groupby(["model", "route"], observed=True)
-                      .agg(calls=("latency_ms", "size"), out_tokens=("out_tokens", "sum")))
-
+parts = [chunk.groupby(["model", "route"], observed=True)["out_tokens"].sum()
+         for chunk in pd.read_csv("usage.csv", usecols=cols, dtype=dtypes,
+                                  chunksize=1_000_000)]
 usage = pd.concat(parts).groupby(level=["model", "route"], observed=True).sum()  # combine partial sums
-print(usage.sort_values("out_tokens", ascending=False).head())
+print(usage.sort_values(ascending=False).head())
 ```
 
 Why the dtypes matter, per 10 million rows (bytes are exact for fixed-width types):

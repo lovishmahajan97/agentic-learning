@@ -278,22 +278,19 @@ class SupportAnswer(dspy.Signature):
 
 agent = dspy.ReAct(SupportAnswer, tools=[lookup_refund_policy], max_iters=4)
 
-trainset = [
+trainset = [  # use 20+ real examples in practice
     dspy.Example(question="Can I return my laptop after 3 weeks?", answer="30 days").with_inputs("question"),
     dspy.Example(question="Refund window for headphones?", answer="14 days").with_inputs("question"),
-    # ...use 20+ real examples in practice
 ]
 
 def metric(example, pred, trace=None):
     return example.answer in pred.answer          # did the answer state the right window?
 
-evaluate = dspy.Evaluate(devset=trainset, metric=metric, num_threads=4, display_progress=True)
+evaluate = dspy.Evaluate(devset=trainset, metric=metric, num_threads=4)
 print(evaluate(agent))                              # baseline (DSPy 3.x returns a result with .score)
-
 compiled = dspy.BootstrapFewShot(metric=metric, max_bootstrapped_demos=4).compile(agent, trainset=trainset)
 print(evaluate(compiled))                           # use a separate devset in real work
 compiled.save("support_agent.json")
-dspy.inspect_history(n=1)                           # see the exact prompt DSPy sent
 ```
 
 ### Worked scenario: moving a ticket router to a cheaper model

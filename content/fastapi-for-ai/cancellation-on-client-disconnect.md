@@ -349,6 +349,7 @@ A helper that runs a non-streaming model call as a task and cancels it if the cl
 returning 499 (the "client closed request" code popularised by nginx) for logs and metrics.
 
 ```python
+# pip install fastapi uvicorn
 import asyncio
 from fastapi import FastAPI, Request, Response
 
@@ -368,19 +369,14 @@ async def run_unless_disconnected(request: Request, coro, poll_s: float = 0.25):
     finally:
         task.cancel()                              # no-op if done; covers our own cancellation
 
-async def answer_question(q: str) -> str:
-    try:
-        return await llm_complete(q)               # httpx call, closed on cancellation
-    finally:
-        # billing record must survive cancellation, but bounded so it cannot hang shutdown
-        await asyncio.shield(asyncio.wait_for(record_usage(q), timeout=2.0))
+async def slow_llm(q: str) -> str:
+    await asyncio.sleep(15)                        # stand-in for a 15 s model call
+    return f"answer to {q}"
 
 @app.post("/answer")
 async def answer(body: dict, request: Request):
-    result = await run_unless_disconnected(request, answer_question(body["q"]))
-    if result is None:
-        return Response(status_code=499)           # nobody is listening; count it
-    return {"answer": result}
+    result = await run_unless_disconnected(request, slow_llm(body["q"]))
+    return Response(status_code=499) if result is None else {"answer": result}
 ```
 
 Scenario (illustrative):
@@ -391,88 +387,29 @@ Scenario (illustrative):
 | Slot held | 15 seconds | about 3 seconds |
 | Effect under a fixed concurrency cap | longer queues for everyone | shorter queues for the users who stayed |
 
-### An agent loop with cancel points and idempotent side effects
-The loop checks for disconnect before every step and before any side-effecting tool, runs parallel tools
-in a `TaskGroup`, and passes an idempotency key built from run ID and step. `llm_step`, `TOOLS`,
-`SIDE_EFFECTS` and `record_usage_run` stand in for your own code.
-
-```python
-import asyncio
-
-class Stopped(Exception): ...
-
-async def run_agent(request, run_id: str, messages: list, max_steps: int = 10):
-    try:
-        for step in range(max_steps):
-            if await request.is_disconnected():          # cancel point between steps
-                raise Stopped
-            out = await llm_step(messages)               # cancellable: httpx aborts on cancel
-            if out["type"] == "final":
-                return out["text"]
-            calls = out["tool_calls"]
-            if any(c["name"] in SIDE_EFFECTS for c in calls) and await request.is_disconnected():
-                raise Stopped                            # never start a side effect for nobody
-            async with asyncio.TaskGroup() as tg:        # children die with the run
-                tasks = [tg.create_task(TOOLS[c["name"]](**c["args"],
-                                        idempotency_key=f"{run_id}:{step}:{i}"))
-                         for i, c in enumerate(calls)]
-            messages += [{"role": "tool", "content": t.result()} for t in tasks]
-        return None
-    finally:
-        # runs on success, Stopped and CancelledError alike; bounded so shutdown cannot hang
-        await asyncio.shield(asyncio.wait_for(record_usage_run(run_id, messages), timeout=2.0))
-```
-
-- **Run it under `run_unless_disconnected`** as well, so a disconnect during a long model call cancels it
-  at that `await` instead of waiting for the next step's check.
-
-### Streaming relay that stops upstream on disconnect
-The upstream stream is opened with `async with`, so breaking out of the loop (or being cancelled by
-Starlette) closes the provider connection. Assumes a shared httpx client on `app.state.http`.
-
-```python
-from fastapi.responses import StreamingResponse
-
-@app.post("/chat/stream")
-async def chat_stream(body: dict, request: Request):
-    http = request.app.state.http
-
-    async def gen():
-        async with http.stream("POST", "/v1/chat", json={**body, "stream": True}) as r:
-            async for line in r.aiter_lines():
-                if await request.is_disconnected():
-                    break                          # leaving the block closes the upstream stream
-                yield line + "\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
-```
-
 ### Runnable: bare tasks vs a TaskGroup under cancellation
-An agent step fans out two tool calls; the client disconnects 0.1 seconds in. Bare tasks finish their
-side effects anyway; TaskGroup children are cancelled with the parent. Python 3.11+.
+An agent step fans out a tool call; the client disconnects 0.1 seconds in. The bare task finishes its
+side effect anyway; the TaskGroup child is cancelled with the parent. Python 3.11+.
 
 ```python
 import asyncio
 
 log: list[str] = []
 
-async def tool(name: str, seconds: float):
+async def tool(name: str):
     try:
-        await asyncio.sleep(seconds)               # stands in for a tool or model call
+        await asyncio.sleep(0.3)                   # stands in for a tool or model call
         log.append(f"{name} finished")             # a side effect the user thought they stopped
     except asyncio.CancelledError:
-        log.append(f"{name} cancelled")
-        raise
+        log.append(f"{name} cancelled"); raise
 
 async def step_bare():
-    asyncio.create_task(tool("bare-A", 0.3))       # orphans: nothing ties them to this step
-    asyncio.create_task(tool("bare-B", 0.3))
+    asyncio.create_task(tool("bare"))              # orphan: nothing ties it to this step
     await asyncio.sleep(1)
 
 async def step_grouped():
-    async with asyncio.TaskGroup() as tg:          # Python 3.11+
-        tg.create_task(tool("tg-A", 0.3))
-        tg.create_task(tool("tg-B", 0.3))
+    async with asyncio.TaskGroup() as tg:          # children die with the parent
+        tg.create_task(tool("tg"))
 
 async def main():
     for step in (step_bare, step_grouped):
@@ -480,12 +417,11 @@ async def main():
         await asyncio.sleep(0.1)
         t.cancel()                                 # the client disconnected
         await asyncio.gather(t, return_exceptions=True)
-    await asyncio.sleep(0.5)                       # give orphans time to act
+    await asyncio.sleep(0.5)                       # give the orphan time to act
     print(log)
 
 asyncio.run(main())
-# ['tg-B cancelled', 'tg-A cancelled', 'bare-A finished', 'bare-B finished']
-# (the order of the two tg lines is not guaranteed)
+# ['tg cancelled', 'bare finished']
 ```
 
 ## Production patterns
@@ -507,6 +443,14 @@ asyncio.run(main())
   age, not 499s.
 - **Bounded shields only.** Wrap every shielded step in its own timeout (`asyncio.wait_for(..., 2.0)` in
   the example) so shutdown cannot hang. Monitor shielded-step timeouts and graceful-shutdown duration.
+- **Record usage in a bounded, shielded `finally`.** Write the billing record with
+  `await asyncio.shield(asyncio.wait_for(record_usage(q), timeout=2.0))` so it survives cancellation but
+  cannot hang shutdown.
+- **Run agent tool fan-out in a `TaskGroup`, and the whole run under the disconnect watcher.** Children
+  are then cancelled with the run, and a disconnect during a long model call cancels at that `await`
+  instead of waiting for the next step's `is_disconnected()` check.
+- **Open streaming upstreams with `async with http.stream(...)`.** Breaking out of the relay loop on
+  `is_disconnected()`, or being cancelled by Starlette, then closes the provider connection.
 
 ## Trade-offs
 - **Saved capacity vs lost work.** Cancelling on disconnect saves tokens, slots and GPU memory, but loses

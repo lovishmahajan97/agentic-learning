@@ -209,14 +209,10 @@ AGENTS = {
                  tools=["search_docs", "create_ticket", "transfer_to_triage"]),
 }
 
-def handoff_history(messages, keep_last=6):
-    user_turns = [m for m in messages if m["role"] in ("user", "assistant") and not m.get("tool_calls")]
-    return user_turns[-keep_last:]            # specialists do not need triage's tool noise
-
 def run(messages, agent="triage", max_turns=20, max_transfers=3):
     brief, transfers = {}, 0
     for _ in range(max_turns):
-        spec = AGENTS[agent]
+        spec = AGENTS[agent]                        # the active agent: its prompt and its tools only
         reply = llm(system=spec["system"] + f"\nHandoff brief: {brief}", messages=messages,
                     tools=[TOOL_SCHEMAS[t] for t in spec["tools"]])
         messages.append(reply)
@@ -226,15 +222,12 @@ def run(messages, agent="triage", max_turns=20, max_transfers=3):
             if call["name"].startswith("transfer_to_"):
                 transfers += 1
                 if transfers > max_transfers:       # ping-pong guard: escalate to a human
-                    return escalate(messages, trace_id=TRACE), agent
-                agent = call["name"].removeprefix("transfer_to_")
-                brief = call["arguments"]           # e.g. {"account_id": "A-17", "reason": "..."}
-                messages = handoff_history(messages) # filtered context crosses the boundary
-                log_event(trace_id=TRACE, event="handoff", to=agent, brief=brief)
+                    return escalate(messages), agent
+                agent, brief = call["name"].removeprefix("transfer_to_"), call["arguments"]
+                messages = [m for m in messages if m["role"] in ("user", "assistant")
+                            and not m.get("tool_calls")][-6:]   # filtered history, no tool noise
                 break                                # drop the rest of this reply's calls
-            else:
-                out = TOOLS[call["name"]](**call["arguments"])
-                messages.append(tool_result(call["id"], out))
+            messages.append(tool_result(call["id"], TOOLS[call["name"]](**call["arguments"])))
     return messages, agent
 ```
 
@@ -252,7 +245,7 @@ Pure Python with simulated workers; runs as is. One worker fails and becomes a g
 workers spend one shared budget.
 
 ```python
-import asyncio, random, uuid
+import asyncio, uuid
 
 class Budget:
     def __init__(self, tokens):
@@ -263,7 +256,7 @@ class Budget:
         self.left -= n
 
 async def worker(brief, budget, trace_id):
-    await asyncio.sleep(random.uniform(0.01, 0.05))      # stands in for an isolated agent loop
+    await asyncio.sleep(0.01)                            # stands in for an isolated agent loop
     if brief["objective"] == "vendor C pricing":
         raise TimeoutError("search API timed out")       # failures are routine with parallelism
     budget.spend(brief["max_tool_calls"] * 3_000)
@@ -275,10 +268,10 @@ async def orchestrate(objectives, total_tokens=200_000):
     briefs = [{"objective": o, "tools": ["search"], "max_tool_calls": 5,
                "output_schema": "findings, sources"} for o in objectives]
     results = await asyncio.gather(*(worker(b, budget, trace_id) for b in briefs),
-                                   return_exceptions=True)
-    ok = [r for r in results if not isinstance(r, Exception)]
+                                   return_exceptions=True)  # one failure becomes a gap, not a crash
     gaps = [b["objective"] for b, r in zip(briefs, results) if isinstance(r, Exception)]
-    return {"done": [r["objective"] for r in ok], "gaps": gaps, "tokens_left": budget.left}
+    done = [r["objective"] for r in results if not isinstance(r, Exception)]
+    return {"done": done, "gaps": gaps, "tokens_left": budget.left}
 
 print(asyncio.run(orchestrate(["vendor A pricing", "vendor B pricing", "vendor C pricing"])))
 # {'done': ['vendor A pricing', 'vendor B pricing'], 'gaps': ['vendor C pricing'], 'tokens_left': 170000}
@@ -308,6 +301,8 @@ The `gaps` list is what drives a follow-up worker or an honest "could not verify
 - **Results as data, not instructions.** Wrap worker results and web content as delimited data in the
   orchestrator prompt and validate them against the output schema before use. Monitor schema rejections and
   any orchestrator action whose provenance is a worker's retrieved content.
+- **Log every handoff.** At each transfer, log the trace id, the target agent and the brief, so a
+  conversation's route can be replayed. Monitor handoffs per conversation.
 
 ## Trade-offs
 - **Focus vs boundary loss.** Context isolation keeps each agent focused with a short tool list, but every

@@ -284,31 +284,14 @@ flip = next(s for s in range(1, 10_000) if tco_buy(s) > tco_build(s))
 print("flip at", flip, "seats")   # 363: the "s ≈ 360" of the worked scenario
 ```
 
-### Owned seams with contract tests: retriever and agent runner
+### Owned seam with a contract test: the agent runner
 The seam is an interface you own plus one test suite every implementation must pass; running it
 against a candidate is how "time to swap" becomes a measured number. The `AgentRunner` adapter wraps
-whichever framework or hand-written loop you use.
+whichever framework or hand-written loop you use; a retriever seam works the same way.
 
 ```python
 from dataclasses import dataclass
 from typing import Protocol
-
-@dataclass
-class Chunk:
-    doc_id: str
-    text: str
-
-class Retriever(Protocol):
-    def search(self, query: str, user_id: str, k: int) -> list[Chunk]: ...
-
-def contract_test(r: Retriever, golden: list[dict]) -> float:
-    """Same golden set for the vendor adapter and any replacement."""
-    hits = 0
-    for case in golden:
-        got = r.search(case["query"], case["user_id"], k=5)
-        assert all(c.doc_id not in case["forbidden_docs"] for c in got), "ACL leak"
-        hits += any(c.doc_id in case["relevant_docs"] for c in got)
-    return hits / len(golden)          # recall@5 to compare implementations
 
 @dataclass
 class RunResult:
@@ -325,6 +308,14 @@ def agent_contract_test(a: AgentRunner, tasks: list[dict]) -> float:
         assert not set(res.tool_calls) & set(t["forbidden_tools"]), "unapproved tool used"
         ok += all(res.final_state.get(k) == v for k, v in t["expected_state"].items())
     return ok / len(tasks)     # task success rate to compare implementations
+
+class FakeRunner:              # stand-in for a real adapter
+    def run(self, task, user_id, max_steps):
+        return RunResult({"ticket_status": "open"}, ["lookup_order", "create_ticket"])
+
+tasks = [{"task": "Order 7 is late", "user_id": "u1", "forbidden_tools": ["issue_refund"],
+          "expected_state": {"ticket_status": "open"}}]
+print(agent_contract_test(FakeRunner(), tasks))  # 1.0
 ```
 
 ## Production patterns
@@ -348,6 +339,8 @@ def agent_contract_test(a: AgentRunner, tasks: list[dict]) -> float:
 - **Spend caps on usage-priced vendors.** For any usage-priced component, especially managed agent
   runtimes that bill per step. Set budget alerts and hard caps in the vendor console or your gateway, per
   environment. Monitor spend against forecast weekly.
+- **Retriever contract test.** Run the same golden set against the vendor adapter and any
+  replacement, assert that no access-restricted document is ever returned, and compare recall@5.
 
 ## Trade-offs
 - **Buying: speed vs control.** Time-to-value and someone else's roadmap, but you pay lock-in and lose

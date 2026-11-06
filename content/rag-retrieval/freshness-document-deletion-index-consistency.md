@@ -222,13 +222,11 @@ def upsert_positional(doc_id, chunks):
 def upsert_versioned(doc_id, version, chunks):
     for i, c in enumerate(chunks):
         index[f"{doc_id}:{version}:{i}"] = c             # 1. write new alongside old
-    stale = [k for k in index if k.startswith(f"{doc_id}:") and k.split(":")[1] != version]
-    for k in stale:
+    for k in [k for k in index if k.startswith(f"{doc_id}:") and k.split(":")[1] != version]:
         del index[k]                                     # 3. delete old by filter, not by count
 
 v1 = [f"old para {i}" for i in range(9)]                 # 9 chunks
 v2 = [f"new para {i}" for i in range(7)]                 # edited down to 7 chunks
-
 upsert_positional("policy", v1); upsert_positional("policy", v2)
 print(sorted(v for v in index.values() if v.startswith("old")))  # ['old para 7', 'old para 8']
 
@@ -242,78 +240,47 @@ The agent never sees raw index hits. The tool drops tombstoned and superseded ch
 `version` and `modified_at` with each passage so the agent can cite them and your evals can check them.
 
 ```python
-import logging
-log = logging.getLogger("tools.search_docs")
-
 def search_docs(query: str, k: int = 5, include_archived: bool = False,
                 *, index, manifest, tombstones, doc_meta) -> list[dict]:
     """Tool exposed to the agent. Over-fetch, then filter, so stale hits do not eat the k slots."""
-    hits = index.search(query, k=k * 3)
-    out, dropped = [], 0
-    for h in hits:
+    out = []
+    for h in index.search(query, k=k * 3):
         d, v = h.meta["doc_id"], h.meta["version"]
-        if d in tombstones or manifest.get(d) != v:       # deleted, or an old version still lingering
-            dropped += 1
-            continue
+        if d in tombstones or manifest.get(d) != v:
+            continue                                      # deleted, or an old version still lingering
         meta = doc_meta[d]
         if meta["status"] == "archived" and not include_archived:
             continue                                      # superseded policy: hidden unless asked for
-        out.append({"doc_id": d, "version": v, "modified_at": meta["modified_at"],
-                    "text": h.text, "superseded_by": meta.get("superseded_by")})
+        out.append({"doc_id": d, "version": v, "modified_at": meta["modified_at"], "text": h.text})
         if len(out) == k:
             break
-    log.info("search_docs dropped_stale=%d", dropped)     # rising count = reconciliation lagging
     return out
-
-# Tool schema description shown to the model (plain words, no hidden policy):
-# "Searches current company documents. Results include modified_at. Set include_archived=true only
-#  when the user asks about a past version of a policy."
 ```
 
-### Versioned upsert, fan-out delete and reconciliation
-Runs against a generic vector store and keyword index. Any engine that supports upsert by id and delete by
-metadata filter (or by id prefix) fits this shape.
+The tool description shown to the model says, in plain words: searches current company documents,
+results include `modified_at`, and `include_archived=true` is only for questions about a past version
+of a policy.
+
+### Reconciliation with a mass-delete breaker
+A pull or crawl pipeline sees deletes only as `manifest − listing`. The breaker stops a failed or empty
+listing from wiping the index.
 
 ```python
-import hashlib, time
-
-def chunk_ids(doc_id, version, n):
-    return [f"{doc_id}:{version}:{i}" for i in range(n)]
-
-def index_document(store, bm25, embed, split, doc_id, text, manifest, tombstones):
-    version = hashlib.sha256(text.encode()).hexdigest()[:16]
-    if manifest.get(doc_id) == version and doc_id not in tombstones:
-        return "unchanged"                                  # content hash: no embedding call needed
-    tombstones.discard(doc_id)                              # a re-created document must become visible
-    chunks = split(text)
-    ids = chunk_ids(doc_id, version, len(chunks))
-    meta = [{"doc_id": doc_id, "version": version, "chunk": i, "indexed_at": time.time()}
-            for i in range(len(chunks))]
-    store.upsert(ids, embed(chunks), meta)                  # 1. write the new version alongside the old
-    bm25.upsert(ids, chunks, meta)
-    old = manifest.get(doc_id)
-    manifest[doc_id] = version                              # 2. flip the pointer
-    if old and old != version:                              # 3. delete old chunks by filter, not by count
-        store.delete(filter={"doc_id": doc_id, "version": old})
-        bm25.delete(filter={"doc_id": doc_id, "version": old})
-    return "updated"
-
-def delete_document(store, bm25, caches, doc_id, manifest, tombstones):
-    tombstones.add(doc_id)                                  # query path filters these ids out immediately
-    for target in (store, bm25):
-        target.delete(filter={"doc_id": doc_id})            # every version, every chunk
-    for c in caches:                                        # answer cache, parent store, chunk contexts
-        c.invalidate(doc_id=doc_id)
-    manifest.pop(doc_id, None)                              # only after every target succeeded: a crash
-                                                            # above leaves it for reconcile to retry
-
-def reconcile(source_listing, manifest, tombstones, store, bm25, caches, max_frac=0.05):
-    gone = set(manifest) - set(source_listing)              # gone at the source: only the manifest sees it
-    if len(gone) > max_frac * max(len(manifest), 1):        # a failed or truncated listing looks like
+def reconcile(listing, manifest, tombstones, stores, max_frac=0.05):
+    """listing: every doc_id the source holds now, from a complete, error-free listing."""
+    gone = set(manifest) - set(listing)                  # deletes are visible only via the manifest
+    if len(gone) > max_frac * max(len(manifest), 1):     # a failed or truncated listing looks like
         raise RuntimeError(f"refusing to delete {len(gone)} docs")  # mass deletion: stop and alert
     for doc_id in gone:
-        delete_document(store, bm25, caches, doc_id, manifest, tombstones)
-    return [d for d in source_listing if d not in manifest]  # never indexed: feed back to index_document
+        tombstones.add(doc_id)                           # query path hides it immediately
+        for s in stores:                                 # vector, BM25, caches, memory: every store
+            s.delete(filter={"doc_id": doc_id})
+        manifest.pop(doc_id)                             # only after every store succeeded
+    return [d for d in listing if d not in manifest]     # never indexed: feed to the indexer
+
+manifest = {f"doc{i}": "v1" for i in range(100)}
+print(reconcile([f"doc{i}" for i in range(98)] + ["new"], manifest, set(), []))  # ['new']
+reconcile([], manifest, set(), [])               # RuntimeError: refusing to delete 98 docs
 ```
 
 ### Worked scenario: a freshness lag budget for a support agent
@@ -358,6 +325,8 @@ that window every agent run that quotes the price uses the old one.
 - **Reconcile and compact on a schedule.** Run the manifest-versus-index diff at a fixed cadence, repair
   orphans both ways, and, where a compliance SLA requires physical erasure, schedule the engine's
   compaction or optimization afterwards and re-run the probe. Track orphan count over time.
+- **Clear the tombstone when a document is re-created.** If a deleted `doc_id` comes back at the source,
+  remove it from the tombstone set when it is re-indexed, or the query path keeps hiding it.
 
 ## Trade-offs
 - **Incremental upserts vs full rebuild.** Upserts give minutes-level freshness but add a manifest,

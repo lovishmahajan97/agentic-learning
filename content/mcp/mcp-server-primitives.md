@@ -315,16 +315,16 @@ flowchart TD
 ## Examples
 ### One server, three primitives, one host
 A ticket server exposing a read-only tool with structured output, a resource template and a prompt, then
-a host that uses each the way an agent should. Tested with the Python SDK 1.x (`mcp>=1.10,<2`).
+a host that uses each the way an agent should.
 
 ```python
-# tickets_server.py
+# tickets_server.py  (pip install "mcp>=1.10,<2")
 from typing import Literal
 from pydantic import BaseModel
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-mcp = FastMCP("tickets", instructions="Helpdesk tickets. Search before you create.")
+mcp = FastMCP("tickets")
 TICKETS = {"T-1": {"title": "VPN down", "status": "open", "body": "Users in Berlin cannot connect."}}
 
 class Ticket(BaseModel):
@@ -332,7 +332,7 @@ class Ticket(BaseModel):
     title: str
     status: Literal["open", "closed"]
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 def search_tickets(query: str, status: Literal["open", "closed"] = "open") -> list[Ticket]:
     """Find tickets whose title contains `query`. Returns id, title, status only."""
     return [Ticket(id=k, title=v["title"], status=v["status"])
@@ -341,16 +341,13 @@ def search_tickets(query: str, status: Literal["open", "closed"] = "open") -> li
 @mcp.resource("tickets://{ticket_id}", mime_type="text/markdown")
 def ticket_body(ticket_id: str) -> str:
     """Full ticket text, for the host to load as context."""
-    t = TICKETS[ticket_id]
-    return f"# {t['title']}\n\n{t['body']}"
+    return f"# {TICKETS[ticket_id]['title']}\n\n{TICKETS[ticket_id]['body']}"
 
 @mcp.prompt()
 def triage(ticket_id: str) -> str:
     """User-picked template: triage one ticket."""
     return f"Triage ticket {ticket_id}: read tickets://{ticket_id}, pick a priority, explain why."
-
-if __name__ == "__main__":
-    mcp.run()
+mcp.run()
 ```
 
 ```python
@@ -363,13 +360,11 @@ async def main():
     params = StdioServerParameters(command=sys.executable, args=["tickets_server.py"])
     async with stdio_client(params) as (r, w), ClientSession(r, w) as s:
         await s.initialize()
-        tools = (await s.list_tools()).tools                    # 1. model-controlled
-        print([(t.name, t.annotations.readOnlyHint) for t in tools])
-        res = await s.call_tool("search_tickets", {"query": "vpn"})
+        res = await s.call_tool("search_tickets", {"query": "vpn"})   # 1. model-controlled
         print(res.structuredContent)        # {'result': [{'id': 'T-1', 'title': 'VPN down', ...}]}
-        doc = await s.read_resource("tickets://T-1")            # 2. application-controlled
-        context = doc.contents[0].text                          # your code inserts this as context
-        p = await s.get_prompt("triage", {"ticket_id": "T-1"})  # 3. user-controlled
+        doc = await s.read_resource("tickets://T-1")                  # 2. application-controlled
+        print(doc.contents[0].text)         # your code inserts this as context
+        p = await s.get_prompt("triage", {"ticket_id": "T-1"})        # 3. user-controlled
         print(p.messages[0].role, p.messages[0].content.text)
 
 asyncio.run(main())
@@ -407,6 +402,9 @@ A support-agent team maps six capabilities. Token figures are illustrative order
   a prompt with typed arguments, version it with the server, and evaluate it like any other prompt.
 - **Announce changes instead of restarting.** Declare `listChanged` and emit list-changed notifications
   when feature flags or permissions change the tool set; hosts re-list without reconnecting.
+- **Use server `instructions` for cross-tool guidance.** A line such as "Search before you create" in
+  `FastMCP(..., instructions=...)` is sent in the initialize result; hosts that support it add it to the
+  model's context, but keep per-tool rules in each tool's description too.
 
 ## Trade-offs
 - **Tool vs resource for read access.** A tool lets the model fetch data on its own, at the price of

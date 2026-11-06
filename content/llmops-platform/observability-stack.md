@@ -250,13 +250,11 @@ flowchart TD
 
 ## Examples
 ### Instrumenting one request with the OpenTelemetry SDK
-A root span for the request, child spans for retrieval and the model call, GenAI attributes on the model
-span, and the platform's mandatory keys.
-- **`retrieve` and `call_model`** are the application's existing functions.
+A root span for the request, a child span for the model call with GenAI attributes, and the platform's
+mandatory keys.
+- **`call_model` and `payloads`** are the application's existing model client and payload store.
 - **The exporter sends to a collector** whose address comes from the standard
   `OTEL_EXPORTER_OTLP_ENDPOINT` variable.
-- **The completion preview is a custom event**, not a semantic-convention one, because the conventions'
-  content-capture names have changed several times and content capture is opt-in.
 
 ```python
 from opentelemetry import trace
@@ -268,41 +266,34 @@ provider = TracerProvider()
 provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))   # -> collector, not a vendor
 trace.set_tracer_provider(provider)
 tracer = trace.get_tracer("support-assistant")
-
 MODEL = "model-id-from-bundle"          # pinned in the bundle, never hard-coded here
 
 def answer(question, tenant, bundle="support-assistant@41", config_version=118):
-    keys = {"app.tenant": tenant, "app.bundle": bundle,               # mandatory platform keys,
-            "app.config_version": config_version}                     # on every span: attributes
-    with tracer.start_as_current_span("answer", attributes=keys):    # are not inherited by children
-        with tracer.start_as_current_span("retrieve", attributes=keys) as s:
-            docs = retrieve(question)
-            s.set_attribute("retrieval.doc_count", len(docs))
-        with tracer.start_as_current_span(f"chat {MODEL}", attributes=keys) as s:  # GenAI span name
+    keys = {"app.tenant": tenant, "app.bundle": bundle, "app.config_version": config_version}
+    with tracer.start_as_current_span("answer", attributes=keys):    # attributes are not inherited,
+        with tracer.start_as_current_span(f"chat {MODEL}", attributes=keys) as s:  # so repeat the keys
             s.set_attributes({"gen_ai.operation.name": "chat",
                               "gen_ai.provider.name": "anthropic",     # 'gen_ai.system' in older versions
                               "gen_ai.request.model": MODEL})
-            resp = call_model(MODEL, question, docs)
-            s.set_attributes({"gen_ai.response.model": resp.model,
+            resp = call_model(MODEL, question)
+            s.set_attributes({"gen_ai.response.model": resp.model,   # the snapshot actually served
                               "gen_ai.usage.input_tokens": resp.usage.input_tokens,
                               "gen_ai.usage.output_tokens": resp.usage.output_tokens})
-            ref = payloads.put(tenant, question, docs, resp.text)  # full payload: own store, own TTL
-            s.set_attribute("app.payload_ref", ref)                 # span carries only the pointer
-            s.add_event("app.completion_preview", {"preview": resp.text[:200]})  # redacted downstream
+            s.set_attribute("app.payload_ref", payloads.put(tenant, question, resp.text))  # pointer only
         return resp.text
 ```
 
 The collector pipeline for this stream, in prose:
 1. **An OTLP receiver.**
-2. **A redaction processor** that drops `preview` for tenants classified as confidential.
+2. **A redaction processor** that hashes user ids and drops content attributes for confidential tenants.
 3. **Tail sampling** keeping every trace with an error status or latency above the budget plus a 5% sample
    (illustrative) of the rest.
 4. **A spanmetrics connector** producing per-model, per-bundle rate, error and latency series.
 5. **Exporters** to the trace store, the metrics database and the LLM analysis tool.
 
 ### Tracing a tool-calling agent loop
-One trace per run: a root span, a span per step, and child spans for the model call and each tool call.
-`call_model` and `TOOLS` are the agent's own functions; `keys` reuses the mandatory platform keys.
+One trace per run: a root span with the run's outcome, and a child span per tool call. `call_model` and
+`TOOLS` are the agent's own functions; `keys` reuses the mandatory platform keys.
 
 ```python
 import hashlib, json
@@ -316,89 +307,26 @@ def run_agent(task, keys, run_id):
     with tracer.start_as_current_span("agent.run", attributes={**keys, "app.run_id": run_id}) as root:
         messages = [{"role": "user", "content": task}]
         for step in range(MAX_STEPS):
-            with tracer.start_as_current_span("agent.step", attributes={**keys, "app.step": step}):
-                with tracer.start_as_current_span(f"chat {MODEL}", attributes=keys) as s:
-                    resp = call_model(MODEL, messages)
-                    s.set_attributes({"gen_ai.request.model": MODEL,
-                                      "gen_ai.response.model": resp.model,
-                                      "gen_ai.usage.input_tokens": resp.usage.input_tokens,
-                                      "gen_ai.usage.output_tokens": resp.usage.output_tokens})
-                if not resp.tool_calls:
-                    root.set_attributes({"app.steps": step + 1, "app.status": "answered"})
-                    return resp.text
-                messages.append(resp.as_message())             # the assistant turn, once per step
-                for tc in resp.tool_calls:
-                    arg_hash = hashlib.sha256(json.dumps(tc.args, sort_keys=True).encode()).hexdigest()[:8]
-                    with tracer.start_as_current_span(f"tool {tc.name}", attributes={
-                            **keys, "app.tool": tc.name, "app.tool.args_hash": arg_hash}) as t:
-                        try:
-                            result = TOOLS[tc.name](**tc.args)
-                        except Exception as e:
-                            t.set_status(Status(StatusCode.ERROR, str(e))); result = f"error: {e}"
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
+            resp = call_model(MODEL, messages)               # wrap in a chat span, as in answer()
+            if not resp.tool_calls:
+                root.set_attributes({"app.steps": step + 1, "app.status": "answered"})
+                return resp.text
+            messages.append(resp.as_message())
+            for tc in resp.tool_calls:
+                h = hashlib.sha256(json.dumps(tc.args, sort_keys=True).encode()).hexdigest()[:8]
+                with tracer.start_as_current_span(f"tool {tc.name}", attributes={
+                        **keys, "app.step": step, "app.tool.args_hash": h}) as t:
+                    try:
+                        result = TOOLS[tc.name](**tc.args)
+                    except Exception as e:
+                        t.set_status(Status(StatusCode.ERROR, str(e))); result = f"error: {e}"
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
         root.set_attributes({"app.steps": MAX_STEPS, "app.status": "step_budget_exhausted"})
         root.set_status(Status(StatusCode.ERROR, "step budget exhausted"))   # tail sampler keeps it
 ```
 
 - **The argument hash** lets a query find repeated identical tool calls, the usual loop signature.
-- **Marking budget exhaustion as an error** means the `errors` tail-sampling policy keeps every runaway run.
-
-### The same pipeline as Collector configuration
-A sketch using components from the OpenTelemetry Collector contrib distribution; check field names against
-the collector version you run. Two trace pipelines read the same receiver: one feeds spanmetrics from the
-full stream, the other tail-samples for storage.
-
-```yaml
-receivers:
-  otlp:
-    protocols:
-      grpc: {}
-      http: {}
-processors:
-  attributes/redact:              # span attributes; event-level redaction needs the transform processor
-    actions:
-      - key: enduser.id
-        action: hash
-      - key: app.raw_prompt
-        action: delete
-  tail_sampling:
-    decision_wait: 10s            # "complete" = no new spans for this long
-    policies:
-      - name: errors
-        type: status_code
-        status_code: {status_codes: [ERROR]}
-      - name: slow
-        type: latency
-        latency: {threshold_ms: 8000}
-      - name: baseline
-        type: probabilistic
-        probabilistic: {sampling_percentage: 5}
-  batch: {}
-connectors:
-  spanmetrics:
-    dimensions:                   # bounded-cardinality labels only
-      - name: gen_ai.request.model
-      - name: app.bundle
-exporters:
-  otlphttp/traces:
-    endpoint: https://traces.internal.example:4318
-  prometheusremotewrite:
-    endpoint: https://metrics.internal.example/api/v1/write
-service:
-  pipelines:
-    traces/all:                   # unsampled: every span counts toward metrics
-      receivers: [otlp]
-      processors: [attributes/redact, batch]
-      exporters: [spanmetrics]
-    traces/sampled:
-      receivers: [otlp]
-      processors: [attributes/redact, tail_sampling, batch]
-      exporters: [otlphttp/traces]
-    metrics:
-      receivers: [spanmetrics]
-      processors: [batch]
-      exporters: [prometheusremotewrite]
-```
+- **Marking budget exhaustion as an error** means the error-status tail-sampling policy keeps every runaway run.
 
 ### Worked numbers: payload budget and the sampled-cost trap
 Illustrative platform: 1,000,000 requests a day, 30 KB average payload, 2% of traces with errors or slow.
@@ -437,6 +365,16 @@ Illustrative platform: 1,000,000 requests a day, 30 KB average payload, 2% of tr
 - **Run-level root spans for agents.** Record run id, step count, final status and total tokens on the
   agent's root span, and mark step-budget exhaustion as an error so tail sampling keeps it. Monitor p95
   steps per run and the share of runs ending in a non-answered status.
+- **Two collector trace pipelines from one receiver.** An unsampled pipeline feeds the spanmetrics
+  connector so every span counts toward metrics; a second runs tail sampling (for example `decision_wait:
+  10s`, policies for error status, latency above 8 s and a 5% probabilistic baseline) before the trace
+  store. Spanmetrics dimensions stay bounded (model, bundle). Check component field names against the
+  collector contrib version you run.
+- **Redaction placement.** The collector's attributes processor hashes or deletes span attributes (for
+  example hash `enduser.id`, delete a raw prompt); redacting span events needs the transform processor.
+- **Content previews as custom events.** If a span carries a short completion preview, emit it as your own
+  named event and redact it downstream, because the conventions' content-capture names have changed
+  several times.
 
 ## Trade-offs
 - **OpenTelemetry vs vendor SDKs.** OTel keeps instrumentation neutral and composable; vendor SDKs capture

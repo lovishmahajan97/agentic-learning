@@ -194,6 +194,9 @@ flowchart TD
 An extraction task. A program samples the record, so the label is correct before any model is involved;
 the model only writes the realistic email. `llm` is a stub for whichever provider you use.
 
+The same pattern works for agent tool calls: sample the call from the tool schema, have the model write
+the request, and round-trip it through an independent checker.
+
 ```python
 import json, random
 
@@ -201,66 +204,25 @@ def llm(prompt: str, temperature: float = 0.8) -> str:
     """Call your model provider and return text. Use temperature ~0.8 to write, 0 to check."""
     raise NotImplementedError
 
-VENDORS = ["Acme Tooling", "Northwind Traders", "Blue Fern Studio", "Kappa Logistics"]
-PERSONAS = ["terse accounts-payable clerk", "chatty small-business owner", "automated billing system"]
-
-def sample_record(rng):                          # the LABEL comes first, so it is correct by construction
-    return {"vendor": rng.choice(VENDORS), "invoice_no": f"INV-{rng.randint(1000, 99999)}",
-            "total": round(rng.uniform(20, 5000), 2), "currency": rng.choice(["USD", "EUR"]),
-            "due_date": f"2026-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}"}
-
 def make_example(rng):
-    rec = sample_record(rng)
-    email = llm(f"You are a {rng.choice(PERSONAS)}. Write a realistic email of 60-150 words that mentions "
-                f"exactly these facts in your own words and order, plus one unrelated detail: "
-                f"{json.dumps(rec)}. Do not output JSON.")
-    # round-trip verification: an independent extraction pass must recover the record exactly
-    back = llm("Extract vendor, invoice_no, total (number), currency and due_date (YYYY-MM-DD) as JSON "
-               f"from this email:\n{email}", temperature=0)
+    rec = {"vendor": rng.choice(["Acme Tooling", "Kappa Logistics"]),    # the LABEL comes first,
+           "invoice_no": f"INV-{rng.randint(1000, 99999)}",              # so it is correct by construction
+           "total": round(rng.uniform(20, 5000), 2), "currency": rng.choice(["USD", "EUR"])}
+    email = llm(f"Write a realistic 60-150 word email that mentions exactly these facts in your own "
+                f"words, plus one unrelated detail: {json.dumps(rec)}. Do not output JSON.")
+    back = llm(f"Extract vendor, invoice_no, total (number) and currency as JSON from:\n{email}",
+               temperature=0)                    # round trip: an independent pass must recover the record
     try:
         ok = json.loads(back) == rec
     except json.JSONDecodeError:
         ok = False
-    return {"input": email, "output": rec, "verified": ok,
-            "provenance": {"generator": "<model id>", "prompt": "invoice-v3", "persona_pool": "v1"}}
+    return {"input": email, "output": rec, "verified": ok, "provenance": {"prompt": "invoice-v3"}}
 
 rng = random.Random(7)
-examples = [make_example(rng) for _ in range(1000)]
-kept = [e for e in examples if e["verified"]]
-print(f"kept {len(kept)}/{len(examples)}")
-# Next: near-deduplicate the emails, balance vendors and currencies, hold out a slice for evaluation,
-# and have a human read 50 kept and 50 rejected examples before trusting the pass rate.
-```
-
-### Construction-first tool-call data for an agent
-The call is sampled from the tool schema first, so the label is correct; the model only writes the
-request. The round-trip check asks an independent, stronger checker model (not the model you will train)
-to produce the call and keeps exact matches.
-
-`llm` is the same provider stub as above; `checker_call` is a tool-call request to that checker.
-
-```python
-import json, random
-
-TOOLS = {"search_orders": {"customer_email": ["ana@example.com", "li@example.com"],
-                           "status": ["open", "shipped", "refunded"]},
-         "create_refund": {"order_id": ["A-1001", "B-2002"], "reason": ["damaged", "late", "wrong_item"]}}
-PERSONAS = ["impatient customer on mobile", "polite non-native speaker", "support agent forwarding a case"]
-
-def sample_call(rng):
-    name = rng.choice(list(TOOLS))
-    return {"name": name, "arguments": {k: rng.choice(v) for k, v in TOOLS[name].items()}}
-
-def make_tool_example(rng, checker_call):
-    call = sample_call(rng)                                     # label first: valid by construction
-    request = llm(f"As a {rng.choice(PERSONAS)}, write one message that requires exactly this action "
-                  f"and states every argument value, without naming the tool: {json.dumps(call)}")
-    predicted = checker_call(request, tools=list(TOOLS))        # round trip: did the request keep every fact?
-    return {"input": request, "label": call, "verified": predicted == call,
-            "provenance": {"generator": "<model id>", "prompt": "toolcall-v1"}}
-
-# Keep verified rows for training; read rejects, because some are hard-but-valid requests the checker
-# missed, which belong in the eval suite rather than the bin.
+kept = [e for e in (make_example(rng) for _ in range(1000)) if e["verified"]]
+print(f"kept {len(kept)}/1000")
+# Next: near-deduplicate, balance vendors and currencies, hold out an eval slice, and have a human
+# read 50 kept and 50 rejected examples before trusting the pass rate.
 ```
 
 ### Worked scenario: bootstrapping an agent eval suite before launch
@@ -347,6 +309,9 @@ print(f"varied    distinct-2 = {distinct_n(varied):.2f}")      # 1.00
 - **Real data as the anchor, walled-off evals.** Accumulate real curated data across versions and add
   synthetic data only for gaps found by error analysis. Keep evaluation sets from any generator prompt,
   and decontaminate synthetic sets against them.
+- **Independent checker, varied writers.** Run the round-trip check with a different, stronger model than
+  the one you will train, and vary the writer's persona (terse clerk, chatty owner, automated system) per
+  row. Rejected tool-call requests that are hard but valid belong in the eval suite, not the bin.
 
 ## Trade-offs
 - **Coverage vs drift.** Cheap, fast, controllable coverage of rare cases, against a distribution that

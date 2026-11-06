@@ -172,44 +172,34 @@ JSON-schema `response_format` on an OpenAI-compatible server; support varies by 
 
 ```python
 # Run with openai 3.37 (Python SDK) against a mock OpenAI-compatible server.
-import json, re
+import json
 from openai import OpenAI
 
 slm, big = OpenAI(base_url="http://localhost:8000/v1", api_key="x"), OpenAI()
 ORDER = {"type": "string", "pattern": r"^ORD-\d{6}$"}
-TOOLS = {   # name -> flat JSON schema for its arguments
-    "lookup_order": {"type": "object", "required": ["order_id"], "properties": {"order_id": ORDER}},
-    "cancel_order": {"type": "object", "required": ["order_id", "reason"], "properties": {
-        "order_id": ORDER, "reason": {"type": "string", "enum": ["changed_mind", "late", "other"]}}},
-    "update_address": {"type": "object", "required": ["order_id", "postcode"], "properties": {
-        "order_id": ORDER, "postcode": {"type": "string"}}},
-}
-KNOWN_ORDERS = {"ORD-123456"}                        # stand-in for your order database
+TOOLS = {"lookup_order": {"order_id": ORDER},               # name -> flat argument properties
+         "cancel_order": {"order_id": ORDER, "reason": {"type": "string", "enum": ["late", "other"]}}}
 
-def validate_against_backend(tool, args):            # raise if IDs are unknown or not permitted
-    if not re.fullmatch(r"ORD-\d{6}", args.get("order_id", "")) or args["order_id"] not in KNOWN_ORDERS:
-        raise ValueError(f"unknown order for {tool}: {args.get('order_id')}")
-
-def ask(client, model, prompt, schema):
+def ask(client, model, prompt, props):
+    schema = {"type": "object", "properties": props, "required": list(props)}
     r = client.chat.completions.create(model=model, temperature=0,
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_schema", "json_schema": {"name": "out", "schema": schema}})
     return json.loads(r.choices[0].message.content)
 
 def plan_call(request, model="Qwen/Qwen2.5-7B-Instruct"):
-    pick = {"type": "object", "required": ["tool"],
-            "properties": {"tool": {"type": "string", "enum": list(TOOLS)}}}
+    pick = {"tool": {"type": "string", "enum": list(TOOLS)}}
     tool = ask(slm, model, f"Which tool handles: {request}", pick)["tool"]
-    prompt = f"Arguments for {tool} given: {request}"
-    try:
-        args = ask(slm, model, prompt, TOOLS[tool])
-        validate_against_backend(tool, args)         # your checks: IDs exist, permissions
-    except Exception:                                # bad JSON or failed checks: escalate
-        args = ask(big, "YOUR_LARGE_MODEL", prompt, TOOLS[tool])
-        validate_against_backend(tool, args)         # escalated output is checked too
-    return tool, args
+    for client, m in [(slm, model), (big, "YOUR_LARGE_MODEL")]:   # SLM first, then escalate once
+        try:
+            args = ask(client, m, f"Arguments for {tool} given: {request}", TOOLS[tool])
+        except json.JSONDecodeError:
+            continue
+        if args.get("order_id") in {"ORD-123456"}:   # stand-in for your checks: IDs exist, permissions
+            return tool, args
+    raise ValueError(f"no valid {tool} call; hand off to a human")
 
-print(plan_call("Where is my order ORD-123456?"))
+print(plan_call("Where is my order ORD-123456?"))   # ('lookup_order', {'order_id': 'ORD-123456'})
 ```
 
 ## Production patterns

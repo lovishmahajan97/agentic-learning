@@ -243,51 +243,34 @@ survive restarts.
 ```python
 import asyncio, uuid
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, Response
 
 jobs: dict[str, dict] = {}              # production: a table with status, result, attempt, lease
-queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)   # bounded => backpressure
-
-async def run_analysis(text: str) -> str:
-    await asyncio.sleep(5)              # stands in for a multi-second LLM/agent run
-    return f"{len(text.split())} words"
+queue: asyncio.Queue[str] = asyncio.Queue()
 
 async def worker():
     while True:
-        job_id = await queue.get()
-        jobs[job_id]["status"] = "running"
-        try:
-            jobs[job_id]["result"] = await run_analysis(jobs[job_id]["input"])
-            jobs[job_id]["status"] = "succeeded"
-        except Exception as e:          # production: retry with backoff, then dead-letter
-            jobs[job_id].update(status="failed", error=str(e))
-        queue.task_done()
+        job = jobs[await queue.get()]; job["status"] = "running"
+        await asyncio.sleep(5)          # stands in for a multi-second LLM/agent run
+        job.update(status="succeeded", result=f"{len(job['input'].split())} words")
 
 @asynccontextmanager
 async def lifespan(app):
     task = asyncio.create_task(worker()); yield; task.cancel()
-
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/analyses", status_code=202)
 async def submit(body: dict, response: Response):
     job_id = body.get("idempotency_key") or str(uuid.uuid4())
-    if job_id in jobs and jobs[job_id]["input"] != body["text"]:
-        raise HTTPException(409, "idempotency key reused with a different body")
     if job_id not in jobs:              # a retried submit returns the same job
         jobs[job_id] = {"status": "queued", "input": body["text"]}
-        try:
-            queue.put_nowait(job_id)
-        except asyncio.QueueFull:
-            del jobs[job_id]; raise HTTPException(503, "busy, retry later")
+        queue.put_nowait(job_id)
     response.headers["Location"] = f"/analyses/{job_id}"
     return {"job_id": job_id, "status": jobs[job_id]["status"]}
 
 @app.get("/analyses/{job_id}")
 async def status(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(404)
-    return jobs[job_id]
+    return jobs.get(job_id) or Response(status_code=404)
 ```
 
 Trace one request:
@@ -295,7 +278,7 @@ Trace one request:
    milliseconds.
 2. A `GET` one second later shows `running`.
 3. The client's network drops and it re-sends the same `POST`; it gets the same job, still `running`,
-   rather than a second five-second run. A full queue is refused immediately rather than growing silently.
+   rather than a second five-second run.
 4. A `GET` after five seconds returns `succeeded` with the result.
 
 What the sketch omits is exactly what production needs:
@@ -324,31 +307,12 @@ print(shape(120, 30, False))                   # async job
 The thresholds (half the timeout, 5 seconds) are illustrative defaults to tune, not standards.
 
 ### Agent scenario: a run worker with checkpoints, cancel points and progress events
-The worker executes the tool-calling loop one step at a time, checkpoints after each step, checks the
-cancel flag between steps and appends numbered events that an SSE endpoint can replay from
-`Last-Event-ID`. `store`, `llm_step` and `call_tool` stand in for your database, model client and tools.
-
-```python
-def run_agent_job(run_id, store, llm_step, call_tool, max_steps=25):
-    state = store.load_checkpoint(run_id) or {"messages": store.load_input(run_id), "step": 0}
-    while state["step"] < max_steps:
-        if store.cancel_requested(run_id):              # safe point: between steps, never mid-tool
-            store.finish(run_id, "cancelled", completed_steps=state["step"])
-            return
-        store.extend_lease(run_id, seconds=60)          # heartbeat so a dead worker's run is reclaimed
-        action = llm_step(state["messages"])
-        if action.kind == "final":
-            store.append_event(run_id, {"type": "final", "text": action.text})
-            store.finish(run_id, "succeeded", result=action.text)
-            return
-        key = f"{run_id}:{state['step']}"               # idempotency key per tool step
-        result = call_tool(action.tool, action.args, idempotency_key=key)
-        state["messages"] += [action.as_message(), result.as_message()]
-        state["step"] += 1
-        store.save_checkpoint(run_id, state)            # resume here after a crash
-        store.append_event(run_id, {"type": "tool", "name": action.tool, "step": state["step"]})
-    store.finish(run_id, "failed", error="step budget exhausted")
-```
+The worker executes the tool-calling loop one step at a time, up to a step budget (25 here). Each step:
+1. If `cancel_requested` is set, finish as `cancelled`: a safe point between steps, never mid-tool.
+2. Extend the run's lease by 60 seconds, a heartbeat so a dead worker's run is reclaimed.
+3. Call the model; on a final answer, append a `final` event and finish as `succeeded`.
+4. Otherwise call the tool with the idempotency key `{run_id}:{step}`, save a checkpoint, and append a
+   numbered `tool` event that an SSE endpoint can replay from `Last-Event-ID`.
 
 | What happens | Without checkpoints and keys | With them |
 |---|---|---|

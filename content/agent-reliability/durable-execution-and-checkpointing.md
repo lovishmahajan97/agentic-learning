@@ -395,15 +395,8 @@ re-executed, with the same keys, so idempotent tools return the original result 
 def key_for(run_id, step, idx):                 # deterministic -> identical on resume
     return f"{run_id}:{step}:{idx}"
 
-def load_or_start(store, run_id, initial_messages):
-    cp = store.load_latest(run_id)              # None on first start
-    if cp is None:
-        cp = {"step": 0, "messages": initial_messages, "pending": [], "status": "running"}
-        store.save(run_id, cp)
-    return cp
-
-def run(store, run_id, model, tools, initial_messages):
-    cp = load_or_start(store, run_id, initial_messages)    # caller holds the run's lease
+def run(store, run_id, model, tools, initial_messages):    # caller holds the run's lease
+    cp = store.load_latest(run_id) or {"step": 0, "messages": initial_messages, "pending": []}
     while True:
         for call in cp["pending"]:              # empty unless we died mid-step
             if "result" not in call:            # completed calls are not re-run
@@ -447,19 +440,13 @@ import copy, uuid
 class Crash(Exception): pass
 
 class TicketAPI:                                    # an API that honours idempotency keys
-    def __init__(self): self.tickets, self.by_key = [], {}
-    def create(self, title, idempotency_key):
-        if idempotency_key in self.by_key:          # same key again: return first result
-            return self.by_key[idempotency_key]
-        self.tickets.append(title)
-        self.by_key[idempotency_key] = f"T-{len(self.tickets)}"
-        return self.by_key[idempotency_key]
+    def __init__(self): self.by_key = {}
+    def create(self, title, idempotency_key):       # same key again: return the first result
+        return self.by_key.setdefault(idempotency_key, f"T-{len(self.by_key) + 1}")
 
 def step(db, api, run_id, crash=False, fresh_key=False):
-    cp = copy.deepcopy(db.get(run_id)) or {"step": 0, "pending": []}
-    if not cp["pending"]:                           # the "model" asks for one ticket
-        cp["pending"] = [{"title": "Fix login", "key": f"{run_id}:{cp['step']}:0"}]
-        db[run_id] = copy.deepcopy(cp)              # intent saved BEFORE execution
+    cp = copy.deepcopy(db.get(run_id)) or {"pending": [{"title": "Fix login", "key": f"{run_id}:0:0"}]}
+    db[run_id] = copy.deepcopy(cp)                  # intent saved BEFORE execution
     for call in cp["pending"]:
         if "result" not in call:
             key = str(uuid.uuid4()) if fresh_key else call["key"]
@@ -467,7 +454,6 @@ def step(db, api, run_id, crash=False, fresh_key=False):
             if crash:
                 raise Crash("died before recording the result")
             db[run_id] = copy.deepcopy(cp)
-    return cp
 
 for fresh in (False, True):
     db, api = {}, TicketAPI()
@@ -476,7 +462,7 @@ for fresh in (False, True):
     except Crash:
         pass                                        # the worker is gone; db survives
     step(db, api, "run_9", fresh_key=fresh)         # another worker resumes
-    print("random keys" if fresh else "deterministic keys", "->", len(api.tickets), "ticket(s)")
+    print("random keys" if fresh else "deterministic keys", "->", len(api.by_key), "ticket(s)")
 # deterministic keys -> 1 ticket(s)
 # random keys -> 2 ticket(s)
 ```

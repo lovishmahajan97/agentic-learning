@@ -269,97 +269,43 @@ asyncio.run(main())
 # StatelessAgent bob's prompt: ['bob: hi']
 ```
 
-### Worked scenario: a chat agent that holds a DB transaction across every step
-One worker, SQLAlchemy defaults (15 connections). The agent loads the user's profile, then runs 4 steps
-of ~6 s each before writing the result, all in one transaction (illustrative timings).
-
-| Design | Connection held per run | Ceiling per worker |
-|---|---|---|
-| one transaction from profile read to final write | about 24 s | 15 ÷ 24 s ≈ 0.6 runs/s |
-| commit after the read, short write per step or at the end | milliseconds per transaction | set by the provider and HTTP pool, not the DB |
-
-Same fix as below: keep the session request-scoped, but keep every transaction short.
-
-### Lifespan plus request-scoped dependencies
-Lifespan creates the application-scoped objects; dependencies derive request-scoped ones; the handler
-mixes them without ever creating a client or sharing a session.
-
-- **Commit before the model call** so its pooled connection is not held for the 10–30 s the provider
-  takes.
-- **`expire_on_commit=False`** is what lets `doc.text` still be read after that commit.
-- **`Document` and `Summary`** are ORM classes defined elsewhere.
+### Lifespan plus a request-scoped session
+Lifespan creates the shared client and engine once per worker; a `yield` dependency derives one session
+per request. The handler commits before the model call, so its pooled connection is not held for the
+10-30 s the provider takes; `expire_on_commit=False` keeps `doc.text` readable after that commit.
+`Document` and `Summary` are ORM classes defined elsewhere.
 
 ```python
 from contextlib import asynccontextmanager
 from typing import Annotated
 import httpx
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import Depends, FastAPI, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    app.state.http = httpx.AsyncClient(base_url="https://api.example.com", timeout=30)  # pool shared
+async def lifespan(app: FastAPI):                       # application scope: once per worker
+    app.state.http = httpx.AsyncClient(base_url="https://api.example.com", timeout=30)
     app.state.engine = create_async_engine("postgresql+asyncpg://user:pw@db/app", pool_size=10)
     app.state.sessions = async_sessionmaker(app.state.engine, expire_on_commit=False)
     yield
-    await app.state.http.aclose()            # application scope ends with the worker
+    await app.state.http.aclose()
     await app.state.engine.dispose()
 
 app = FastAPI(lifespan=lifespan)
 
-async def db(request: Request):              # request scope: one session per request
+async def db(request: Request):                         # request scope: one session per request
     async with request.app.state.sessions() as session:
-        yield session                         # closing it rolls back anything uncommitted
-
-def principal(x_api_key: Annotated[str, Header()]) -> str:
-    return x_api_key.split("-")[0]           # request scope: derived from this request's headers
+        yield session                                   # closing it rolls back anything uncommitted
 
 @app.post("/summarise")
-async def summarise(doc_id: int, request: Request,
-                    session: Annotated[AsyncSession, Depends(db)],
-                    who: Annotated[str, Depends(principal)]):
-    http = request.app.state.http             # borrow the shared client; never httpx.AsyncClient() here
-    doc = await session.get(Document, doc_id)  # checks out a pooled connection
-    await session.commit()                     # short read transaction: connection back to the pool
-    r = await http.post("/v1/complete", json={"text": doc.text}, headers={"x-tenant": who})
-    session.add(Summary(doc_id=doc_id, text=r.json()["text"], by=who))
-    await session.commit()                     # second short transaction for the write
+async def summarise(doc_id: int, request: Request, session: Annotated[AsyncSession, Depends(db)]):
+    doc = await session.get(Document, doc_id)           # checks out a pooled connection
+    await session.commit()                              # short read transaction: connection returned
+    r = await request.app.state.http.post("/v1/complete", json={"text": doc.text})  # shared client
+    session.add(Summary(doc_id=doc_id, text=r.json()["text"]))
+    await session.commit()                              # second short transaction for the write
     return {"ok": True}
 ```
-
-### Runnable: a module global leaks across requests, a context variable does not
-Pure asyncio, no server. Two "requests" for different tenants overlap on one loop; each awaits a fake
-provider call between setting and reading its tenant.
-
-```python
-import asyncio, contextvars
-
-current_tenant = None                                   # BAD: module global, shared by all requests
-tenant_var = contextvars.ContextVar("tenant")           # GOOD: one value per request task
-
-async def handle_global(tenant: str, delay: float) -> str:
-    global current_tenant
-    current_tenant = tenant                             # "middleware" sets it
-    await asyncio.sleep(delay)                          # provider call: the loop runs other requests
-    return f"{tenant} retrieved docs for {current_tenant}"
-
-async def handle_ctx(tenant: str, delay: float) -> str:
-    tenant_var.set(tenant)                              # set inside this request's task
-    await asyncio.sleep(delay)
-    return f"{tenant} retrieved docs for {tenant_var.get()}"
-
-async def main():
-    for handler in (handle_global, handle_ctx):
-        results = await asyncio.gather(handler("acme", 0.2), handler("globex", 0.1))
-        print(handler.__name__, results)
-
-asyncio.run(main())
-# handle_global ['acme retrieved docs for globex', 'globex retrieved docs for globex']
-# handle_ctx ['acme retrieved docs for acme', 'globex retrieved docs for globex']
-```
-
-- **Why it works:** `asyncio.gather` wraps each coroutine in its own task, and each task runs in a copy
-  of the context, so `tenant_var.set` in one request is invisible to the other.
 
 ### Worked scenario: one transaction across the model call
 One worker, SQLAlchemy defaults (15 connections), a 15 s provider call, traffic rising to 3 requests/s.
@@ -398,6 +344,9 @@ One worker, SQLAlchemy defaults (15 connections), a 15 s provider call, traffic 
 - **Cross-worker state in an external store.** Use for rate limits, caches and conversation memory: keep
   counters in Redis (for example `INCR` with an expiry) rather than on `app.state`, so a limit of 100 does
   not silently become 400 across four workers.
+- **Context variables follow tasks.** `asyncio.gather` and `create_task` run each coroutine in a copy of
+  the current context, so a `ContextVar.set` in one request's task is invisible to another, while a module
+  global set by middleware is overwritten by whichever request ran last.
 
 ## Trade-offs
 - **Amortised setup vs per-worker duplication.** Application scope spreads expensive setup across all

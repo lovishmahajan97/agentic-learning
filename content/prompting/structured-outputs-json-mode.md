@@ -170,52 +170,12 @@ flowchart TD
   `minimum` or `maxLength` are often stripped and must be validated client-side.
 
 ## Examples
-### Ticket triage with a Pydantic schema
-The `evidence` field comes first so the label is conditioned on quoted justification; `customer_tier` is
-nullable so the model is not forced to invent one; the stop reason is checked before the parsed object is
-trusted; a semantic rule the schema cannot express is enforced in code.
-
-```python
-from enum import Enum
-from pydantic import BaseModel, Field
-import anthropic
-
-class Severity(str, Enum):
-    low = "low"
-    medium = "medium"
-    high = "high"
-
-class Triage(BaseModel):
-    evidence: list[str] = Field(description="Quotes from the ticket that justify the decision")
-    product_area: str
-    severity: Severity
-    customer_tier: str | None          # nullable: absent data must not be invented
-    needs_human: bool
-
-client = anthropic.Anthropic()
-
-def triage(ticket: str) -> Triage:
-    r = client.messages.parse(
-        model="claude-opus-5-5", max_tokens=4096,   # thinking tokens also count against this cap
-        system="Classify support tickets. Quote evidence before deciding.",
-        messages=[{"role": "user", "content": ticket}],
-        output_format=Triage,          # SDK helper; sent as output_config.format, compiled server-side
-    )
-    if r.stop_reason != "end_turn":    # max_tokens => truncated JSON; refusal => may not match schema
-        raise RuntimeError(f"unusable output: {r.stop_reason}")
-    t = r.parsed_output                # validated Triage instance; SDK re-validates client-side
-    if t.severity == Severity.high and not t.evidence:
-        raise ValueError("high severity without evidence")   # semantic rule the schema cannot state
-    return t
-
-print(triage("Checkout returns 500 for every EU customer since 09:00 UTC. We are an enterprise account."))
-# Triage(evidence=['Checkout returns 500 for every EU customer'], product_area='checkout',
-#        severity=<Severity.high: 'high'>, customer_tier='enterprise', needs_human=True)  (illustrative)
-```
-
 ### An agent router step with an escape action
-Each loop step asks the model for a typed decision. `reasoning` comes first, `ask_user` and `finish` give
-the model ways not to call a tool, and the loop validates before dispatching.
+Each loop step asks the model for a typed decision.
+- **`reasoning` comes first**, so the action is conditioned on it.
+- **`ask_user` and `finish` are escapes**, and nullable fields stop the model inventing data.
+- **The stop reason is checked** before the parsed object is trusted, and a semantic rule the schema
+  cannot express is enforced in code.
 
 ```python
 from enum import Enum
@@ -237,16 +197,17 @@ class Step(BaseModel):
 client = anthropic.Anthropic()
 
 def decide(transcript: list[dict]) -> Step:
-    r = client.messages.parse(model="claude-opus-5-5", max_tokens=2048,
+    r = client.messages.parse(model="claude-opus-5-5", max_tokens=2048,  # thinking tokens count against this cap
                               system="You are a refunds agent. Decide the next step.",
-                              messages=transcript, output_format=Step)
-    if r.stop_reason != "end_turn":
+                              messages=transcript, output_format=Step)  # SDK helper: sent as output_config.format
+    if r.stop_reason != "end_turn":    # max_tokens => truncated JSON; refusal => may not match schema
         raise RuntimeError(f"unusable step: {r.stop_reason}")
-    s = r.parsed_output
-    if s.action == Action.issue_refund and not s.order_id:
-        return Step(reasoning="no order id", action=Action.ask_user, order_id=None,
-                    message="Which order should I refund?")   # semantic rule, enforced in code
+    s = r.parsed_output                # validated Step instance
+    if s.action == Action.issue_refund and not s.order_id:   # semantic rule, enforced in code
+        return Step(reasoning="no order id", action=Action.ask_user, order_id=None, message="Which order?")
     return s
+
+print(decide([{"role": "user", "content": "Refund me please."}]).action)   # Action.ask_user (illustrative)
 ```
 
 ### Worked numbers: format failures compound over agent steps

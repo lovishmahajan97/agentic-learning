@@ -175,9 +175,9 @@ flowchart TD
   dates, SKUs or prices into structured filters.
 
 ## Examples
-### Zero-shot classification, then the same by hand
-The Hugging Face CLIP implementation first, then the raw embeddings so the cosine-similarity-and-softmax
-mechanism is visible. The second form is what you reuse for search: encode once, compare many times.
+### Zero-shot classification
+Each label becomes a text prompt; CLIP scores the image against every prompt and a softmax over the
+scaled cosine similarities gives the class probabilities.
 
 ```python
 import torch
@@ -197,19 +197,10 @@ with torch.no_grad():
     probs = out.logits_per_image.softmax(dim=-1)[0]        # scaled cosine sims -> softmax
 for l, p in zip(labels, probs):
     print(f"{p:.3f}  {l}")
-
-# Same mechanism by hand: unit vectors, dot product, temperature.
-with torch.no_grad():
-    img = model.get_image_features(**proc(images=image, return_tensors="pt"))
-    txt = model.get_text_features(**proc(text=prompts, return_tensors="pt", padding=True))
-img = img / img.norm(dim=-1, keepdim=True)                # [1, 512]
-txt = txt / txt.norm(dim=-1, keepdim=True)                # [4, 512]
-cos = img @ txt.T                                          # cosine similarities, typically 0.2-0.35
-print(cos, (cos * model.logit_scale.exp()).softmax(-1))   # logit_scale.exp() is the learned 1/T
 ```
 
-The hand-computed cosines are small and close together (the shared space is not spread out), which is
-why the learned scale of roughly 100 is needed before the softmax produces a decisive distribution.
+The raw cosines behind those logits are small and close together, which is why the learned scale of
+roughly 100 is needed before the softmax produces a decisive distribution.
 
 ### The InfoNCE loss in plain Python
 Runnable with no dependencies. Matched pairs drive the loss toward zero at scale 100; with scale 1 the
@@ -262,25 +253,22 @@ describing an unrelated photo.
 
 ```python
 import numpy as np, torch
-from transformers import CLIPModel, CLIPProcessor
+from transformers import CLIPModel, CLIPProcessor   # checked against transformers 5.22.1, 2026-11
 
 NAME = "openai/clip-vit-base-patch32"        # must match the checkpoint that built the index
-model = CLIPModel.from_pretrained(NAME).eval()
-proc = CLIPProcessor.from_pretrained(NAME)
+model, proc = CLIPModel.from_pretrained(NAME).eval(), CLIPProcessor.from_pretrained(NAME)
 index = np.load("catalogue_vecs.npy")         # [n_images, 512], L2-normalised at build time
 ids = open("catalogue_ids.txt").read().split()
 TEXT_TO_IMAGE_FLOOR = 0.24                    # illustrative; tune on labelled pairs, this direction only
 
 def search_images(query: str, k: int = 5) -> dict:
-    # Tool exposed to the agent: find catalogue photos matching a short visual description.
     with torch.no_grad():
         q = model.get_text_features(**proc(text=[f"a photo of {query}"], return_tensors="pt",
-                                           padding=True, truncation=True))   # 77-token limit
+                                           padding=True, truncation=True)).pooler_output  # 77-token limit
     q = (q / q.norm(dim=-1, keepdim=True)).numpy()[0]
     sims = index @ q
-    top = np.argsort(-sims)[:k]
-    hits = [{"id": ids[i], "score": round(float(sims[i]), 3)} for i in top
-            if sims[i] >= TEXT_TO_IMAGE_FLOOR]
+    hits = [{"id": ids[i], "score": round(float(sims[i]), 3)}
+            for i in np.argsort(-sims)[:k] if sims[i] >= TEXT_TO_IMAGE_FLOOR]
     return {"hits": hits, "note": None if hits else "no confident match; ask the user to refine"}
 ```
 
@@ -305,6 +293,11 @@ def search_images(query: str, k: int = 5) -> dict:
 - **Retrieve with CLIP, reason with a VLM.** When: an agent must answer a question about the right image
   among many. How: the search tool returns the top few candidates, and only those go to the VLM with the
   question. Monitor: recall@k of the search step and image tokens per agent run.
+- **Expect a narrow cosine band.** Raw CLIP image-text cosines typically sit around 0.2 to 0.35;
+  `model.logit_scale.exp()` (about 100) is the learned inverse temperature applied before the softmax.
+- **Pin transformers for embedding code.** From transformers 5, `get_text_features` and
+  `get_image_features` return an output object whose `.pooler_output` is the projected vector; 4.x
+  returned the tensor itself.
 
 ## Trade-offs
 - **Open vocabulary vs fine-grained accuracy.** No labelling cost, but accuracy on fine-grained or

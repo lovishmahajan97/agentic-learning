@@ -334,44 +334,26 @@ Built directly on `StreamingResponse`:
   and emit a keepalive comment during silent tool calls without cancelling the producer.
 - **Monotonic ids.** This endpoint does not replay, but those ids are exactly what a resume endpoint (see
   Resumability) would key its buffer on.
-- **When the ping fires.** With tokens 0.3 s apart nothing is silent for 15 s, so the ping fires only if
-  the model stalls, for instance during the long tool call simulated here (one ping during its 20 s).
+- **When the ping fires.** Only after 15 s with no event, so here exactly once, during the 20 s tool call.
 
 ```python
 import asyncio, json
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 
 app = FastAPI()
 
-class Ask(BaseModel):
-    prompt: str
-
-def sse(event: str, data: dict, id: int) -> str:
-    return f"event: {event}\nid: {id}\ndata: {json.dumps(data)}\n\n"   # blank line dispatches
-
-async def agent_loop(prompt: str):                    # stand-in for your loop over an SDK stream
-    yield "tool_call", {"name": "web_search", "args": {"q": prompt}}
+async def agent_loop(q: asyncio.Queue):               # stand-in for your loop over an SDK stream
+    await q.put(("tool_call", {"name": "web_search"}))
     await asyncio.sleep(20)                           # a slow tool: 20 s of silence on the wire
-    yield "tool_result", {"name": "web_search", "summary": "3 results"}
-    for w in "Server-sent events frame the tokens.".split():
-        await asyncio.sleep(0.3); yield "token", {"delta": w + " "}
+    await q.put(("token", {"delta": "Server-sent events frame the tokens."}))
+    await q.put(("done", {}))
 
 @app.post("/agent/run")
-async def run(body: Ask):
+async def run():
     q: asyncio.Queue = asyncio.Queue()
-
-    async def produce():
-        try:
-            async for event, data in agent_loop(body.prompt):
-                await q.put((event, data))
-            await q.put(("done", {}))
-        except Exception as exc:
-            await q.put(("error", {"message": str(exc)}))
-
     async def events():
-        task, n = asyncio.create_task(produce()), 0
+        task, n = asyncio.create_task(agent_loop(q)), 0
         try:
             while True:
                 try:
@@ -379,9 +361,8 @@ async def run(body: Ask):
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"; continue       # keepalive comment; clients ignore it
                 n += 1
-                yield sse(event, data, n)
-                if event in ("done", "error"):
-                    break
+                yield f"event: {event}\nid: {n}\ndata: {json.dumps(data)}\n\n"   # blank line dispatches
+                if event == "done": break
         finally:
             task.cancel()                              # client gone or stream over: stop generating
     return StreamingResponse(events(), media_type="text/event-stream",
@@ -449,6 +430,9 @@ one tool call.
   answer reconnects for completed run ids with 204. Monitor GETs per run id after completion.
 - **HTTP/2 at the edge.** Terminate HTTP/2 at the load balancer or CDN so many tabs share one connection,
   keeping HTTP/1.1 to uvicorn. Monitor concurrent streams per client and stalled non-stream requests.
+- **Errors after the first byte are events.** The status code is already sent, so wrap the producer in
+  `try`/`except` and put an `error` event (with a short message) on the queue, then end the stream as
+  for `done`; the client must treat `error` as terminal too.
 
 ## Trade-offs
 - **Plain HTTP vs one direction.** SSE passes through proxies, auth middleware and HTTP/2 multiplexing

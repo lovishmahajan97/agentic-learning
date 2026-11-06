@@ -330,107 +330,43 @@ flowchart TD
 ## Examples
 ### Agent scenario: testing a tool-calling loop with a scripted model
 Self-contained; save as `test_agent_loop.py` and run `pytest -q`. The fake returns pre-written replies
-and records every request, so tests assert on what the loop sent.
+and records every request, so the test asserts on what the loop sent.
 
 ```python
-import json
 import pytest
 
-class ScriptedLLM:
+class ScriptedLLM:                          # stub + spy: replays replies, records each request
     def __init__(self, replies):
         self.replies, self.calls = list(replies), []
     def complete(self, messages):
-        self.calls.append([dict(m) for m in messages])     # snapshot what the loop sent
+        self.calls.append(list(messages))   # snapshot what the loop sent
         return self.replies.pop(0)
 
 TOOLS = {"get_weather": lambda city: {"city": city, "temp_c": 18}}
+CALL = {"type": "tool", "name": "get_weather", "args": {"city": "Oslo"}}
 
 def run_agent(llm, user_msg, max_steps=5):
     messages = [{"role": "user", "content": user_msg}]
     for _ in range(max_steps):
         reply = llm.complete(messages)
         if reply["type"] == "final":
-            return reply["text"], messages
-        fn = TOOLS.get(reply["name"])
-        result = fn(**reply["args"]) if fn else {"error": f"unknown tool {reply['name']}"}
-        messages.append({"role": "tool", "name": reply["name"], "content": json.dumps(result)})
+            return reply["text"]
+        messages.append({"role": "tool", "content": TOOLS[reply["name"]](**reply["args"])})
     raise RuntimeError("step budget exhausted")
 
-CALL = {"type": "tool", "name": "get_weather", "args": {"city": "Oslo"}}
-FINAL = {"type": "final", "text": "18 C in Oslo"}
-
 @pytest.fixture
-def llm():
-    return ScriptedLLM([CALL, FINAL])
+def llm():                                  # rebuilt per test: no shared script state
+    return ScriptedLLM([CALL, {"type": "final", "text": "18 C in Oslo"}])
 
 def test_tool_result_reaches_model(llm):
-    text, _ = run_agent(llm, "weather in Oslo?")
-    assert text == "18 C in Oslo"
-    assert json.loads(llm.calls[1][-1]["content"])["temp_c"] == 18
-
-def test_unknown_tool_is_reported_not_raised():
-    llm = ScriptedLLM([{"type": "tool", "name": "rm_rf", "args": {}}, FINAL])
-    run_agent(llm, "clean up")
-    assert "unknown tool" in llm.calls[1][-1]["content"]
-
-@pytest.mark.parametrize("budget", [1, 3, 5])
-def test_loop_stops_at_budget(budget):
-    llm = ScriptedLLM([CALL] * budget)          # a model that never finishes
-    with pytest.raises(RuntimeError, match="budget"):
-        run_agent(llm, "loop forever", max_steps=budget)
-    assert len(llm.calls) == budget
+    assert run_agent(llm, "weather in Oslo?") == "18 C in Oslo"
+    assert llm.calls[1][-1]["content"]["temp_c"] == 18   # the model saw the tool result
 ```
 
-- **No tokens, no flakiness.** Five tests cover the happy path, the error-feedback path and the runaway
-  loop, which are exactly the behaviours a real model run would hit only occasionally.
+- **No tokens, no flakiness.** `pytest -q` prints `1 passed`; the Lab adds the bad-call and runaway-loop
+  cases to this same shape.
 - **Assert on the transcript.** `llm.calls` is the message list the model saw; checking it catches a
   dropped tool result or a wrong role before a model ever does.
-
-### Chunker suite: session fixture, parametrized ids, `pytest.raises`
-The RAG chunker counts whitespace tokens so the arithmetic in the ids is checkable by hand.
-
-```python
-# tests/conftest.py
-import pytest
-from myapp.chunking import Chunker
-
-@pytest.fixture(scope="session")
-def chunker():                              # built once per run: construction is the slow part
-    return Chunker(max_tokens=50, overlap=5)
-
-# tests/test_chunking.py
-import pytest
-
-@pytest.mark.parametrize("text,n_chunks", [
-    ("", 0),
-    ("short", 1),
-    ("word " * 120, 3),                     # windows 0-49, 45-94, 90-119 -> three chunks
-], ids=["empty", "single", "overlapping"])
-def test_chunk_count(chunker, text, n_chunks):
-    assert len(chunker.split(text)) == n_chunks
-
-def test_every_chunk_respects_limit(chunker):
-    chunks = chunker.split("word " * 1000)
-    assert all(chunker.count_tokens(c) <= 50 for c in chunks)
-
-def test_overlap_is_shared_tokens(chunker):
-    text = " ".join(f"w{i}" for i in range(120))   # distinct tokens, so overlap is observable
-    first, second = chunker.split(text)[:2]
-    assert first.split()[-5:] == second.split()[:5] == ["w45", "w46", "w47", "w48", "w49"]
-
-@pytest.mark.parametrize("bad", [None, 42, b"bytes"])
-def test_rejects_non_text(chunker, bad):
-    with pytest.raises(TypeError):
-        chunker.split(bad)
-```
-
-- **Run** `pytest -q tests/test_chunking.py`: a wrong overlap implementation fails as
-  `test_chunk_count[overlapping]` with `assert 4 == 3` followed by `where 4 = len([...])`. You get the
-  case and the value without a debugger.
-- **Distinct tokens on purpose.** With `"word " * 120` every window looks identical, so the overlap
-  assertion would pass even with zero overlap.
-- **`pytest -k overlap`** runs just the two ids containing the word: `test_chunk_count[overlapping]` and
-  `test_overlap_is_shared_tokens`.
 
 ### Runnable: a model-output parser as a case table
 Self-contained; save as `test_parse.py` and run `pytest -q test_parse.py`. This is the parser between
@@ -444,34 +380,27 @@ FENCE = "`" * 3                      # a Markdown code fence, built so this file
 FENCED = re.compile(FENCE + r"(?:json)?\s*(.*?)" + FENCE, flags=re.S)
 
 def parse_json_reply(text: str) -> dict:
-    """Accept bare JSON or JSON inside a fence; reject anything that is not an object."""
     m = FENCED.search(text)
-    body = m.group(1) if m else text
-    data = json.loads(body.strip())
+    data = json.loads((m.group(1) if m else text).strip())
     if not isinstance(data, dict):
         raise ValueError("expected a JSON object")
     return data
 
 @pytest.mark.parametrize("raw,expected", [
     ('{"a": 1}', {"a": 1}),
-    (f'{FENCE}json\n{{"a": 1}}\n{FENCE}', {"a": 1}),
-    (f'Sure!\n{FENCE}\n{{"a": [1, 2]}}\n{FENCE}', {"a": [1, 2]}),
-], ids=["bare", "fenced-json", "chatty-fence"])
+    (f'Sure!\n{FENCE}json\n{{"a": [1, 2]}}\n{FENCE}', {"a": [1, 2]}),
+], ids=["bare", "chatty-fence"])
 def test_parse_ok(raw, expected):
     assert parse_json_reply(raw) == expected
 
-@pytest.mark.parametrize("raw,exc", [
-    ("[1, 2]", ValueError),
-    ("not json", json.JSONDecodeError),
-], ids=["array", "prose"])
-def test_parse_rejects(raw, exc):
-    with pytest.raises(exc):
+@pytest.mark.parametrize("raw", ["[1, 2]", "not json"], ids=["array", "prose"])
+def test_parse_rejects(raw):
+    with pytest.raises(ValueError):      # json.JSONDecodeError subclasses ValueError
         parse_json_reply(raw)
 ```
 
-Five ids such as `test_parse_ok[fenced-json]` show up in the report, so a regression names the input
-shape that broke. `json.JSONDecodeError` is a subclass of `ValueError`, so the "prose" row asserts the
-narrower class on purpose. When production logs show a new reply shape, add it as a row.
+Four ids such as `test_parse_ok[chatty-fence]` show up in the report (`4 passed`), so a regression names
+the input shape that broke. When production logs show a new reply shape, add it as a row.
 
 ### Worked scenario: a session fixture under xdist
 An agent's retrieval tests use a session fixture that starts a vector-DB container in ~20 s
@@ -511,6 +440,9 @@ The fix that teams use is the xdist docs pattern: guard startup with a file lock
   replay failures with `--randomly-seed=<n>`; monitor the flake rate per test id. Keep `fake_llm`,
   settings overrides and a temp workspace in the root `conftest.py`, and shadow them in
   `tests/integration/conftest.py` with real clients.
+- **Make the property observable.** Test a chunker's overlap with distinct tokens (`w0 w1 ...`), because
+  repeated filler such as `"word " * 120` passes an overlap assertion even with zero overlap; build
+  costly objects like the chunker in a `session` fixture.
 
 ## Trade-offs
 - **Concise injection vs hidden wiring.** Fixtures by name are short, but `conftest.py` hides where a

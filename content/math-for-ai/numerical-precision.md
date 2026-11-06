@@ -131,55 +131,37 @@ flowchart TD
 
 ## Examples
 ### Overflow, swamping, bf16 rounding and int8 outliers
-numpy has no native bf16, so the script emulates it by rounding fp32 to its top 16 bits. Tested with
+numpy has no native bf16, so `to_bf16` emulates it by rounding fp32 to its top 16 bits. Tested with
 numpy 2.0.2.
 
 ```python
 import numpy as np
 np.seterr(over="ignore", invalid="ignore")   # we want to SEE inf and nan here
 
-def to_bf16(x):
-    """Round float32 to bfloat16 (keep the top 16 bits, round to nearest even), back as float32."""
+def to_bf16(x):  # emulate bf16: round fp32 to its top 16 bits (nearest even)
     b = np.asarray(x, np.float32).view(np.uint32)
-    b = (b + 0x7FFF + ((b >> 16) & 1)) & 0xFFFF0000
-    return b.view(np.float32)
+    return ((b + 0x7FFF + ((b >> 16) & 1)) & 0xFFFF0000).view(np.float32)
 
-fp16 = np.finfo(np.float16)
-print("fp16 max:", float(fp16.max), " eps:", fp16.eps, " smallest normal:", fp16.tiny)
-print("bf16 max:", (2 - 2.0 ** -7) * 2.0 ** 127, " eps:", 2.0 ** -7)
+# 1. Overflow: exp(12) does not fit in fp16
+z = np.array([12.0, 10.0, 3.0], np.float16)
+print("naive:", np.exp(z) / np.exp(z).sum())   # [nan  0.  0.]
+e = np.exp(z - z.max())
+print("stable:", e / e.sum())                  # [8.8037e-01 1.1920e-01 1.0866e-04]
 
-# 1. Overflow: logits of 12 are ordinary, but exp(12) does not fit in fp16
-logits = np.array([12.0, 10.0, 3.0], np.float16)
-naive = np.exp(logits) / np.exp(logits).sum()
-stable = np.exp(logits - logits.max()) / np.exp(logits - logits.max()).sum()
-print("naive fp16 softmax:", naive, " stable:", stable)
-
-# 2. Swamping: small updates vanish when added to a large fp16 accumulator
+# 2. Swamping: small updates vanish in a large fp16 accumulator
 acc = np.float16(2048)
 for _ in range(100):
-    acc = np.float16(acc + np.float16(1))
-print("2048 + 1 (x100) in fp16 =", acc, " in fp32 =", np.float32(2048) + 100)
+    acc += np.float16(1)
+print("2048 + 1 x100 in fp16:", acc)           # 2048.0 (fp32 gives 2148.0)
 
-# 3. bf16 keeps range, loses digits
-print("bf16(1.001) =", to_bf16(1.001), " bf16(70000) =", to_bf16(70000.0),
-      " fp16(70000) =", np.float16(np.float32(70000.0)))
+# 3. bf16 keeps range, loses digits; fp16 is the reverse
+print(to_bf16(1.001), to_bf16(70000.0), np.float16(70000.0))  # 1.0 70144.0 inf
 
-# 4. int8 symmetric quantization of a weight row with one outlier
+# 4. int8: one outlier sets the scale for the whole row
 w = np.array([0.02, -0.05, 0.03, 0.01, -0.02, 2.5], np.float32)
 scale = np.abs(w).max() / 127
-q = np.clip(np.round(w / scale), -127, 127).astype(np.int8)
-print("int8:", q, " dequant:", np.round(q * scale, 4), " scale:", round(float(scale), 5))
-```
-
-Output:
-
-```
-fp16 max: 65504.0  eps: 0.000977  smallest normal: 6.104e-05
-bf16 max: 3.3895313892515355e+38  eps: 0.0078125
-naive fp16 softmax: [nan  0.  0.]  stable: [8.8037e-01 1.1920e-01 1.0866e-04]
-2048 + 1 (x100) in fp16 = 2048.0  in fp32 = 2148.0
-bf16(1.001) = 1.0  bf16(70000) = 70144.0  fp16(70000) = inf
-int8: [  1  -3   2   1  -1 127]  dequant: [ 0.0197 -0.0591  0.0394  0.0197 -0.0197  2.5   ]  scale: 0.01969
+q = np.round(w / scale).astype(np.int8)
+print(q, np.round(q * scale, 4))  # [1 -3 2 1 -1 127] [0.0197 -0.0591 0.0394 0.0197 -0.0197 2.5]
 ```
 
 - **Overflow:** the naive softmax returns NaN; subtracting the max gives valid probabilities.

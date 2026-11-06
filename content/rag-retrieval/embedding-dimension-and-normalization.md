@@ -167,35 +167,29 @@ flowchart TD
 ## Examples
 ### Norm bias, the metric identity and truncation in numpy
 Document 3 is only weakly related to the query but has an eight-times larger norm. Raw dot product
-ranks it first; cosine, and every metric after normalization, rank document 1 first. The last block
-shows truncate-then-renormalize and the storage arithmetic.
+ranks it first; after normalization, dot product and Euclidean distance both rank document 1 first.
+The last block truncates to a prefix and renormalizes.
 
 ```python
 import numpy as np
 
 rng = np.random.default_rng(0)
-d, n = 1536, 5
-X = rng.normal(size=(n, d))                      # five "document" vectors
+d = 1536
+X = rng.normal(size=(5, d))                      # five "document" vectors
 q = X[1] + 0.5 * rng.normal(size=d)              # a query genuinely closest to doc 1
 X[3] = 8.0 * (0.2 * X[1] + rng.normal(size=d))   # doc 3: weakly related, 8x larger norm
-
-dot = X @ q
-cos = dot / (np.linalg.norm(X, axis=1) * np.linalg.norm(q))
-print("raw dot ranking:", np.argsort(-dot))      # [3 1 4 2 0]  magnitude wins
-print("raw cos ranking:", np.argsort(-cos))      # [1 3 4 2 0]  direction wins
+print("raw dot:", np.argsort(-(X @ q)))          # [3 1 4 2 0]  magnitude wins
 
 Xn = X / np.linalg.norm(X, axis=1, keepdims=True)
 qn = q / np.linalg.norm(q)
-dot_n = Xn @ qn
-l2 = np.linalg.norm(Xn - qn, axis=1)
-assert np.allclose(l2**2, 2 - 2 * dot_n)        # unit vectors: ||a-b||^2 = 2 - 2 a.b
-print(np.argsort(-dot_n), np.argsort(l2))        # identical orderings
+dot_n, l2 = Xn @ qn, np.linalg.norm(Xn - qn, axis=1)
+assert np.allclose(l2**2, 2 - 2 * dot_n)         # unit vectors: ||a-b||^2 = 2 - 2 a.b
+print("unit dot:", np.argsort(-dot_n), "l2:", np.argsort(l2))   # [1 3 4 2 0] twice
 
-k = 256                                          # Matryoshka-style truncation: keep a prefix, renormalize
+k = 256                                          # Matryoshka-style: keep a prefix, renormalize
 Xk = Xn[:, :k] / np.linalg.norm(Xn[:, :k], axis=1, keepdims=True)
 qk = qn[:k] / np.linalg.norm(qn[:k])
-print("256-dim ranking:", np.argsort(-(Xk @ qk)), "storage ratio:", k / d)
-print("10M x 1536 x 4 bytes =", 10_000_000 * 1536 * 4 / 1e9, "GB")   # 61.44 GB, before the index
+print("256-dim:", np.argsort(-(Xk @ qk)))        # [1 3 4 2 0] at a sixth of the storage
 ```
 
 With random vectors the truncation keeps the order only because the signal is spread evenly; a real
@@ -214,20 +208,19 @@ def calibrate(pos_scores, neg_scores):
     acc = [((pos_scores >= t).mean() + (neg_scores < t).mean()) / 2 for t in cands]
     return float(cands[int(np.argmax(acc))])
 
-rng = np.random.default_rng(0)                  # stand-ins for scores of labelled pairs
-labelled_pos, labelled_neg = rng.normal(0.82, 0.04, 200), rng.normal(0.71, 0.04, 200)
-THRESHOLD = calibrate(labelled_pos, labelled_neg)   # store with the model id
+rng = np.random.default_rng(0)                   # stand-ins for scores of labelled pairs
+THRESHOLD = calibrate(rng.normal(0.82, 0.04, 200), rng.normal(0.71, 0.04, 200))  # store with model id
 
 def search_tool(query_vec, X, k=5):              # X: unit-length rows of the index
     assert abs(np.linalg.norm(query_vec) - 1) < 1e-3, "query not normalized"
-    scores = X @ query_vec                       # inner product on unit vectors
+    scores = X @ query_vec
     top = np.argsort(-scores)[:k]
     good = [(int(i), round(float(scores[i]), 3)) for i in top if scores[i] >= THRESHOLD]
     return good or "No sufficiently relevant passages. Ask the user or try another tool."
 
 X = rng.normal(size=(1000, 384)); X /= np.linalg.norm(X, axis=1, keepdims=True)
 q = rng.normal(size=384); q /= np.linalg.norm(q)
-print(round(THRESHOLD, 3), search_tool(q, X))    # a random query: the gate says nothing relevant
+print(round(THRESHOLD, 3), search_tool(q, X))    # 0.761 No sufficiently relevant passages. ...
 print(search_tool(X[7], X))                      # an exact match passes: [(7, 1.0)]
 ```
 

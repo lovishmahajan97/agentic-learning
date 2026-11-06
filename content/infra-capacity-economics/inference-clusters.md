@@ -243,45 +243,35 @@ flowchart TD
 ## Examples
 ### Sizing a pool and routing agent steps inside it
 The capacity numbers are illustrative placeholders you would replace with your own load-test results.
-The routing key is the agent run id when there is one, so every step of a run stays together.
+The routing key is the agent run id, so every step of a run stays together.
 
 ```python
 import math, hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 @dataclass
 class Replica:
     name: str
     max_seqs: int            # concurrency at which p95 TPOT still meets the budget (load-tested)
     running: int = 0
-    hot_prefixes: set = field(default_factory=set)
 
 def replicas_needed(peak_out_tok_s, out_tok_s_per_replica, headroom=1.3, n_plus=1):
     """Pool size from peak decode demand, with headroom for burst and N+1 for a node loss."""
     return math.ceil(peak_out_tok_s * headroom / out_tok_s_per_replica) + n_plus
 
 # Peak 6,000 output tok/s; a 2xH100 TP=2 replica sustains ~1,500 tok/s within budget (illustrative).
-print("replicas:", replicas_needed(6_000, 1_500))      # -> ceil(5.2)+1 = 7
-
+print("replicas:", replicas_needed(6_000, 1_500))      # replicas: 7  (ceil(5.2) + 1)
 pool = [Replica(f"r{i}", max_seqs=48) for i in range(7)]
 
-def route(prompt: str, run_id: str = "", prefix_chars: int = 2048) -> Replica:
-    # Agents: key on the run id so all steps share a replica. Otherwise hash the shared prefix,
-    # which only works if that prefix (system prompt) is at least prefix_chars long.
-    key = hashlib.sha1((run_id or prompt[:prefix_chars]).encode()).hexdigest()
-    preferred = pool[int(key, 16) % len(pool)]  # modulo for brevity; use consistent hashing in prod
-    if preferred.running < preferred.max_seqs:
-        preferred.hot_prefixes.add(key); preferred.running += 1
-        return preferred
-    # Affinity is not worth queueing for: spill to the least-loaded replica with room.
-    cands = [r for r in pool if r.running < r.max_seqs]
-    if not cands:
-        raise RuntimeError("pool saturated: shed or queue at the gateway")
-    best = min(cands, key=lambda r: r.running); best.running += 1
-    return best
+def route(run_id: str) -> Replica:
+    # Key on the run id so every step of an agent run hits the replica holding its transcript.
+    preferred = pool[int(hashlib.sha1(run_id.encode()).hexdigest(), 16) % len(pool)]
+    if preferred.running >= preferred.max_seqs:   # affinity is not worth queueing for: spill
+        preferred = min(pool, key=lambda r: r.running)
+    preferred.running += 1                        # decrement when the stream ends
+    return preferred
 
-def finished(r: Replica):             # call when the stream ends, or slots leak and the pool "fills"
-    r.running -= 1
+print(route("run-42").name == route("run-42").name)    # True: same run, same replica
 ```
 
 - **Assumption 1, made explicit:** a replica's capacity is the concurrency at which it still meets the
@@ -344,6 +334,8 @@ uses 2 GPUs, so one node hosts 4 replicas.
 - **Blue/green pools for model versions.** Deploy the new weights as a second pool and shift traffic by
   weight at the gateway, pinning in-flight agent runs to the version they started on; rollback is a
   routing change. Monitor error rate, latency and agent eval scores per pool during the shift.
+- **Release admission slots when the stream ends.** A router that counts running sequences must decrement
+  on every finish, error and client disconnect, or slots leak and the pool looks full while idle.
 
 ## Trade-offs
 - **Many small replicas vs a few large TP replicas.** TP=1 replicas give fine-grained scaling and

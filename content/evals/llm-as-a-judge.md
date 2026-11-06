@@ -186,10 +186,10 @@ flowchart TD
 ### Reference-guided binary judge and its calibration
 Single criterion, reasoning-first JSON verdict, then the calibration numbers that decide whether it can
 be trusted. `llm` is any chat-completion call returning text; the judge prompt is the part that matters.
+Kappa is agreement corrected for chance (0.90 observed, 0.60 expected by chance).
 
 ```python
 import json
-from itertools import product
 
 JUDGE_PROMPT = """You are grading a customer-support answer for FACTUAL CORRECTNESS only.
 Task the answer was meant to solve: {task}
@@ -200,29 +200,22 @@ Pass only if every factual claim in the answer agrees with the reference; wordin
 do not matter. Fail if any claim contradicts the reference or adds an unsupported fact.
 Reply with JSON: {{"reason": "<one or two sentences>", "verdict": "pass" | "fail"}}"""
 
-def judge(task: str, reference: str, answer: str) -> dict:
+def judge(task: str, reference: str, answer: str) -> dict:   # `llm`: any chat call returning text
     raw = llm(JUDGE_PROMPT.format(task=task, reference=reference, answer=answer), temperature=0)
-    out = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
-    assert out["verdict"] in ("pass", "fail")
-    return out
+    return json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
 
-def calibrate(items, human: dict[str, bool]) -> dict:
-    """items: labeled cases; human: id -> True if humans marked it a pass."""
-    pred = {it["id"]: judge(it["task"], it["reference"], it["answer"])["verdict"] == "pass" for it in items}
-    n = len(items)
-    cm = {(h, p): sum(human[i] == h and pred[i] == p for i in pred) for h, p in product([True, False], repeat=2)}
-    acc = (cm[True, True] + cm[False, False]) / n
-    p_yes = (cm[True, True] + cm[False, True]) / n * (cm[True, True] + cm[True, False]) / n
-    p_no = (cm[True, False] + cm[False, False]) / n * (cm[False, True] + cm[False, False]) / n
-    kappa = (acc - (p_yes + p_no)) / (1 - (p_yes + p_no))
-    fail_recall = cm[False, False] / max(1, cm[False, False] + cm[False, True])
-    return {"n": n, "agreement": round(acc, 3), "kappa": round(kappa, 3), "fail_recall": round(fail_recall, 3)}
+def calibrate(human: list[bool], pred: list[bool]) -> dict:   # True = pass, per labeled item
+    acc = sum(h == p for h, p in zip(human, pred)) / len(human)
+    ph, pp = sum(human) / len(human), sum(pred) / len(pred)
+    chance = ph * pp + (1 - ph) * (1 - pp)                    # agreement expected by chance
+    fails = [p for h, p in zip(human, pred) if not h]
+    return {"agreement": acc, "kappa": round((acc - chance) / (1 - chance), 3),
+            "fail_recall": fails.count(False) / len(fails)}
 
-# Worked numbers for 200 items, 140 human-pass / 60 human-fail; judge passes 150:
-#   135 true passes, 15 fails marked pass, 5 passes marked fail, 45 fails marked fail
-#   agreement = 180/200 = 0.90, chance agreement = 0.75*0.70 + 0.25*0.30 = 0.60, kappa = 0.75
-#   fail_recall = 45/60 = 0.75  -> the judge misses one real failure in four: not yet a release gate.
-#   observed pass rate 0.75 vs true 0.70; correction: (0.75 + 0.75 - 1) / (135/140 + 0.75 - 1) ≈ 0.70
+# 200 items: 135 pass/pass, 5 human-pass judged fail, 15 human-fail judged pass, 45 fail/fail
+human = [True] * 140 + [False] * 60
+pred = [True] * 135 + [False] * 5 + [True] * 15 + [False] * 45
+print(calibrate(human, pred))   # {'agreement': 0.9, 'kappa': 0.75, 'fail_recall': 0.75}
 ```
 
 | Calibration number | Value | Reading |
@@ -252,9 +245,7 @@ Reply with JSON: {{"reason": "<name the unsupported claim, if any>", "verdict": 
 def judge_grounding(trace: list[dict], reply: str, max_chars=2000) -> dict:
     results = "\n".join(f"- {t['tool']}: {str(t['result'])[:max_chars]}" for t in trace)
     raw = llm(TOOL_GROUNDING_PROMPT.format(tool_results=results, reply=reply), temperature=0)
-    out = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
-    assert out["verdict"] in ("pass", "fail")
-    return out
+    return json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
 ```
 
 | Calibration on 150 human-labeled traces (illustrative) | Value |
@@ -276,29 +267,24 @@ the correction above.
 ```python
 from math import comb
 
-def order_consistent(b_second: dict, b_first: dict) -> dict:
-    """Each dict: item id -> winning candidate ('A' or 'B'), named by candidate, not position.
-    b_second: run with A shown first; b_first: run with B shown first."""
+def order_consistent(b_second: dict, b_first: dict) -> dict:   # id -> winner, named by candidate
     tally = {"A": 0, "B": 0, "tie": 0}
     for i in b_second:
         tally[b_second[i] if b_second[i] == b_first[i] else "tie"] += 1   # flips with order = tie
     return tally
 
-def sign_test(wins: int, losses: int) -> float:              # two-sided exact test on decisive items
+def sign_test(wins: int, losses: int) -> float:   # two-sided exact test on decisive items
     n, k = wins + losses, min(wins, losses)
     return min(1.0, 2 * sum(comb(n, j) for j in range(k + 1)) / 2**n)
 
 def rogan_gladen(observed: float, r_pass: float, r_fail: float) -> float:
     return (observed + r_fail - 1) / (r_pass + r_fail - 1)
 
-# 100 items: B wins 68 when shown first, 44 when shown second (the quiz scenario)
-b_first = {i: "B" if i < 68 else "A" for i in range(100)}
-b_second = {i: "B" if i < 44 else "A" for i in range(100)}
+b_first = {i: "B" if i < 68 else "A" for i in range(100)}    # B wins 68 of 100 when shown first
+b_second = {i: "B" if i < 44 else "A" for i in range(100)}   # and 44 when shown second
 t = order_consistent(b_second, b_first)
-print(t, "p =", round(sign_test(t["B"], t["A"]), 3))
-print("corrected pass rate:", round(rogan_gladen(0.75, 135 / 140, 0.75), 3))
-# {'A': 32, 'B': 44, 'tie': 24} p = 0.207
-# corrected pass rate: 0.7
+print(t, "p =", round(sign_test(t["B"], t["A"]), 3))   # {'A': 32, 'B': 44, 'tie': 24} p = 0.207
+print(round(rogan_gladen(0.75, 135 / 140, 0.75), 3))    # 0.7: observed 0.75 corrected to the true rate
 ```
 
 - **Reading it:** a 56% average for B hides 24 order-driven ties. On the 76 decisive items, 44 vs 32

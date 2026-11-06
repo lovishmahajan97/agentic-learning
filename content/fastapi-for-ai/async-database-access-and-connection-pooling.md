@@ -326,16 +326,15 @@ sequenceDiagram
 ```
 
 ## Examples
-### Lifespan engine and an agent route that releases before every model call
-Engine and session factory are created in the lifespan; ordinary routes use the per-request dependency;
-the agent endpoint returns its connection before each slow model call, gives the DB-backed tool its own
-short session, and writes the answer in a short final session.
+### Lifespan engine and an agent route that releases before the model call
+Engine and session factory are created once in the lifespan. The agent endpoint reads in one short
+session, returns the connection before the slow model call, and writes the answer in a second short one.
 
 ```python
 from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI, Request
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -349,36 +348,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-async def get_session(request: Request):      # for ordinary CRUD routes: one session per request
-    async with request.app.state.sessions() as session:
-        yield session
-
-async def lookup_order(sessions, order_id: int) -> str:   # a DB-backed agent tool
-    async with sessions() as s:               # its own short session: milliseconds of hold time
-        order = await s.get(Order, order_id)
-        return f"order {order_id}: {order.status if order else 'not found'}"
-
 @app.post("/agent/{conv_id}")
 async def agent(conv_id: int, body: Ask, request: Request):
     sessions = request.app.state.sessions
     async with sessions() as s:               # session 1: read, then RELEASE the connection
         history = (await s.scalars(select(Message).where(Message.conv_id == conv_id)
                                    .order_by(Message.id))).all()
-
-    transcript = [*history, body.prompt]
-    for _ in range(6):                        # agent loop: step budget
-        reply = await call_model(transcript)  # seconds; holds no database connection
-        if reply.tool_call is None:
-            break
-        transcript.append(await lookup_order(sessions, reply.tool_call.args["order_id"]))
-    answer = reply.text if reply.tool_call is None else "step budget exhausted"
-
-    async with sessions() as s:               # final session: short write
+    answer = await call_model([*history, body.prompt])   # seconds; holds no database connection
+    async with sessions() as s:               # session 2: short write
         s.add(Message(conv_id=conv_id, role="assistant", content=answer))
         await s.commit()
     return {"answer": answer}
-
-# Ask, Message, Order and call_model are the Pydantic model, ORM models and model client from other lessons.
+# Ask, Message and call_model are the Pydantic model, ORM model and model client from other lessons.
 ```
 
 ### Pool budget calculator
@@ -441,6 +422,9 @@ engine = create_async_engine(
 - **Pre-ping and recycle on cloud databases.** Keep `pool_pre_ping=True` and a `pool_recycle` below the
   provider's or appliance's idle cut-off, because those drops are silent. Monitor "server closed the
   connection unexpectedly" errors after failovers.
+- **Ordinary CRUD routes: one session per request.** A `yield` dependency
+  (`async with request.app.state.sessions() as session: yield session`) is fine for routes that only touch
+  the database; it is the agent and model-calling routes that need the short-session split.
 
 ## Trade-offs
 - **High concurrency vs async discipline.** An async driver lets one process keep hundreds of requests in

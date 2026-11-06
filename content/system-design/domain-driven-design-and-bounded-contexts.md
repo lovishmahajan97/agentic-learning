@@ -223,60 +223,42 @@ flowchart TD
 
 ## Examples
 ### Two contexts, one anticorruption layer, one published tool
-Each context has its own Customer; the support agent sees only its own concept. The translation from
-billing's model happens in the adapter, not in the prompt. `billing_api`, `mapping_repo` and `tickets`
-stand in for the real clients.
+Each context has its own customer; the support agent sees only its own concept. The translation from
+billing's model happens in the `lookup_customer` tool, not in the prompt.
 
 ```python
 from dataclasses import dataclass
 from datetime import date
 
-# Billing context: its own language and storage, owned by the billing team
 @dataclass(frozen=True)
-class BillingAccount:
-    account_id: str
-    legal_name: str
+class BillingAccount:              # billing context: its own language, owned by the billing team
     plan: str                      # billing's codes: "ent", "pro", "free"
     past_due_since: date | None
 
-# Support context: a different "customer", shaped for support work
 @dataclass(frozen=True)
-class SupportCustomer:
+class SupportCustomer:             # support context: a different "customer", shaped for support work
     customer_id: str
-    display_name: str
     tier: str                      # support's words: "enterprise", "pro", "free"
     payment_blocked: bool
-    open_tickets: int
 
 PLAN_TO_TIER = {"ent": "enterprise", "pro": "pro", "free": "free"}
 
-class BillingAdapter:              # anticorruption layer: billing model -> support language
-    def __init__(self, billing_api, mapping_repo):
-        self.api, self.map = billing_api, mapping_repo
-    def payment_status(self, customer_id: str) -> dict:
-        acct: BillingAccount = self.api.get_account(self.map.billing_id_for(customer_id))
-        blocked = acct.past_due_since is not None and (date.today() - acct.past_due_since).days > 14
-        if acct.plan not in PLAN_TO_TIER:            # fail loudly: a silent default corrupts meaning
-            raise UnmappedUpstreamValue(f"billing plan {acct.plan!r}")
-        return {"payment_blocked": blocked, "tier": PLAN_TO_TIER[acct.plan]}
+def lookup_customer(customer_id: str, acct: BillingAccount, today: date) -> SupportCustomer:
+    """Anticorruption layer: no billing field names leak into the agent's context."""
+    if acct.plan not in PLAN_TO_TIER:            # fail loudly: a silent default corrupts meaning
+        raise ValueError(f"unmapped billing plan {acct.plan!r}")
+    blocked = acct.past_due_since is not None and (today - acct.past_due_since).days > 14
+    return SupportCustomer(customer_id, PLAN_TO_TIER[acct.plan], blocked)
 
-def lookup_customer(customer_id: str, tickets, billing: BillingAdapter) -> SupportCustomer:
-    """Published language for the agent: no billing field names leak into its context."""
-    b = billing.payment_status(customer_id)
-    return SupportCustomer(customer_id=customer_id, display_name=tickets.name(customer_id),
-                           tier=b["tier"], payment_blocked=b["payment_blocked"],
-                           open_tickets=tickets.count_open(customer_id))
-
-TOOLS = [{"name": "lookup_customer", "description": "Fetch the support view of a customer.",
-          "input_schema": {"type": "object", "properties": {"customer_id": {"type": "string"}},
-                           "required": ["customer_id"]}}]
+print(lookup_customer("C-7", BillingAccount("ent", date(2026, 9, 30)), date(2026, 10, 20)))
+# SupportCustomer(customer_id='C-7', tier='enterprise', payment_blocked=True)
+lookup_customer("C-8", BillingAccount("team", None), date(2026, 10, 20))  # ValueError: unmapped billing plan 'team'
 ```
 
 ### Running one lookup, then an upstream change
 | Moment | What happens |
 |---|---|
-| Lookup | billing returns `BillingAccount("B-881", "Acme GmbH", "ent", 2026-09-30)` |
-| On 2026-10-20 | 20 days past due, more than 14, so the agent sees `SupportCustomer(tier="enterprise", payment_blocked=True, open_tickets=3)` and never the words "ent" or `past_due_since` |
+| Lookup on 2026-10-20 | billing says plan `"ent"`, past due since 2026-09-30: 20 days, more than 14, so the agent sees `tier="enterprise", payment_blocked=True` and never the words "ent" or `past_due_since` |
 | Billing launches a "team" plan, with a `.get(plan, "free")` default | every team-plan customer is silently treated as free tier: a wrong answer with no error anywhere |
 | Same launch, with the explicit map | the upstream change becomes a failing call and an alert on day one |
 
@@ -295,10 +277,6 @@ from decimal import Decimal
 class Money:                                   # value object: immutable, equal by value
     amount: Decimal
     currency: str
-    def __add__(self, other):
-        if other.currency != self.currency:
-            raise ValueError("currency mismatch")
-        return Money(self.amount + other.amount, self.currency)
 
 class CreditLimitExceeded(Exception):
     pass
@@ -306,27 +284,18 @@ class CreditLimitExceeded(Exception):
 @dataclass
 class Order:                                   # aggregate root: the only way to change lines
     order_id: str
-    customer_id: str                           # another aggregate, referenced by id
     credit: Money
     lines: list = field(default_factory=list)
-    events: list = field(default_factory=list)
-
-    def total(self) -> Money:
-        t = Money(Decimal(0), self.credit.currency)
-        for _, price in self.lines:
-            t = t + price
-        return t
 
     def add_line(self, sku: str, price: Money) -> None:
-        if (self.total() + price).amount > self.credit.amount:   # invariant checked on every change
+        total = sum((p.amount for _, p in self.lines), price.amount)
+        if total > self.credit.amount:         # invariant checked on every change
             raise CreditLimitExceeded(f"{self.order_id} would exceed {self.credit.amount}")
         self.lines.append((sku, price))
-        self.events.append(("OrderLineAdded", self.order_id, sku))  # other contexts react later
 
-order = Order("O-1", "C-7", Money(Decimal(10000), "EUR"))
+order = Order("O-1", Money(Decimal(10000), "EUR"))
 order.add_line("seats", Money(Decimal(9880), "EUR"))
-order.add_line("support", Money(Decimal(120), "EUR"))
-print(order.total().amount)                    # 10000: equal to the credit is allowed
+order.add_line("support", Money(Decimal(120), "EUR"))   # total 10000: equal to the credit is allowed
 try:
     order.add_line("extra", Money(Decimal(1), "EUR"))
 except CreditLimitExceeded as e:
